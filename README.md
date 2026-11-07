@@ -17,7 +17,7 @@ huxerui_use_library(my_app
 )
 ```
 
-Include the public headers and register the camera module in your application's `root_hooks`:
+Include the public headers and register the camera module in your application's `application_hooks`:
 
 ```cpp
 #include <huxerui/camera.h>
@@ -28,7 +28,7 @@ using namespace huxerui;
 const Application application{
     App,
     {
-        .root_hooks = {
+        .application_hooks = {
             camera::Install,
         },
     }

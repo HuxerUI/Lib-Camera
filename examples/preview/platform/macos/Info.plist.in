@@ -6,6 +6,14 @@
   <string>Show a live camera preview in the HuxerUI Camera example.</string>
   <key>CFBundleDisplayName</key>
   <string>Camera Preview</string>
+  <key>CFBundleExecutable</key>
+  <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+  <key>CFBundleVersion</key>
+  <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
   <key>CFBundleIdentifier</key>
   <string>org.huxerui.lib.camera.preview</string>
   <key>CFBundleIconFile</key>

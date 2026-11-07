@@ -115,7 +115,7 @@ private:
 
 } // namespace
 
-void InstallPlatformCamera(RootContext& root) {
+void InstallPlatformCamera(ApplicationContext& context) {
   android::JavaPlatformModuleFactory<std::shared_ptr<CameraBackend>> factory;
   factory.class_name = "org.huxerui.lib.camera.CameraModule";
   factory.create = [](PlatformChannel channel) {
@@ -123,7 +123,7 @@ void InstallPlatformCamera(RootContext& root) {
     backend->Connect();
     return backend;
   };
-  root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(camera_module_name, std::move(factory));
+  context.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(camera_module_name, std::move(factory));
 }
 
 } // namespace huxerui::camera::detail

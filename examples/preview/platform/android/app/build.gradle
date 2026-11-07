@@ -2,9 +2,34 @@ import com.android.build.api.artifact.SingleArtifact
 import com.android.build.api.variant.BuildConfigField
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
+import javax.inject.Inject
 
 plugins {
     alias(libs.plugins.android.application)
+}
+
+abstract class StageHuxerUIAssets extends DefaultTask {
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getPackageDirectories()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+
+    @Inject
+    abstract FileSystemOperations getFileSystemOperations()
+
+    @TaskAction
+    void stage() {
+        def resourcePackage = packageDirectories.files.find { new File(it, "huxerui/resources.bin").isFile() }
+        if (resourcePackage == null) {
+            throw new GradleException("HuxerUI resource package is missing from the built Android ABIs")
+        }
+        fileSystemOperations.sync {
+            from resourcePackage
+            into outputDirectory
+        }
+    }
 }
 
 def huxeruiProperty = { String name -> providers.gradleProperty(name).get() }
@@ -16,10 +41,6 @@ def huxeruiTargetSdk = huxeruiProperty("huxeruiTargetSdk").toInteger()
 def huxeruiNdkVersion = huxeruiProperty("huxeruiNdkVersion")
 def huxeruiAbis = huxeruiProperty("huxeruiAbis").split(",")
 def huxeruiStl = huxeruiProperty("huxeruiStl")
-def huxeruiDebugResourceRoot = layout.buildDirectory.dir("generated/huxerui/resources/debug").get().asFile
-def huxeruiReleaseResourceRoot = layout.buildDirectory.dir("generated/huxerui/resources/release").get().asFile
-def huxeruiDebugAssets = layout.buildDirectory.dir("generated/huxerui/assets/debug").get().asFile
-def huxeruiReleaseAssets = layout.buildDirectory.dir("generated/huxerui/assets/release").get().asFile
 
 android {
     buildFeatures {
@@ -35,7 +56,7 @@ android {
         minSdk = huxeruiMinSdk
         targetSdk = huxeruiTargetSdk
         versionCode = 1
-        versionName = "1.0"
+        versionName = "0.1.0"
 
         externalNativeBuild {
             cmake {
@@ -50,35 +71,10 @@ android {
     }
 
     buildTypes {
-        debug {
-            externalNativeBuild {
-                cmake {
-                    arguments "-DHUXERUI_ANDROID_RESOURCE_OUTPUT_ROOT=${huxeruiDebugResourceRoot.absolutePath}"
-                }
-            }
-        }
         release {
             signingConfig = signingConfigs.debug
             minifyEnabled = false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
-            externalNativeBuild {
-                cmake {
-                    arguments "-DHUXERUI_ANDROID_RESOURCE_OUTPUT_ROOT=${huxeruiReleaseResourceRoot.absolutePath}"
-                }
-            }
-        }
-    }
-
-    lint {
-        checkReleaseBuilds = false
-    }
-
-    sourceSets {
-        debug {
-            assets.srcDir huxeruiDebugAssets
-        }
-        release {
-            assets.srcDir huxeruiReleaseAssets
         }
     }
 
@@ -92,11 +88,17 @@ android {
             path = file("../../../CMakeLists.txt")
         }
     }
+
+    lint {
+        checkReleaseBuilds = false
+    }
 }
 
 androidComponents.onVariants(androidComponents.selector().all()) { variant ->
     def integrationRoot = layout.buildDirectory.dir("generated/huxerui/integration/${variant.name}").get().asFile
     variant.externalNativeBuild.arguments.add("-DHUXERUI_ANDROID_APP_INTEGRATION_ROOT=${integrationRoot.absolutePath}")
+    def resourceRoot = layout.buildDirectory.dir("generated/huxerui/resources/${variant.name}").get().asFile
+    variant.externalNativeBuild.arguments.add("-DHUXERUI_ANDROID_RESOURCE_OUTPUT_ROOT=${resourceRoot.absolutePath}")
     def nativeLibraries = variant.artifacts.get(SingleArtifact.MERGED_NATIVE_LIBS.INSTANCE)
     def packagedAbis = nativeLibraries.map { directory ->
         new File(directory.asFile, "lib").listFiles()?.findAll { it.isDirectory() && huxeruiAbis.contains(it.name) }?.sort { it.name } ?: []
@@ -143,6 +145,13 @@ androidComponents.onVariants(androidComponents.selector().all()) { variant ->
                 "Application library resolved from the CMake target.")
     })
 
+    def stageAssets = tasks.register("stageHuxerUI${variant.name.capitalize()}Assets", StageHuxerUIAssets) {
+        packageDirectories.from(packagedAbis.map { directories ->
+            directories.collect { new File(resourceRoot, "${it.name}/package") }
+        })
+    }
+    // Register ownership once so asset merging, lint, and other consumers all depend on staging.
+    variant.sources.assets.addGeneratedSourceDirectory(stageAssets) { it.outputDirectory }
 }
 
 dependencies {
@@ -155,36 +164,3 @@ dependencies {
         implementation project(library.projectPath)
     }
 }
-
-def registerHuxerUIResourceStaging = { String buildType, File resourceRoot, File assetsDirectory ->
-    def capitalizedBuildType = buildType.capitalize()
-    def nativeTaskName = "externalNativeBuild${capitalizedBuildType}"
-    def resolveResourcePackage = {
-        for (String abi : huxeruiAbis) {
-            def packageDirectory = new File(resourceRoot, "${abi}/package")
-            if (new File(packageDirectory, "huxerui/resources.bin").isFile()) {
-                return packageDirectory
-            }
-        }
-        return null
-    }
-    def verificationTask = tasks.register("verifyHuxerUI${capitalizedBuildType}Resources") {
-        dependsOn nativeTaskName
-        doLast {
-            if (resolveResourcePackage() == null) {
-                throw new GradleException("HuxerUI resource package is missing under ${resourceRoot}")
-            }
-        }
-    }
-    def stagingTask = tasks.register("stageHuxerUI${capitalizedBuildType}Resources", Sync) {
-        dependsOn verificationTask
-        from { resolveResourcePackage() ?: [] }
-        into assetsDirectory
-    }
-    tasks.matching { it.name == "merge${capitalizedBuildType}Assets" }.configureEach {
-        dependsOn stagingTask
-    }
-}
-
-registerHuxerUIResourceStaging("debug", huxeruiDebugResourceRoot, huxeruiDebugAssets)
-registerHuxerUIResourceStaging("release", huxeruiReleaseResourceRoot, huxeruiReleaseAssets)

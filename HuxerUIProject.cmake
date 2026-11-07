@@ -21,10 +21,6 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target" FORCE)
-endif ()
-
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     enable_language(CXX)
     if (APPLE AND NOT IOS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/src")
@@ -32,8 +28,8 @@ if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     endif ()
 endif ()
 
-if (NOT TARGET HuxerUI::huxerui)
-    set(HUXERUI_HOME "$ENV{HUXERUI_HOME}" CACHE PATH "HuxerUI SDK or source directory")
+if (NOT TARGET HuxerUI::huxerui AND NOT TARGET HuxerUI::huxerui_static)
+    set(HUXERUI_HOME "$ENV{HUXERUI_HOME}" CACHE PATH "HuxerUI framework directory")
     if (HUXERUI_HOME AND EXISTS "${HUXERUI_HOME}/CMakeLists.txt"
             AND EXISTS "${HUXERUI_HOME}/include/huxerui/huxerui.h")
         set(HUXERUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)

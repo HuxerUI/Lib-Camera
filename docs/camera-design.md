@@ -123,7 +123,7 @@ public:
   [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 };
 
-void Install(RootContext& root);
+void Install(ApplicationContext& context);
 
 [[nodiscard]] CameraSession UseCamera(
     CameraOptions options = {},

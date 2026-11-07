@@ -8,7 +8,7 @@
 #include <huxerui/external_texture.h>
 #include <huxerui/data.h>
 #include <huxerui/resource.h>
-#include <huxerui/root.h>
+#include <huxerui/app.h>
 #include <huxerui/task.h>
 #include <huxerui/view.h>
 
@@ -246,25 +246,25 @@ private:
   friend CameraSession UseCamera(CameraOptions, const std::source_location&);
 };
 
-/// Installs the camera platform module for an application root.
-/// Register this function in AppOptions::root_hooks before composing content that calls UseCamera.
+/// Installs the camera platform module in the application catalog.
+/// Register this function in AppOptions::application_hooks before composing content that calls UseCamera.
 /// Registration neither opens a camera nor requests authorization. Unsupported capture platforms report
 /// CameraErrorCode::Unavailable when capture is requested.
-/// @param root Application root context supplied by HuxerUI when it runs the registered hook.
+/// @param context Application context supplied by HuxerUI when it runs the registered hook.
 /// @code
 /// const huxerui::Application application{
 ///     App,
 ///     {
-///         .root_hooks = {
+///         .application_hooks = {
 ///             huxerui::camera::Install,
 ///         },
 ///     }
 /// };
 /// @endcode
-void Install(RootContext& root);
+void Install(ApplicationContext& context);
 
 /// Retains a camera session in the current composition and applies the requested capture intent.
-/// Call from an active composition on the UI thread, with Install registered for its root.
+/// Call from an active composition on the UI thread, with Install registered for its application.
 /// Recomposition at the same retained call site updates the existing session. Distinct calls own separate
 /// sessions; share a returned handle when multiple previews should use one device.
 ///

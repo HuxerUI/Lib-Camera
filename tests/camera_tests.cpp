@@ -1,5 +1,4 @@
 #include <huxerui/huxerui.h>
-#include <huxerui/platform_adapter.h>
 
 #include <array>
 #include <cmath>
@@ -79,13 +78,20 @@ void TestGeometry() {
   Check(!camera::detail::PlacePreview(source, output, {}, {}, source), "Non-finite geometry must not draw.");
 }
 
-class TestPlatform final : public PlatformAdapter {
+class TestPlatform final : public UiWindow, public huxerui::Runtime {
 public:
   TestPlatform()
-      : PlatformAdapter([this](std::function<void()> work) {
+      : huxerui::Runtime([this](std::function<void()> work) {
           std::lock_guard lock(mutex);
           pending.push_back(std::move(work));
         }) {}
+  ~TestPlatform() override { UiWindow::Retire(); huxerui::Runtime::Retire(); }
+  void Start(const Application& application) {
+    InitializeApplication(application, LaunchActivation{}, ApplicationLifecycleState::Active);
+    InitializeWindow(*this, application.root_factory, application.options.window,
+                     std::nullopt, WindowLifecycleState::Active);
+  }
+  void OnRuntimeStopped() override {}
   void RequestFrameAt(double) override {}
   double Now() const noexcept override { return 0.0; }
   FontMetrics Metrics(const Font&) override { return {}; }
@@ -93,7 +99,7 @@ public:
   TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
     return {};
   }
-  void Drain(Runtime& runtime) {
+  void Drain(UiWindow& runtime) {
     for (int turns = 0; turns < 30; ++turns) {
       while (RunOne()) {
       }
@@ -118,11 +124,11 @@ public:
     return true;
   }
 
-  void Await(Runtime& runtime, const std::function<bool()>& done) {
-    const auto deadline = std::chrono::steady_clock::now() + 3s;
+  void Await(UiWindow& runtime, const std::function<bool()>& done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
     while (!done() && std::chrono::steady_clock::now() < deadline) {
       Drain(runtime);
-      std::this_thread::sleep_for(1ms);
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     Check(done(), "Asynchronous photo operation did not complete.");
   }
@@ -166,10 +172,10 @@ View TestRoot() {
 }
 
 void TestSessionLifetime() {
-  Application application(TestRoot, {.show_debug_overlay = false, .root_hooks = {
-    [](RootContext& root) {
-      root.RegisterPlatformModule<std::shared_ptr<camera::detail::CameraBackend>>(
-          camera::detail::camera_module_name, [](PlatformAdapter&) -> std::shared_ptr<camera::detail::CameraBackend> {
+  Application application(TestRoot, {.show_debug_overlay = false, .application_hooks = {
+    [](ApplicationContext& context) {
+      context.RegisterPlatformModule<std::shared_ptr<camera::detail::CameraBackend>>(
+          camera::detail::camera_module_name, [](UiWindow&) -> std::shared_ptr<camera::detail::CameraBackend> {
             auto backend = std::make_shared<TestBackend>();
             backends.push_back(backend);
             return backend;
@@ -177,9 +183,10 @@ void TestSessionLifetime() {
       );
     },
   }});
-  TestPlatform platform;
   {
-    Runtime runtime(application, platform);
+    TestPlatform platform;
+    platform.Start(application);
+    UiWindow& runtime = platform;
     runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
     runtime.BuildFrame();
     platform.Drain(runtime);
@@ -280,14 +287,14 @@ public:
   PhotoTestContext context;
   Application application;
   TestPlatform platform;
-  Runtime runtime;
+  UiWindow& runtime = platform;
 
   explicit PhotoTestFixture(Facing facing = Facing::Front)
-      : application(PhotoTestRoot, {.show_debug_overlay = false}),
-        runtime(application, platform) {
+      : application(PhotoTestRoot, {.show_debug_overlay = false}) {
     Check(!active_photo_test, "Photo fixtures must not overlap.");
     active_photo_test = &context;
     context.facing = facing;
+    platform.Start(application);
     runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
     Drain();
   }

@@ -550,9 +550,9 @@ std::shared_ptr<CameraBackend> CreateWindowsCamera() {
   return std::make_shared<WindowsCamera>();
 }
 
-void InstallPlatformCamera(RootContext& root) {
-  root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
-      camera_module_name, [](PlatformAdapter&) { return CreateWindowsCamera(); });
+void InstallPlatformCamera(ApplicationContext& context) {
+  context.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
+      camera_module_name, [](UiWindow&) { return CreateWindowsCamera(); });
 }
 
 } // namespace huxerui::camera::detail

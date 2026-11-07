@@ -196,16 +196,17 @@ private:
 #if defined(__ANDROID__)
 [[huxerui::composable]]
 View PhotoImage(ImageAsset photo) {
-  auto thumbnails = UseService<PhotoThumbnail>();
   auto image = UseState(ImageAsset{});
   auto error = UseState(std::string{});
-  Lifecycle([thumbnails, photo, image, error] {
+  Lifecycle([photo, image, error] {
     image = ImageAsset{};
     error = std::string{};
-    return thumbnails->Load(photo, [image, error](ImageAsset thumbnail, std::string failure) {
+    auto thumbnails = OpenPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail");
+    auto cancel = thumbnails->Load(photo, [image, error](ImageAsset thumbnail, std::string failure) {
       image = std::move(thumbnail);
       error = std::move(failure);
     });
+    return [thumbnails, cancel = std::move(cancel)] { cancel(); };
   }, photo);
   if (!image.Get().HasValue()) {
     return Column {
@@ -222,18 +223,18 @@ View PhotoImage(ImageAsset photo) {
 
 [[huxerui::composable]]
 View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, State<bool> saving) {
-  auto files = UseService<FileSystem>();
+  auto application = UseApplication();
   auto picker = UseService<FilePicker>();
   auto message = UseState(std::string{});
-  auto save = [tasks, files, picker, photo, saving, message] {
+  auto save = [tasks, application, picker, photo, saving, message] {
     if (saving.Get()) return;
     saving = true;
     message = std::string{};
-    tasks.Launch([files, picker, photo, saving, message]() -> Task<void> {
+    tasks.Launch([application, picker, photo, saving, message]() -> Task<void> {
       static std::atomic_uint64_t sequence{0};
       const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
       const auto filename = "camera-" + std::to_string(timestamp) + "-" + std::to_string(++sequence) + ".jpg";
-      const File directory = files->Directories().temporary_directory.Child("camera-preview-exports");
+      const File directory = application.Directories().temporary_directory.Child("camera-preview-exports");
       const File temporary = directory.Child(filename);
       try {
         const bool prepared = co_await RunWorker([directory] {
@@ -519,17 +520,16 @@ const Application application{
             .minimum_size = Size{360.0F, 480.0F},
         },
         .show_debug_overlay = false,
-        .root_hooks = {
+        .application_hooks = {
             huxerui::camera::Install,
 #if defined(__ANDROID__)
-            [](RootContext& root) {
+            [](ApplicationContext& context) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;
               factory.class_name = "org.huxerui.lib.camera.preview.PhotoThumbnailModule";
               factory.create = [](PlatformChannel channel) {
                 return std::make_shared<PhotoThumbnail>(std::move(channel));
               };
-              root.RegisterPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail", std::move(factory));
-              root.Provide(root.OpenPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail"));
+              context.RegisterPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail", std::move(factory));
             },
 #endif
         },
