@@ -137,7 +137,7 @@ void TestPhotos() {
   }
   bool rejected = false;
   try {
-    (void)camera::detail::EncodeWindowsPhoto({}, {}, PreviewRotation::R0);
+    camera::detail::EncodeWindowsPhoto({}, {}, PreviewRotation::R0);
   } catch (const std::exception&) {
     rejected = true;
   }
@@ -181,13 +181,13 @@ void TestDevice() {
   };
   const auto stop = [&](const std::shared_ptr<DeviceProbe>& probe) {
     request_stop(probe);
-    probe->Await([&] { return probe->stopped; }, "Native camera did not stop.");
+    probe->Await([&] { return probe->stopped; }, "Windows camera did not stop.");
   };
   std::optional<Facing> actual_facing;
   for (int run = 0; run < 2; ++run) {
     auto probe = begin(actual_facing);
     probe->Await([&] { return probe->status.state == SessionState::Running || probe->status.error.has_value(); },
-                 "Native camera did not start.");
+                 "Windows camera did not start.");
     std::shared_ptr<ExternalTexture> texture;
     {
       std::lock_guard lock(probe->mutex);
@@ -196,14 +196,14 @@ void TestDevice() {
       Check(probe->status.preview && probe->status.preview->texture, "Running camera must expose its preview.");
       texture = probe->status.preview->texture;
       actual_facing = probe->status.actual_facing;
-      std::cout << "Native preview: " << texture->IntrinsicSize().width << 'x' << texture->IntrinsicSize().height
+      std::cout << "Windows preview: " << texture->IntrinsicSize().width << 'x' << texture->IntrinsicSize().height
                 << ", facing=" << (probe->status.actual_facing ? (*probe->status.actual_facing == Facing::Front ? "front" : "back") : "unknown") << '\n';
     }
     const auto revision = texture->Revision();
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     while (texture->Revision() <= revision + 2 && std::chrono::steady_clock::now() < deadline)
       std::this_thread::sleep_for(20ms);
-    Check(texture->Revision() > revision + 2, "Native preview did not publish frames.");
+    Check(texture->Revision() > revision + 2, "Windows preview did not publish frames.");
     camera->CapturePhoto({.mirror = run == 0 ? MirrorMode::Off : MirrorMode::On}, [probe](CameraResult<ImageAsset> result) {
       std::lock_guard lock(probe->mutex);
       probe->photo = std::move(result);
@@ -211,20 +211,20 @@ void TestDevice() {
     });
     if (run == 1)
       request_stop(probe);
-    probe->Await([&] { return probe->photo.has_value(); }, "Native photo did not complete.");
+    probe->Await([&] { return probe->photo.has_value(); }, "Windows photo did not complete.");
     {
       std::lock_guard lock(probe->mutex);
       if (probe->photo->Succeeded())
-        std::cout << "Native photo: " << probe->photo->Value().PixelWidth() << 'x' << probe->photo->Value().PixelHeight() << '\n';
+        std::cout << "Windows photo: " << probe->photo->Value().PixelWidth() << 'x' << probe->photo->Value().PixelHeight() << '\n';
       else if (probe->photo->Error().code == CameraErrorCode::Unavailable)
-        std::cout << "Native photo unavailable on this device: " << probe->photo->Error().message << '\n';
+        std::cout << "Windows photo unavailable on this device: " << probe->photo->Error().message << '\n';
       else
         throw std::runtime_error(probe->photo->Error().message);
     }
     if (run == 0)
       stop(probe);
     else
-      probe->Await([&] { return probe->stopped; }, "Stop must finish after native photo processing.");
+      probe->Await([&] { return probe->stopped; }, "Stop must finish after photo processing.");
     const auto final_revision = texture->Revision();
     std::this_thread::sleep_for(100ms);
     Check(texture->Revision() == final_revision, "Preview published after stop completion.");
@@ -249,7 +249,7 @@ void TestDevice() {
   auto closing = begin({});
   stop(closing);
   camera.reset();
-  std::cout << "Native Windows preview, photos, pending-operation stops, facing selection and restart passed.\n";
+  std::cout << "Windows preview, photos, pending-operation stops, facing selection and restart passed.\n";
 }
 } // namespace
 

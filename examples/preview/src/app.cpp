@@ -10,6 +10,8 @@
 #include <chrono>
 #include <mutex>
 
+#define CAMERA_DISCARD(expression) static_cast<void>(expression)
+
 using namespace huxerui;
 
 namespace {
@@ -80,10 +82,12 @@ View StatusBadge(camera::SessionState state) {
 [[huxerui::composable]]
 View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit> fit,
                     State<camera::MirrorMode> mirror, State<bool> grid, State<bool> comparison) {
-  const auto selected_facing = facing.Get();
+  const std::optional<camera::Facing> selected_facing = facing;
+  const ImageFit selected_fit = fit;
+  const camera::MirrorMode selected_mirror = mirror;
   const std::size_t facing_index = !selected_facing ? 0 : *selected_facing == camera::Facing::Front ? 1 : 2;
-  const std::size_t mirror_index = mirror.Get() == camera::MirrorMode::Auto ? 0
-      : mirror.Get() == camera::MirrorMode::Off ? 1 : 2;
+  const std::size_t mirror_index = selected_mirror == camera::MirrorMode::Auto ? 0
+      : selected_mirror == camera::MirrorMode::Off ? 1 : 2;
   return Column {
     Column {
       Label("Camera source", 13.0F, foreground, FontWeight::Medium),
@@ -94,7 +98,7 @@ View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit>
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     Column {
       Label("Frame fit", 13.0F, foreground, FontWeight::Medium),
-      SegmentedButton({"Fill", "Fit"}, fit.Get() == ImageFit::Cover ? 0 : 1)
+      SegmentedButton({"Fill", "Fit"}, selected_fit == ImageFit::Cover ? 0 : 1)
           .OnChanged([fit](std::size_t index) { fit = index == 0 ? ImageFit::Cover : ImageFit::Contain; }),
       Label("Fill crops to the viewfinder. Fit shows the full frame.", 12.0F),
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
@@ -185,7 +189,7 @@ public:
           }
           completed(std::move(thumbnail), {});
         });
-    return [channel = channel_, request] { (void)channel.Cancel(request); };
+    return [channel = channel_, request] { channel.Cancel(request); };
   }
 
 private:
@@ -208,9 +212,9 @@ View PhotoImage(ImageAsset photo) {
     });
     return [thumbnails, cancel = std::move(cancel)] { cancel(); };
   }, photo);
-  if (!image.Get().HasValue()) {
+  if (!image->HasValue()) {
     return Column {
-      error.Get().empty() ? View(ProgressCircle()) : View(Label(error.Get(), 12.0F).Align(TextAlign::Center)),
+      error->empty() ? View(ProgressCircle()) : View(Label(error.Get(), 12.0F).Align(TextAlign::Center)),
     }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center));
   }
   return Image(image.Get()).Fit(ImageFit::Contain);
@@ -227,7 +231,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
   auto picker = UseService<FilePicker>();
   auto message = UseState(std::string{});
   auto save = [tasks, application, picker, photo, saving, message] {
-    if (saving.Get()) return;
+    if (saving) return;
     saving = true;
     message = std::string{};
     tasks.Launch([application, picker, photo, saving, message]() -> Task<void> {
@@ -240,7 +244,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
         const bool prepared = co_await RunWorker([directory] {
           static std::once_flag cleanup;
           // Sweep previous runs only once so another window cannot delete an active export.
-          std::call_once(cleanup, [&] { (void)directory.DeleteRecursively(); });
+          std::call_once(cleanup, [&] { CAMERA_DISCARD(directory.DeleteRecursively()); });
           return directory.CreateDirectories();
         });
         const auto encoded = photo.EncodedBytes();
@@ -257,7 +261,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
       } catch (const std::exception& error) {
         message = std::string(error.what());
       }
-      (void)co_await temporary.DeleteAsync();
+      co_await temporary.DeleteAsync();
       saving = false;
     });
   };
@@ -270,8 +274,8 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
     PhotoImage(photo)
         .With(Frame{.height = 280.0F}, Background(Color::Black()), CornerRadius(16.0F), ClipChildren()),
     Label(std::to_string(photo.PixelWidth()) + " × " + std::to_string(photo.PixelHeight()) + " · JPEG", 12.0F),
-    Button(saving.Get() ? "Saving photo" : "Save photo").OnClick(save)
-        .With(Enabled(!saving.Get() && picker->CanSaveFiles())),
+    Button(saving ? "Saving photo" : "Save photo").OnClick(save)
+        .With(Enabled(!saving && picker->CanSaveFiles())),
     Label(!picker->CanSaveFiles() ? "File export is unavailable on this device." : message.Get(), 12.0F),
   }.With(Padding(20.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch)))
       .With(Frame{.max_height = 560.0F});
@@ -293,8 +297,9 @@ View CameraWorkspace() {
   auto application = UseApplication();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
-  auto session = camera::UseCamera({.facing = facing.Get(), .active = active.Get()});
+  auto session = camera::UseCamera({.facing = facing, .active = active});
   const auto status = session.Status();
+  const ImageFit selected_fit = fit;
   const bool expanded = UseViewportClass() == ViewportClass::Expanded;
   const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
   const bool failed = status.state == camera::SessionState::Failed;
@@ -314,7 +319,7 @@ View CameraWorkspace() {
   };
 
   auto toggle_camera = [active, authorizing, permission_error, application, tasks, session, failed] {
-    if (active.Get() && !failed) {
+    if (active && !failed) {
       active = false;
       return;
     }
@@ -327,7 +332,7 @@ View CameraWorkspace() {
           permission = co_await application.RequestPermissionAsync(Permission::Camera);
         }
         if (permission == PermissionStatus::Granted) {
-          if (active.Get()) session.Retry();
+          if (active) session.Retry();
           else active = true;
         } else {
           active = false;
@@ -355,7 +360,7 @@ View CameraWorkspace() {
     });
   };
   auto show_photo = [sheets, photo, tasks, saving_photo] {
-    const auto image = photo.Get();
+    const ImageAsset image = photo;
     if (!image.HasValue()) return;
     sheets.Show([image, tasks, saving_photo](BottomSheetContext sheet) {
       return PhotoReview(image, sheet, tasks, saving_photo);
@@ -363,9 +368,9 @@ View CameraWorkspace() {
   };
 
   View viewfinder = Stack {
-    camera::CameraPreview(session, {.fit = fit.Get(), .mirror = mirror.Get()}).Key("main-preview"),
-    live ? View() : EmptyPreview(status, authorizing.Get(), permission_error.Get()),
-    live && grid.Get() ? CompositionGrid() : View(),
+    camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
+    live ? View() : EmptyPreview(status, authorizing, permission_error),
+    live && grid ? CompositionGrid() : View(),
     Column {
       Row {
         StatusBadge(status.state),
@@ -374,7 +379,7 @@ View CameraWorkspace() {
             .With(Padding(8.0F), Background(Color::Rgb(15, 18, 22, 0.88F)), CornerRadius(8.0F)),
       }.With(CrossAlign(CrossAxisAlignment::Center)),
       Spacer(),
-      live && comparison.Get() ? View(Row {
+      live && comparison ? View(Row {
         Spacer(),
         Column {
           camera::CameraPreview(session, {.fit = ImageFit::Contain, .mirror = camera::MirrorMode::Off})
@@ -397,29 +402,29 @@ View CameraWorkspace() {
       Column {
         Label(FacingName(status.actual_facing ? status.actual_facing : facing.Get()),
               14.0F, foreground, FontWeight::Medium),
-        Label(fit.Get() == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
+        Label(selected_fit == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
       }.With(Spacing(4.0F)),
       Spacer(),
       IconButton(app::images::photo, "View last photo").OnClick(show_photo)
-          .With(Enabled(photo.Get().HasValue()), Background(control_background), CornerRadius(14.0F)),
+          .With(Enabled(photo->HasValue()), Background(control_background), CornerRadius(14.0F)),
     }.With(CrossAlign(CrossAxisAlignment::Center)),
     Row {
       IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
         const auto current = status.actual_facing ? status.actual_facing : facing.Get();
         facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
-      }).With(Enabled(!authorizing.Get() && !stopping), Background(control_background), CornerRadius(14.0F)),
-      Button(authorizing.Get() ? "Requesting access" : stopping ? "Stopping camera"
+      }).With(Enabled(!authorizing && !stopping), Background(control_background), CornerRadius(14.0F)),
+      Button(authorizing ? "Requesting access" : stopping ? "Stopping camera"
           : status.capturing_photo ? "Taking photo" : live ? "Take photo"
-          : failed || !permission_error.Get().empty() ? "Try again"
-          : active.Get() ? "Stop camera" : "Start camera")
+          : failed || !permission_error->empty() ? "Try again"
+          : active ? "Stop camera" : "Start camera")
           .OnClick([live, take_photo, toggle_camera] { if (live) take_photo(); else toggle_camera(); })
-          .With(Grow(), Enabled(!authorizing.Get() && !stopping && !status.capturing_photo)),
+          .With(Grow(), Enabled(!authorizing && !stopping && !status.capturing_photo)),
       live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
           .With(Background(control_background), CornerRadius(14.0F))) : View(),
       expanded ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
           .With(Background(control_background), CornerRadius(14.0F))),
     }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
-    photo_error.Get().empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
+    photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
   }.With(Spacing(18.0F), Padding(EdgeInsets::Symmetric(4.0F, 8.0F)), CrossAlign(CrossAxisAlignment::Stretch));
 
   View preview = Column {

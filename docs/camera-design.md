@@ -6,7 +6,7 @@ Status: the shared API, session ownership, preview drawing, Android capture, ind
 
 The Camera module manages capture through `CameraSession`, publishes preview frames through platform `ExternalTexture` implementations, and displays them inside HuxerUI through `camera::CameraPreview`.
 
-The default implementation does not embed Android PreviewView or Apple native preview layers through PlatformView. The camera produces frames; HuxerUI handles layout, clipping, transforms, gestures, and surrounding UI. If later measurements justify native preview on a particular platform, evaluate it separately. The initial version does not offer two interchangeable preview backends.
+The default implementation does not embed Android PreviewView or Apple preview layers through PlatformView. The camera produces frames; HuxerUI handles layout, clipping, transforms, gestures, and surrounding UI. If later measurements justify platform preview on a particular platform, evaluate it separately. The initial version does not offer two interchangeable preview backends.
 
 ```mermaid
 flowchart LR
@@ -120,7 +120,7 @@ class CameraSession {
 public:
   [[nodiscard]] CameraStatus Status() const;
   void Retry() const;
-  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
+  Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 };
 
 void Install(ApplicationContext& context);
@@ -138,7 +138,7 @@ View CameraPreview(CameraSession session, PreviewOptions options = {});
 
 ### Interface Semantics
 
-`CameraSession` is a copyable, stable handle rather than a native device object. `UseCamera()` retains the same handle at the same composition call site; configuration changes update that session's desired configuration. `location` forwards the caller's source location to the internal state retention logic. Owners in dynamic lists still require stable semantic keys.
+`CameraSession` is a copyable, stable handle rather than a platform device object. `UseCamera()` retains the same handle at the same composition call site; configuration changes update that session's desired configuration. `location` forwards the caller's source location to the internal state retention logic. Owners in dynamic lists still require stable semantic keys.
 
 `UseCamera()` must run in a composition context. Like an ordinary custom hook, it uses the caller's composition scope. Reusable components that call it directly require `[[huxerui::composable]]`. Define `CameraPreview` in a `.cpp` file so the existing composition code generator can process it.
 
@@ -154,7 +154,7 @@ Multiple CameraPreview instances can consume one Session. CameraPreview does not
 
 ### Page Usage Example
 
-This example assumes the page has already obtained authorization through the SDK. Application state controls `active`, and the page supplies bounded layout. The shared Camera APIs are implemented; native capture availability depends on the backend status in README.md.
+This example assumes the page has already obtained authorization through the SDK. Application state controls `active`, and the page supplies bounded layout. The shared Camera APIs are implemented; platform capture availability depends on the backend status in README.md.
 
 ```cpp
 [[huxerui::composable]]
@@ -177,13 +177,13 @@ Applications that need an error page or startup indicator read `session.Status()
 
 `CapturePhotoAsync(PhotoOptions)` returns `Task<CameraResult<ImageAsset>>`. `CameraResult<T>` reuses the SDK Result implementation with CameraError; ImageAsset already owns the encoded image, format, and dimensions. No camera-specific photo container or file result type is needed.
 
-A session accepts one still request at a time without queuing. It stays Running while `capturing_photo` is true; canceling the caller suppresses result delivery without admitting another capture before native cleanup. Stop, switch, background, close, and reported session interruptions resolve accepted work as Interrupted. Ordinary photo errors stay local to that result and do not populate CameraStatus::error. Generation and request identity checks discard stale callbacks.
+A session accepts one still request at a time without queuing. It stays Running while `capturing_photo` is true; canceling the caller suppresses result delivery without admitting another capture before platform cleanup. Stop, switch, background, close, and reported session interruptions resolve accepted work as Interrupted. Ordinary photo errors stay local to that result and do not populate CameraStatus::error. Generation and request identity checks discard stale callbacks.
 
-The first format is JPEG, with quality 1–100 and scale 1. The native target orientation and resolved mirror mode are frozen on acceptance. Each backend normalizes pixel orientation, optionally mirrors the upright pixels, and emits a JPEG that requires no EXIF rotation. Photo mirroring defaults to Off. Auto mirrors confirmed front cameras. Preview layout, crop, fit, and mirror settings have no effect on still capture. Native output negotiates photo dimensions independently; maximum-resolution photography, HDR, RAW, metadata retention, and recording are outside this phase.
+The first format is JPEG, with quality 1–100 and scale 1. The capture target orientation and resolved mirror mode are frozen on acceptance. Each backend normalizes pixel orientation, optionally mirrors the upright pixels, and emits a JPEG that requires no EXIF rotation. Photo mirroring defaults to Off. Auto mirrors confirmed front cameras. Preview layout, crop, fit, and mirror settings have no effect on still capture. Capture output negotiates photo dimensions independently; maximum-resolution photography, HDR, RAW, metadata retention, and recording are outside this phase.
 
 Android binds ImageCapture with Preview and performs JPEG normalization on a separate executor. The iOS and macOS implementations remain separate; each owns AVCapturePhotoOutput, a per-request delegate retained through final capture, and a photo processing queue. Stop completion waits for both preview release and photo cleanup. Unsupported preview/photo output combinations fall back to preview where configuration APIs can detect the limitation.
 
-The current SDK has no public callback-to-Task completion primitive. The private request stores one completion behind a condition variable; RunWorker bridges that completion through the SDK's existing cancellation and UI-dispatch contract. Native callbacks never directly resume coroutine frames. At most one such wait belongs to a session, and interruption releases it independently of native cleanup.
+The current SDK has no public callback-to-Task completion primitive. The private request stores one completion behind a condition variable; RunWorker bridges that completion through the SDK's existing cancellation and UI-dispatch contract. Platform callbacks never directly resume coroutine frames. At most one such wait belongs to a session, and interruption releases it independently of platform cleanup.
 
 Saving is composed with the SDK File and FilePicker APIs. Write ImageAsset::EncodedBytes() to an application-owned file, or prepare a temporary file and pass it to FilePicker::SaveFileAsync() for user-directed export. CameraSession does not add a duplicate SavePhotoAsync wrapper, select paths, or create photo-library entries. The example supports capture, photo review, and file export. See README.md for complete English usage examples and validation scope.
 
@@ -192,8 +192,8 @@ Saving is composed with the SDK File and FilePicker APIs. Write ImageAsset::Enco
 | Object | Owner | End of lifetime |
 | --- | --- | --- |
 | Session handle and observable status | The composition lifetime containing `UseCamera()` | Enters Closed when the owner unmounts; external handles can still read the terminal state |
-| Platform capture implementation | Session's committed lifecycle | Owner unmount; the backend may be reused after its native resources are fully stopped |
-| Native capture resources | Platform implementation | Released after the platform confirms it no longer uses the output resources |
+| Platform capture implementation | Session's committed lifecycle | Owner unmount; the backend may be reused after its platform resources are fully stopped |
+| Platform capture resources | Platform implementation | Released after the platform confirms it no longer uses the output resources |
 | Current texture | Session; render snapshots may also hold references | Finished after stopping; final release follows reference lifetime |
 | Display options and drawing content | Each CameraPreview | CameraPreview update or unmount |
 
@@ -209,7 +209,7 @@ Permission checks, startup, and shutdown are asynchronous. Composition functions
 | --- | --- |
 | Initial declaration before committed setup | Stopped |
 | active is true, the application is in the foreground, and authorization checks or device opening begin | Starting |
-| The native capture session starts successfully | Running |
+| The platform capture session starts successfully | Running |
 | active becomes false | If resources are held, enter Stopping, then Stopped after release |
 | The application enters Background while active remains true | If resources are held, enter Stopping, then Suspended after release |
 | A Suspended session returns to the foreground while active remains true | Check authorization again and enter Starting |
@@ -257,7 +257,7 @@ Geometry remains immutable within one output generation. Treat changes to orient
 
 This prevents old frames from briefly appearing with new geometry and an incorrect orientation. The initial version permits a brief gap during a switch rather than introducing transitions between two simultaneous outputs or a complex pipeline with per-frame metadata.
 
-Each backend must verify whether system transformations are already included in the Surface or buffer consumed by the SDK. If the existing public SDK contract cannot ensure consistent geometry for a new output, document the specific gap and discuss an SDK extension. Do not fill it by accessing private framework state or guessing matrices.
+Each backend must verify whether platform transformations are already included in the Surface or buffer consumed by the SDK. If the existing public SDK contract cannot ensure consistent geometry for a new output, document the specific gap and discuss an SDK extension. Do not fill it by accessing private framework state or guessing matrices.
 
 ## Platform Integration
 
@@ -265,7 +265,7 @@ Each backend must verify whether system transformations are already included in 
 
 Use the CameraX Preview use case, connecting its SurfaceProvider to `android::SurfaceStreamTexture`. The implementation pins CameraX 1.5.3. The SDK already owns the SurfaceTexture/OES consumer; the Camera module does not create a duplicate OES consumer.
 
-Create output using the actual resolution from SurfaceRequest. Obtain the Surface with a JNIEnv belonging to the calling thread and respect JNI local reference lifetimes. Keep the texture and necessary native references alive throughout CameraX's asynchronous use of the Surface.
+Create output using the actual resolution from SurfaceRequest. Obtain the Surface with a JNIEnv belonging to the calling thread and respect JNI local reference lifetimes. Keep the texture and necessary producer references alive throughout CameraX's asynchronous use of the Surface.
 
 Surface shutdown follows the producer's release protocol: stop or unbind the CameraX output, wait for notification that it no longer uses the Surface, then call Finish and release consumer resources. Request cancellation, configuration failure, and rapid switching must follow the same complete release path. Cancellation of a C++ request does not justify destroying a Surface still in use by the platform.
 
@@ -275,7 +275,7 @@ Read SurfaceRequest's TransformationInfo, verify which Surface transformations t
 
 The current Android implementation exchanges commands and snapshots through one SDK PlatformChannel. The backend subscribes to its snapshot event once during creation; Start and Retry reuse that subscription with generation checks. Three private JNI resource operations create a Surface stream, obtain its Surface, and finish it. They pass retained ExternalTexture payloads, not numeric texture handles. Each Surface request owns its texture until the producer's result callback; disposal retains outstanding cleanup independently of the C++ session facade.
 
-The initial full-frame path does not bind a ViewPort or effects. For direct camera Surfaces, the integration expects the SDK to consume the SurfaceTexture matrix into natural orientation, uses natural-orientation intrinsic dimensions, applies inverse display rotation, and reports native front mirroring. The user confirmed these preview behaviors on TAS_AN00; this does not establish compatibility with every camera device. Unexpected non-full cropping is rejected. Geometry changes invalidate the Surface request and publish a new immutable output generation. The user confirmed switching, all four orientations, mirroring, fitting, and background recovery on the tested device. Permission revocation and prolonged stress testing remain separate acceptance cases.
+The initial full-frame path does not bind a ViewPort or effects. For direct camera Surfaces, the integration expects the SDK to consume the SurfaceTexture matrix into natural orientation, uses natural-orientation intrinsic dimensions, applies inverse display rotation, and reports source front mirroring. The user confirmed these preview behaviors on TAS_AN00; this does not establish compatibility with every camera device. Unexpected non-full cropping is rejected. Geometry changes invalidate the Surface request and publish a new immutable output generation. The user confirmed switching, all four orientations, mirroring, fitting, and background recovery on the tested device. Permission revocation and prolonged stress testing remain separate acceptance cases.
 
 Report Unavailable when hardware acceleration or required EGL capabilities are missing. The initial version does not silently fall back to copying each frame into a Bitmap.
 
@@ -285,9 +285,9 @@ Use an AVFoundation capture session and video data output to publish CVPixelBuff
 
 Perform capture session configuration, start, and stop operations on a defined serial queue. UI bridge objects follow their main-thread contracts. After publication, callbacks may release the producer's own buffer reference but must not modify a buffer still retained by HuxerUI.
 
-Select pixel formats according to the active SDK and rendering support on actual devices. Measure compatibility and cost for common BGRA and native YUV output. Publish accepting a CVPixelBuffer does not establish support for every format, HDR, or color attachment. SDR is the initial acceptance baseline.
+Select pixel formats according to the active SDK and rendering support on actual devices. Measure compatibility and cost for common BGRA and camera YUV output. Publish accepting a CVPixelBuffer does not establish support for every format, HDR, or color attachment. SDR is the initial acceptance baseline.
 
-iOS and macOS have separate Objective-C++ implementations in `platform/ios/src/camera.mm` and `platform/macos/src/camera.mm`. They share only the public API, session orchestration, and preview drawing. The iOS factory uses the public `ios::PlatformModuleFactory` to receive its owning UIViewController; the existing Swift Package declares native framework dependencies. There is no Swift capture implementation or per-frame language bridge.
+iOS and macOS have separate Objective-C++ implementations in `platform/ios/src/camera.mm` and `platform/macos/src/camera.mm`. They share only the public API, session orchestration, and preview drawing. The iOS factory uses the public `ios::PlatformModuleFactory` to receive its owning UIViewController; the existing Swift Package declares platform framework dependencies. There is no Swift capture implementation or per-frame language bridge.
 
 The iOS output requests fixed portrait, unmirrored BGRA buffers from AVFoundation. PreviewOutput expresses the remaining clockwise rotation for the owning interface orientation: portrait 0°, landscape left 90°, upside-down 180°, and landscape right 270°. A transparent, noninteractive child view controller observes layout and rotation completion, reading UIWindowScene geometry or the owning controller orientation for hosts using the UIApplication lifecycle. It renders no preview content and is removed synchronously on stop. Device image checks must verify the mapping on front/back cameras and landscape-mounted iPad cameras.
 
@@ -297,13 +297,13 @@ Camera declares its AVFoundation, CoreMedia, CoreVideo, and UIKit dependencies t
 
 ### Windows
 
-The backend uses Media Foundation Capture Engine with video-only device initialization. A private serial queue runs start, photo, and stop operations on Windows thread-pool workers initialized for COM MTA. Native event waits stay off the UI thread. Queue ownership retains capture resources through asynchronous cleanup; an explicit stop also satisfies backend destruction, avoiding duplicate stop scheduling.
+The backend uses Media Foundation Capture Engine with video-only device initialization. A private serial queue runs start, photo, and stop operations on Windows thread-pool workers initialized for COM MTA. Capture Engine event waits stay off the UI thread. Queue ownership retains capture resources through asynchronous cleanup; an explicit stop also satisfies backend destruction, avoiding duplicate stop scheduling.
 
 The preview sink negotiates RGB32 output. Positive-stride samples upload directly from the locked media buffer to a BGRA D3D11 texture; negative-stride samples use a reusable buffer to reverse row order. Publication through the SDK's `windows::D3D11Texture` produces render snapshots without per-frame UI state changes. This path includes CPU-to-GPU upload and SDK snapshot copying; it does not promise zero-copy capture. Sample publication and texture Finish share a lock.
 
 Default selection uses the first enumerated video device. Explicit facing matches Windows device enclosure metadata; unknown or opposite-facing devices are not substitutes. Preview rotation uses the selected stream's rotation metadata. The backend does not track changes from a device orientation sensor during capture.
 
-Still capture uses the engine's preferred photo source and an in-memory JPEG sink, without requiring a separate physical photo stream. WIC normalizes EXIF orientation, falling back to stream rotation when EXIF orientation is absent, then applies final mirroring and JPEG quality. Stop is serialized after accepted photo work. A native photo timeout fails the session and shuts down the engine before another request can reuse it.
+Still capture uses the engine's preferred photo source and an in-memory JPEG sink, without requiring a separate physical photo stream. WIC normalizes EXIF orientation, falling back to stream rotation when EXIF orientation is absent, then applies final mirroring and JPEG quality. Stop is serialized after accepted photo work. A Capture Engine photo timeout fails the session and shuts down the engine before another request can reuse it.
 
 Automated image tests check all four corners for four stream rotations, all eight EXIF orientations, EXIF precedence, and final mirroring. Optional device tests cover frame publication, JPEG capture, pending-operation stops, strict facing selection, and restart. Device removal, permission revocation during capture, multiple GPU adapters, and sustained performance still require separate validation.
 
@@ -339,15 +339,15 @@ The module and application shell configure the Android manifest, Apple usage des
 
 ## Threads, Cancellation, and Backpressure
 
-The UI thread owns observable Session state, desired configuration, and lifecycle decisions. Platform queues own native device operations. Texture publication follows the threading constraints of the corresponding SDK type.
+The UI thread owns observable Session state, desired configuration, and lifecycle decisions. Platform queues own device operations. Texture publication follows the threading constraints of the corresponding SDK type.
 
 Allocate an internal, monotonically increasing generation identifier for each startup or output rebuild. Callbacks validate the generation and closed state before publishing output or posting UI updates. This identifier isolates stale work and is not part of the public API.
 
-Generation checks do not replace synchronization. A publication callback that has already passed its check must still be serialized or protected by mutual exclusion against Finish. Destruction waits for required native operations already in progress. The UI handle may enter Closed first, while internal objects retain resources until cleanup completes.
+Generation checks do not replace synchronization. A publication callback that has already passed its check must still be serialized or protected by mutual exclusion against Finish. Destruction waits for required platform operations already in progress. The UI handle may enter Closed first, while internal objects retain resources until cleanup completes.
 
 Rapid configuration changes retain only the latest desired configuration. After closing the old device, start with that latest configuration rather than accumulating a queue of camera switches. Do not open the new device before the old one has been released.
 
-CameraPreview uses a latest-frame policy. The module does not create an unbounded frame queue. Apple output may discard outdated preview frames, and Android follows the Surface protocol. The SDK and native platform may still have buffers in flight, so the design does not promise that the entire system retains only one frame.
+CameraPreview uses a latest-frame policy. The module does not create an unbounded frame queue. Apple output may discard outdated preview frames, and Android follows the Surface protocol. The SDK and platform may still have buffers in flight, so the design does not promise that the entire system retains only one frame.
 
 Publish state changes from external threads through UI dispatch constrained by the owning lifecycle. Use the SDK's TaskScope or platform bridge dispatcher; do not access private State cells or use detached threads without an owner.
 
@@ -355,7 +355,7 @@ Publish state changes from external threads through UI dispatch constrained by t
 
 `Install(root)` registers one internal, strongly typed capture factory. The library centrally defines the registration name, proposed as `camera/Session`. Install does not open devices, request authorization, or create a global camera session.
 
-The public CameraSession handles composition lifetime and domain state. The internal platform implementation handles system capture only. PlatformModule serves the device control boundary, while ExternalTexture handles frame production and display. Direct C++ paths remain strongly typed; only actual language boundaries use PlatformPayload or PlatformChannel. Application pages do not access those transport types.
+The public CameraSession handles composition lifetime and domain state. The internal platform implementation handles capture only. PlatformModule serves the device control boundary, while ExternalTexture handles frame production and display. Direct C++ paths remain strongly typed; only actual language boundaries use PlatformPayload or PlatformChannel. Application pages do not access those transport types.
 
 Add the following files as their functionality is implemented, without creating empty interfaces or placeholder layers for every platform in advance:
 
@@ -378,7 +378,7 @@ examples/preview/src/app.cpp
 
 Keep only the contracts that Session and platform implementations must share in `camera_internal.h`. Geometry helpers can initially remain in `camera_preview.cpp`; do not extract a general graphics library before a second real consumer exists.
 
-Do not modify generated host entry points to establish a second registration path. Add platform sources and dependencies through the current generated project structure. The iOS implementation uses the public native factory through CMake; the Swift Package contributes framework link dependencies.
+Do not modify generated host entry points to establish a second registration path. Add platform sources and dependencies through the current generated project structure. The iOS implementation uses the public platform factory through CMake; the Swift Package contributes framework link dependencies.
 
 ## Implementation Order and Acceptance
 
@@ -409,13 +409,13 @@ The independent iOS integration is complete. JPEG photo capture is implemented o
 
 Geometry mathematics and asynchronous lifecycle races warrant focused automated tests: use asymmetric markers to verify corner mapping and controlled callback ordering to verify shutdown and restart. Device release, Surface lifetime, permissions, orientation, and performance require checks on an available host or physical device. Mock tests alone do not establish that these scenarios pass.
 
-Performance records should include the device, resolution, actual frame rate, end-to-end latency, CPU/GPU usage, memory, and behavior during extended operation. Compare with native preview when needed, without assuming zero-copy operation, minimum power consumption, or identical performance across platforms.
+Performance records should include the device, resolution, actual frame rate, end-to-end latency, CPU/GPU usage, memory, and behavior during extended operation. Compare with platform preview when needed, without assuming zero-copy operation, minimum power consumption, or identical performance across platforms.
 
 ## Design Review
 
 The design retains one public Session handle, one hook, and one CameraPreview. It does not introduce a parallel Controller, general frame bus, dual-backend mode, or pluggable processing graph. Declarative configuration controls operation, the SDK texture mechanism updates frames, and owner teardown actively releases hardware.
 
-Physical iOS operation has been confirmed by the user. Remaining checks include successful-session asynchronous stop and stale-callback regression coverage, detailed iOS window-orientation and native-interruption cases, and Apple pixel-format compatibility and sustained performance. These are explicit implementation entry checks, not gaps to fill with invented SDK APIs. If validation requires changes to HuxerUI core, a broader public API, or another backend, report the concrete evidence and discuss it first.
+Physical iOS operation has been confirmed by the user. Remaining checks include successful-session asynchronous stop and stale-callback regression coverage, detailed iOS window-orientation and platform-interruption cases, and Apple pixel-format compatibility and sustained performance. These are explicit implementation entry checks, not gaps to fill with invented SDK APIs. If validation requires changes to HuxerUI core, a broader public API, or another backend, report the concrete evidence and discuss it first.
 
 ## References
 

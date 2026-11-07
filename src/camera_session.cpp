@@ -48,7 +48,7 @@ void CameraSessionData::InterruptPhoto() {
 
 void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request) {
   photo = request;
-  auto value = status.Get();
+  CameraStatus value = status;
   value.capturing_photo = true;
   status = value;
   options.mirror =
@@ -62,7 +62,7 @@ void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<P
       if (!owner || owner->photo != request)
         return;
       owner->photo.reset();
-      auto value = owner->status.Get();
+      CameraStatus value = owner->status;
       value.capturing_photo = false;
       owner->status = std::move(value);
       request->Complete(std::move(result));
@@ -206,7 +206,7 @@ Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> o
   }
   auto request = std::make_shared<PhotoRequest>();
   owner->BeginPhoto(options, request);
-  // Let the SDK own coroutine resumption and cancellation; native callbacks never resume a frame directly.
+  // Let the SDK own coroutine resumption and cancellation; platform callbacks never resume a frame directly.
   co_return co_await RunWorker([request] { return request->Wait(); });
 }
 
@@ -217,7 +217,7 @@ namespace huxerui::camera {
 CameraSession::CameraSession(std::shared_ptr<detail::CameraSessionData> data) : data_(std::move(data)) {}
 
 CameraStatus CameraSession::Status() const {
-  return data_->status.Get();
+  return data_->status;
 }
 
 void CameraSession::Retry() const {
@@ -240,7 +240,7 @@ CameraSession UseCamera(CameraOptions options, const std::source_location& locat
   auto tasks = UseTaskScope();
   auto application = UseApplication();
   auto retained = UseState(std::make_shared<detail::CameraSessionData>(status, tasks, application), location);
-  auto data = retained.Get();
+  std::shared_ptr<detail::CameraSessionData> data = retained;
   const bool background = application.LifecycleState() == ApplicationLifecycleState::Background;
   Lifecycle([data] {
     data->backend = OpenPlatformModule<std::shared_ptr<detail::CameraBackend>>(detail::camera_module_name);

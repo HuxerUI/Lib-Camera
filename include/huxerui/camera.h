@@ -181,7 +181,7 @@ struct CameraStatus {
   /// Available texture and presentation geometry, or empty before output is available or after it is cleared.
   /// A suspended platform session may retain output; its presence alone does not indicate live capture.
   std::optional<PreviewOutput> preview;
-  /// Whether an accepted photo request is still pending, including native processing after caller cancellation.
+  /// Whether an accepted photo request is still pending, including platform processing after caller cancellation.
   /// Capture normally remains Running during a photo; this flag is shared by all session handles.
   bool capturing_photo = false;
 
@@ -216,15 +216,15 @@ public:
   /// @endcode
   void Retry() const;
 
-  /// Captures a JPEG photo through the native still-photo output of the current camera.
+  /// Captures a JPEG photo through the platform still-photo output of the current camera.
   /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
   /// Only one request is accepted at a time; additional requests return OperationInProgress without queuing.
   /// The target orientation and resolved mirror mode are fixed when the request is accepted.
   /// Success returns an independent ImageAsset with upright pixels, normal EXIF orientation, and scale 1.
-  /// Photo dimensions are negotiated by the native output, independently of the preview's layout or Cover crop.
+  /// Photo dimensions are negotiated by the capture output, independently of the preview's layout or Cover crop.
   /// Stopping, switching, backgrounding, or session failure ends a pending request with Interrupted.
   /// An individual photo error does not set CameraStatus::error or stop otherwise healthy preview capture.
-  /// Task cancellation suppresses delivery; native cleanup continues before another request is accepted.
+  /// Task cancellation suppresses delivery; platform cleanup continues before another request is accepted.
   /// No file or photo-library entry is created. Save EncodedBytes() with the SDK File APIs when needed.
   /// @param options JPEG quality and final mirroring for this request only.
   /// @return A task yielding an owned JPEG image or CameraError; unavailable still-photo output returns Unavailable.
@@ -237,7 +237,7 @@ public:
   ///   message = result.Error().message;
   /// }
   /// @endcode
-  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
+  Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
 private:
   explicit CameraSession(std::shared_ptr<detail::CameraSessionData> data);
@@ -287,7 +287,7 @@ void Install(ApplicationContext& context);
 ///   auto active = UseState(false);
 ///   auto application = UseApplication();
 ///   auto tasks = UseTaskScope();
-///   auto session = camera::UseCamera({.active = active.Get()});
+///   auto session = camera::UseCamera({.active = active});
 ///
 ///   return Column {
 ///     camera::CameraPreview(session).With(Frame{.width = 320.0F, .height = 240.0F}),

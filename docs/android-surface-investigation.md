@@ -50,7 +50,7 @@ All temporary synthetic producers, diagnostic JNI methods, automatic starts, rep
 
 ## Root Cause and Fix
 
-The black-preview TextureViews were attached, visible, and measured, but `isAvailable()` remained false. In `platform/android/huxerui/src/main/cpp/android_gpu_texture.cpp`, `AndroidTextureLayers::Draw` returned whenever `has_presentation` was false. A newly mounted TextureView requires its first `drawChild` pass to create its display Surface; without that Surface, the native layer cannot present a frame. The guard therefore prevented initialization from progressing.
+The black-preview TextureViews were attached, visible, and measured, but `isAvailable()` remained false. In `platform/android/huxerui/src/main/cpp/android_gpu_texture.cpp`, `AndroidTextureLayers::Draw` returned whenever `has_presentation` was false. A newly mounted TextureView requires its first `drawChild` pass to create its display Surface; without that Surface, the platform layer cannot present a frame. The guard therefore prevented initialization from progressing.
 
 The guard now returns only when `!layer.has_presentation && layer.output`. A new child with no output Surface can perform its first draw, while an existing output still remains hidden until its current frame has been presented. No public API or camera transport changes were needed.
 

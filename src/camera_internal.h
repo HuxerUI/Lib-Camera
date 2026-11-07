@@ -15,7 +15,7 @@ public:
   virtual void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) = 0;
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
-  /// Delivers one independent, upright JPEG. Stop must wait for accepted native photo work to finish cleanup.
+  /// Delivers one independent, upright JPEG. Stop must wait for accepted platform photo work to finish cleanup.
   virtual void CapturePhoto(PhotoOptions, std::function<void(CameraResult<ImageAsset>)> completed) {
     completed(CameraResult<ImageAsset>::Failure(
         {CameraErrorCode::Unavailable, "Still-photo capture is unavailable on this camera."}));

@@ -106,16 +106,16 @@ View PhotoCapture(camera::CameraSession session, State<ImageAsset> photo) {
         }
       });
     }).With(Enabled(status.state == camera::SessionState::Running && !status.capturing_photo)),
-    Text(message.Get()),
+    Text(message),
   };
 }
 ```
 
-The result is an upright JPEG whose resolution is selected by the native camera output. Preview size, fitting, and cropping do not affect the photo. Photo mirroring is independent of preview mirroring and defaults to `Off`. JPEG quality defaults to 90 and must be between 1 and 100; invalid options throw `std::invalid_argument` before returning the task.
+The result is an upright JPEG whose resolution is selected by the platform camera output. Preview size, fitting, and cropping do not affect the photo. Photo mirroring is independent of preview mirroring and defaults to `Off`. JPEG quality defaults to 90 and must be between 1 and 100; invalid options throw `std::invalid_argument` before returning the task.
 
 Keep the original `ImageAsset` for saving. For photo review on Android, decode a separate thumbnail before displaying it: constraining an `Image` view's layout does not reduce the original bitmap's decoded dimensions. The [example](examples/preview/src/app.cpp) displays a thumbnail with a maximum edge of 2048 pixels while preserving the original JPEG for export.
 
-Only one photo request can be in progress per session. Additional requests return `OperationInProgress`; a session that is not ready returns `NotReady`. `capturing_photo` stays true until native processing finishes, including after the caller cancels waiting. Stopping, switching cameras, backgrounding, or session failure interrupts a pending photo with `Interrupted`.
+Only one photo request can be in progress per session. Additional requests return `OperationInProgress`; a session that is not ready returns `NotReady`. `capturing_photo` stays true until platform processing finishes, including after the caller cancels waiting. Stopping, switching cameras, backgrounding, or session failure interrupts a pending photo with `Interrupted`.
 
 A photo failure does not stop an otherwise healthy preview. A captured `ImageAsset` remains usable after the session closes. Devices that cannot provide still-photo output report `Unavailable` for photo requests. Video recording, RAW, HDR, maximum sensor resolution, and metadata preservation are outside the current API's guarantees.
 
@@ -149,7 +149,7 @@ Task<bool> ExportPhoto(ImageAsset photo, File prepared_file, std::shared_ptr<Fil
 
 Obtain the picker with `UseService<FilePicker>()` during composition and pass a unique temporary file as `prepared_file`. The task returns false when saving is unavailable, dismissed, or unsuccessful. File operations use SDK file results rather than `CameraError`.
 
-Your application owns temporary-file cleanup. Keep the file available until writing and native export finish; canceling the caller does not make it safe to delete immediately. The example keeps saving in the camera page's task scope so dismissing photo review does not cancel the export. Saving directly to the system photo library is not provided by this module.
+Your application owns temporary-file cleanup. Keep the file available until writing and platform export finish; canceling the caller does not make it safe to delete immediately. The example keeps saving in the camera page's task scope so dismissing photo review does not cancel the export. Saving directly to the system photo library is not provided by this module.
 
 ## Run the Example
 
@@ -166,7 +166,7 @@ Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use 
 
 Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The photo icon opens the latest photo and its **Save photo** action. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
 
-On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the native photo output and WIC to normalize orientation and JPEG quality.
+On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
 ## Tests
 

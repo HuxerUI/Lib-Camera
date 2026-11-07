@@ -13,6 +13,8 @@
 #include "camera_session.h"
 #include "photo_fixture.h"
 
+#define CAMERA_DISCARD(expression) static_cast<void>(expression)
+
 using namespace huxerui;
 using namespace huxerui::camera;
 
@@ -158,7 +160,7 @@ std::vector<std::shared_ptr<TestBackend>> backends;
 [[huxerui::composable]]
 View TestOwner() {
   requested = UseState(CameraOptions{.active = false});
-  auto session = UseCamera(requested.Get());
+  auto session = UseCamera(requested);
   retained_session = session;
   return Column {
     CameraPreview(session).With(Frame{.width = 80.0F, .height = 60.0F}),
@@ -168,7 +170,7 @@ View TestOwner() {
 
 View TestRoot() {
   visible = UseState(true);
-  return visible.Get() ? TestOwner() : Canvas([](PaintContext&, Size) {});
+  return visible ? TestOwner() : Canvas([](PaintContext&, Size) {});
 }
 
 void TestSessionLifetime() {
@@ -195,7 +197,7 @@ void TestSessionLifetime() {
     for (int quality : {0, 101}) {
       bool rejected = false;
       try {
-        (void)retained_session->CapturePhotoAsync({.jpeg_quality = quality});
+        CAMERA_DISCARD(retained_session->CapturePhotoAsync({.jpeg_quality = quality}));
       } catch (const std::invalid_argument&) {
         rejected = true;
       }
@@ -262,7 +264,7 @@ View PhotoTestOwner(PhotoTestContext* context) {
   auto status = UseState(CameraStatus{.state = SessionState::Running, .actual_facing = context->facing});
   auto tasks = UseTaskScope();
   auto retained = UseState(std::make_shared<camera::detail::CameraSessionData>(status, tasks, UseApplication()));
-  context->owner = retained.Get();
+  context->owner = retained;
   Lifecycle([owner = context->owner, backend = context->backend] {
     owner->backend = backend;
     owner->engaged = true;
@@ -277,7 +279,7 @@ PhotoTestContext* active_photo_test = nullptr;
 View PhotoTestContent(PhotoTestContext* context) {
   context->callers = UseTaskScope();
   context->visible = UseState(true);
-  return context->visible.Get() ? PhotoTestOwner(context) : View{};
+  return context->visible ? PhotoTestOwner(context) : View{};
 }
 
 View PhotoTestRoot() { return PhotoTestContent(active_photo_test); }
@@ -324,14 +326,14 @@ void TestPhotoRequests() {
     fixture.Drain();
     Check(owner->status->capturing_photo, "Accepted photo must publish busy state.");
     Check(backend->options.mirror == MirrorMode::On, "Auto photo mirror must lock actual front facing.");
-    Check(backend->options.jpeg_quality == 82, "Photo quality must reach the native backend.");
-    (void)fixture.Launch(second);
+    Check(backend->options.jpeg_quality == 82, "Photo quality must reach the platform backend.");
+    fixture.Launch(second);
     fixture.Await(second);
     Check(second->Error().code == CameraErrorCode::OperationInProgress, "Concurrent photos must be rejected.");
     Check(backend->captures == 1, "Rejected photo must not reach the backend.");
     handle.Cancel();
     fixture.Drain();
-    Check(owner->status->capturing_photo, "Canceling the caller must not release native capture ownership.");
+    Check(owner->status->capturing_photo, "Canceling the caller must not release platform capture ownership.");
     backend->Complete(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Injected capture failure."}));
     fixture.Drain();
     Check(!first && !owner->status->capturing_photo, "Canceled caller must not receive a late callback.");
@@ -341,7 +343,7 @@ void TestPhotoRequests() {
   {
     PhotoTestFixture fixture;
     std::optional<CameraResult<ImageAsset>> result;
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Drain();
     fixture.context.backend->Complete(
         CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Injected encoding failure."}));
@@ -354,20 +356,20 @@ void TestPhotoRequests() {
     PhotoTestFixture fixture;
     const auto& owner = fixture.context.owner;
     std::optional<CameraResult<ImageAsset>> result;
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Drain();
     owner->Update({.active = false}, false);
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::Interrupted, "Stopping must interrupt the photo task.");
-    Check(owner->status->state == SessionState::Stopping, "Stop must wait for native photo cleanup.");
-    Check(owner->status->capturing_photo, "Native cleanup remains busy while stopping.");
+    Check(owner->status->state == SessionState::Stopping, "Stop must wait for platform photo cleanup.");
+    Check(owner->status->capturing_photo, "Platform cleanup remains busy while stopping.");
     fixture.context.backend->Complete(
-        CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Late native failure."}));
+        CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Late platform failure."}));
     fixture.Drain();
     Check(result->Error().code == CameraErrorCode::Interrupted, "Late callbacks must not replace interruption.");
-    Check(owner->status->state == SessionState::Stopped, "Native completion must settle stop.");
+    Check(owner->status->state == SessionState::Stopped, "Platform completion must settle stop.");
     result.reset();
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::NotReady, "Stopped camera must reject photos.");
   }
@@ -376,7 +378,7 @@ void TestPhotoRequests() {
   {
     PhotoTestFixture fixture(Facing::Back);
     std::optional<CameraResult<ImageAsset>> result;
-    (void)fixture.Launch(result, {.mirror = MirrorMode::Auto});
+    fixture.Launch(result, {.mirror = MirrorMode::Auto});
     fixture.Drain();
     Check(fixture.context.backend->options.mirror == MirrorMode::Off,
           "Auto photo mirror must leave rear cameras unmirrored.");
@@ -394,7 +396,7 @@ void TestPhotoRequests() {
     PhotoTestFixture fixture;
     const auto& owner = fixture.context.owner;
     std::optional<CameraResult<ImageAsset>> result;
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Drain();
     Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened_facing,
           "Interruption scenarios must start with a healthy, matching camera configuration.");
@@ -404,7 +406,7 @@ void TestPhotoRequests() {
     owner->Update(options, background);
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::Interrupted, "Switching and background must interrupt photos.");
-    Check(owner->status->state == SessionState::Stopping, "Interruption must wait for native cleanup.");
+    Check(owner->status->state == SessionState::Stopping, "Interruption must wait for platform cleanup.");
     fixture.context.backend->Complete(CameraResult<ImageAsset>::Success(image));
     fixture.Drain();
     Check(!owner->status->capturing_photo, "Late successful capture must release busy state.");
@@ -416,18 +418,18 @@ void TestPhotoRequests() {
     PhotoTestFixture fixture;
     const auto owner = fixture.context.owner;
     std::optional<CameraResult<ImageAsset>> result;
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Drain();
     fixture.context.visible = false;
     fixture.Drain();
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::Interrupted, "Owner unmount must resolve an external caller.");
-    Check(!owner->backend, "Owner unmount must release its native backend reference.");
+    Check(!owner->backend, "Owner unmount must release its platform backend reference.");
     fixture.context.backend->Complete(CameraResult<ImageAsset>::Success(image));
     fixture.Drain();
     Check(owner->status->state == SessionState::Closed, "Late capture must not reopen an unmounted owner.");
     result.reset();
-    (void)fixture.Launch(result);
+    fixture.Launch(result);
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::NotReady, "Closed camera must reject photos.");
   }

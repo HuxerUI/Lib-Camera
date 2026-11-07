@@ -352,10 +352,10 @@ public:
     if (events_)
       events_->Silence();
     if (engine_ && preview_started_ && SUCCEEDED(engine_->StopPreview()))
-      (void)events_->Wait(MF_CAPTURE_ENGINE_PREVIEW_STOPPED);
+      events_->Wait(MF_CAPTURE_ENGINE_PREVIEW_STOPPED);
     // Shutdown also covers failed initialization and a device that no longer sends stop events.
     if (device_)
-      (void)device_->Shutdown();
+      device_->Shutdown();
     if (frames_)
       frames_->Finish();
     preview_.Reset();
@@ -383,21 +383,21 @@ public:
     try {
       Require(com_status_);
       constexpr DWORD stream = MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_PHOTO;
-      ComPtr<IMFMediaType> native;
-      const HRESULT available = source_->GetCurrentDeviceMediaType(stream, &native);
+      ComPtr<IMFMediaType> source_type;
+      const HRESULT available = source_->GetCurrentDeviceMediaType(stream, &source_type);
       if (available == MF_E_INVALIDSTREAMNUMBER) {
         completed(CameraResult<ImageAsset>::Failure(
-            {CameraErrorCode::Unavailable, "This camera does not expose a native photo output."}));
+            {CameraErrorCode::Unavailable, "This camera does not expose a still-photo output."}));
         return;
       }
       Require(available);
-      const auto rotation = Rotation(native.Get());
+      const auto rotation = Rotation(source_type.Get());
       ComPtr<IMFMediaType> type;
       Require(MFCreateMediaType(&type));
       Require(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Image));
       Require(type->SetGUID(MF_MT_SUBTYPE, GUID_ContainerFormatJpeg));
       UINT32 width = 0, height = 0;
-      Require(MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &width, &height));
+      Require(MFGetAttributeSize(source_type.Get(), MF_MT_FRAME_SIZE, &width, &height));
       Require(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width, height));
       ComPtr<IMFCaptureSink> sink;
       Require(engine_->GetSink(MF_CAPTURE_ENGINE_SINK_TYPE_PHOTO, &sink));
@@ -431,15 +431,15 @@ public:
       if (read != jpeg.size())
         throw E_FAIL;
       auto image = EncodeWindowsPhoto(jpeg, options, rotation);
-      (void)photo->RemoveAllStreams();
+      photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Success(std::move(image)));
     } catch (HRESULT result) {
       if (photo)
-        (void)photo->RemoveAllStreams();
+        photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Failure(Error(result, CameraErrorCode::CaptureFailed)));
     } catch (const std::exception& error) {
       if (photo)
-        (void)photo->RemoveAllStreams();
+        photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
     }
   }
@@ -469,15 +469,15 @@ private:
 
   void ConfigurePreview() {
     constexpr DWORD stream = MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_VIDEO_PREVIEW;
-    ComPtr<IMFMediaType> native;
-    Require(source_->GetCurrentDeviceMediaType(stream, &native));
-    rotation_ = Rotation(native.Get());
+    ComPtr<IMFMediaType> source_type;
+    Require(source_->GetCurrentDeviceMediaType(stream, &source_type));
+    rotation_ = Rotation(source_type.Get());
     ComPtr<IMFMediaType> type;
     Require(MFCreateMediaType(&type));
-    Require(native->CopyAllItems(type.Get()));
+    Require(source_type->CopyAllItems(type.Get()));
     Require(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32));
-    (void)type->DeleteItem(MF_MT_DEFAULT_STRIDE);
-    (void)type->DeleteItem(MF_MT_SAMPLE_SIZE);
+    type->DeleteItem(MF_MT_DEFAULT_STRIDE);
+    type->DeleteItem(MF_MT_SAMPLE_SIZE);
     ComPtr<IMFCaptureSink> sink;
     Require(engine_->GetSink(MF_CAPTURE_ENGINE_SINK_TYPE_PREVIEW, &sink));
     Require(sink.As(&preview_));
