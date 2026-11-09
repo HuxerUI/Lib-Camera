@@ -61,7 +61,9 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_STL=${huxeruiStl}",
-                        "-DHUXERUI_HOME=${huxeruiHome.absolutePath}"
+                        "-DHUXERUI_HOME=${huxeruiHome.absolutePath}",
+                        "-DHUXERUI_OPTIMIZATION=${providers.gradleProperty('huxeruiOptimization').orElse('default').get()}",
+                        "-DHUXERUI_ENABLE_LTO=${providers.gradleProperty('huxeruiLto').orElse('OFF').get()}"
             }
         }
 
@@ -105,7 +107,7 @@ androidComponents.onVariants(androidComponents.selector().all()) { variant ->
     }
     def libraryFile = layout.buildDirectory.file("generated/huxerui/app-library/${variant.name}.txt").get().asFile
     def resolveLibrary = tasks.register("resolveHuxerUI${variant.name.capitalize()}AppLibrary") {
-        // Resolve configured app ABIs; the SDK archive may also contain other architectures.
+        // Dependencies can contribute native libraries for ABIs the app does not build.
         inputs.dir(nativeLibraries)
         inputs.dir(integrationRoot)
         outputs.file(libraryFile)
