@@ -1,5 +1,14 @@
 #pragma once
 
+/// @file
+/// @brief Camera sessions, live previews, frame processing, still photos, and video recording.
+///
+/// Include <huxerui/camera.h> and link HuxerUI::Camera. Register Install before composing UseCamera.
+/// The owning composition controls capture. Use CameraPreview to present frames and CameraSession to
+/// capture photos or record video. Recording uses the codec and container APIs from HuxerUI::Media.
+
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <source_location>
@@ -7,6 +16,7 @@
 
 #include <huxerui/external_texture.h>
 #include <huxerui/data.h>
+#include <huxerui/file.h>
 #include <huxerui/resource.h>
 #include <huxerui/app.h>
 #include <huxerui/task.h>
@@ -14,7 +24,8 @@
 
 namespace huxerui::camera {
 
-/// Camera position relative to the device's primary display.
+/// @brief Camera position relative to the device's primary display.
+///
 /// Devices whose position is unknown report an empty CameraStatus::actual_facing.
 enum class Facing {
   /// Camera facing the user on the display side of the device.
@@ -23,10 +34,11 @@ enum class Facing {
   Back,
 };
 
-/// Selects the final horizontal mirror appearance of an upright preview or photo.
+/// @brief Selects the final horizontal mirror appearance of an upright preview or photo.
+///
 /// CameraPreview accounts for PreviewOutput::mirrored to avoid applying mirroring twice.
 enum class MirrorMode {
-  /// Mirror a confirmed Facing::Front camera; leave rear or unknown-facing cameras unmirrored.
+  /// Mirror a confirmed Facing::Front camera. Rear and unknown-facing cameras appear unmirrored.
   Auto,
   /// Show an unmirrored result, undoing source mirroring when necessary.
   Off,
@@ -34,45 +46,48 @@ enum class MirrorMode {
   On,
 };
 
-/// Clockwise rotation still required to orient a cropped source for the current preview.
+/// @brief Clockwise rotation required to orient a cropped source.
 enum class PreviewRotation {
   /// No remaining rotation.
   R0,
-  /// Rotate 90 degrees clockwise; exchange the cropped width and height.
+  /// Rotate 90 degrees clockwise and exchange the cropped width and height.
   R90,
   /// Rotate 180 degrees clockwise.
   R180,
-  /// Rotate 270 degrees clockwise; exchange the cropped width and height.
+  /// Rotate 270 degrees clockwise and exchange the cropped width and height.
   R270,
 };
 
-/// Observed capture lifecycle, distinct from CameraOptions::active capture intent.
+/// @brief Observed lifecycle of a camera session.
+///
 /// Start, stop, and camera-switch operations settle asynchronously.
+/// @see CameraOptions::active, CameraSession::Status()
 enum class SessionState {
-  /// No active capture; also the initial state before capture intent is applied.
+  /// No active capture. This is the initial state before capture intent is applied.
   Stopped,
   /// Checking existing authorization or preparing the selected camera.
   Starting,
-  /// Capture has started; the first preview frame may not yet be available.
+  /// Capture has started. The first preview frame may still be pending.
   Running,
   /// Releasing capture resources before applying the latest capture intent.
   Stopping,
-  /// Capture is temporarily paused by application backgrounding or a reported platform interruption.
+  /// Capture is temporarily paused by application backgrounding or a system interruption.
   Suspended,
-  /// Capture could not proceed; CameraStatus::error describes the failure.
+  /// Capture could not proceed. CameraStatus::error describes the failure.
   Failed,
-  /// The owning UseCamera composition was unmounted; this session cannot be restarted.
+  /// The owning UseCamera composition was unmounted and the session is permanently closed.
   Closed,
 };
 
-/// Portable failure categories for authorization, device selection, and capture.
+/// @brief Portable failure categories for authorization, device selection, and capture.
+///
 /// Platform-specific details are provided by CameraError::message.
 enum class CameraErrorCode {
-  /// Camera authorization has not been requested; the application must request it explicitly.
+  /// The application still needs to request camera authorization.
   PermissionRequired,
   /// Camera access is denied or restricted by the user or system policy.
   PermissionDenied,
-  /// The platform, capture backend, or required platform capability is unavailable.
+  /// A capture backend or required platform capability is unavailable.
   Unavailable,
   /// No camera matches the requested facing, or no default camera can be found.
   DeviceNotFound,
@@ -82,83 +97,74 @@ enum class CameraErrorCode {
   DeviceDisconnected,
   /// The requested capture input, output, format, or preview geometry could not be configured.
   ConfigurationFailed,
-  /// Capture failed to start, resume, continue, or produce a photo for another reason.
+  /// Capture failed to start, resume, process a frame, or complete a photo or recording.
   CaptureFailed,
-  /// The session is not running and ready to accept a photo request.
+  /// The session is not running and ready to accept the capture request.
   NotReady,
-  /// Another photo request is still being captured or processed by this session.
+  /// An operation of the same kind is still being captured, processed, or finalized by this session.
   OperationInProgress,
   /// An accepted request was interrupted by stopping, switching, backgrounding, or session failure.
   Interrupted,
 };
 
-/// Diagnostic information for a failed camera session or individual operation.
+/// @brief Diagnostic information for a failed camera session or individual operation.
 struct CameraError {
   /// Stable category suitable for application recovery decisions.
   CameraErrorCode code;
-  /// Human-readable diagnostic that may contain platform-provided text.
-  /// Wording and language are not stable; use code rather than parsing this string.
+  /// Human-readable diagnostic that may contain platform-provided text. Use code for recovery decisions.
   std::string message;
 
   bool operator==(const CameraError&) const = default;
 };
 
-/// Success value or a camera operation error.
+/// @brief SDK result carrying an owned success value or a CameraError.
+///
+/// Check Succeeded() before accessing Value() or Error(). References from those accessors borrow the
+/// result. Copy or move the stored value to retain it independently.
 /// @tparam T Owned result payload, or void for operations without a payload.
-/// Check Succeeded() before accessing Value() or Error().
 template <class T> using CameraResult = Result<T, CameraError>;
 
-/// Encoding and final appearance of one still photo, independent of preview settings.
+/// @brief Encoding and final appearance of one still photo, independent of preview settings.
 struct PhotoOptions {
-  /// Final JPEG encoding quality in [1, 100]; higher values generally produce larger files.
+  /// Final JPEG encoding quality in [1, 100]. Higher values generally produce larger files.
   int jpeg_quality = 90;
-  /// Final horizontal mirroring after orientation is applied; Off by default.
-  /// Auto mirrors only a confirmed front camera. Preview fitting and mirroring do not affect this choice.
+  /// Final horizontal mirroring after orientation is applied. Defaults to MirrorMode::Off.
+  /// Auto mirrors only a confirmed front camera.
   MirrorMode mirror = MirrorMode::Off;
 
   bool operator==(const PhotoOptions&) const = default;
 };
 
-/// Declarative capture intent applied by UseCamera on recomposition.
-/// These options control the shared device; per-preview appearance belongs to PreviewOptions.
-struct CameraOptions {
-  /// Required camera facing, or an empty value to select the platform's default video device.
-  /// An explicit facing has no fallback to the opposite facing. Changing it while active reopens capture.
-  std::optional<Facing> facing;
-  /// Whether capture is requested; true by default.
-  /// False stops capture asynchronously. True starts only with existing camera authorization.
-  /// Backgrounding suspends capture without changing this intent; foregrounding reevaluates it.
-  bool active = true;
-
-  bool operator==(const CameraOptions&) const = default;
-};
-
-/// Presentation options for one CameraPreview, independent of other previews of the same session.
+/// @brief Presentation options for one CameraPreview.
+///
+/// Each preview applies its own options to the shared session output.
 struct PreviewOptions {
   /// Scaling applied after cropping and orientation, centered within the preview's bounds.
   /// Cover fills the bounds and clips excess content. Contain preserves the complete cropped frame.
-  /// Fill stretches independently on each axis; None keeps intrinsic size; ScaleDown only reduces size.
+  /// Fill stretches independently on each axis. None keeps intrinsic size. ScaleDown only reduces size.
   ImageFit fit = ImageFit::Cover;
-  /// Desired final horizontal mirror appearance; Auto mirrors confirmed front cameras only.
+  /// Desired final horizontal mirror appearance. Auto mirrors confirmed front cameras only.
   /// Changing this option affects presentation without reopening the shared camera.
   MirrorMode mirror = MirrorMode::Auto;
 
   bool operator==(const PreviewOptions&) const = default;
 };
 
-/// Published texture and geometry needed to present a camera frame correctly.
-/// Prefer CameraPreview unless custom drawing is needed. Custom consumers must interpret crop, rotation,
-/// and mirrored together rather than drawing the texture as an ordinary, already-oriented image.
-/// The producer updates texture contents independently of UI recomposition.
+/// @brief Published frame texture with its crop, orientation, and mirror state.
+///
+/// CameraPreview applies the geometry when drawing. Apply it together when drawing the texture yourself.
+/// The producer can publish new pixels to the same texture independently of UI recomposition.
+/// @see FrameProcessor, CameraStatus::preview, CameraPreview()
 struct PreviewOutput {
-  /// Shared frame source; retaining it does not keep the owning camera session capturing.
-  /// Use ExternalTexture::IntrinsicSize() for source geometry in logical units, not physical pixel dimensions.
+  /// Shared frame source. The owning composition controls capture lifetime.
+  /// ExternalTexture::IntrinsicSize() gives the source geometry in logical units.
+  /// Use the texture's platform acquisition API when you need a retained snapshot of its current pixels.
   std::shared_ptr<ExternalTexture> texture;
   /// Normalized source region in texture coordinates, before clockwise rotation and final mirroring.
-  /// Coordinates span [0, 1], with the origin at the top left; the default selects the complete texture.
+  /// Coordinates span [0, 1] with the origin at the top left. The default selects the complete texture.
   /// CameraPreview intersects this rectangle with the texture bounds and draws nothing for an empty region.
   Rect crop = {0.0F, 0.0F, 1.0F, 1.0F};
-  /// Remaining clockwise rotation after selecting crop; independent of the requested mirror mode.
+  /// Remaining clockwise rotation after selecting crop.
   PreviewRotation rotation = PreviewRotation::R0;
   /// Whether the source already appears horizontally mirrored after applying rotation.
   /// CameraPreview flips the upright result only when this differs from PreviewOptions::mirror's desired result.
@@ -167,23 +173,64 @@ struct PreviewOutput {
   bool operator==(const PreviewOutput&) const = default;
 };
 
-/// Current observed session state and optional preview metadata.
-/// This describes session status, not a frozen image: preview may retain a texture that continues receiving frames.
-/// Do not infer capture intent from this value; CameraOptions::active remains the application's control.
+/// @brief Processes a camera frame for both live preview and video recording.
+///
+/// The callback runs on the platform's serial frame queue. `input` holds the published source texture and
+/// its geometry. `capture_time` is the frame timestamp in nanoseconds on the capture source's clock.
+/// Read the source during the callback and acquire a snapshot if its pixels must outlive the call. Any
+/// shared effect parameters read on the frame queue must be synchronized with writes from other threads.
+///
+/// Return a published texture and its matching crop, rotation, and mirror state. You can return the source
+/// texture for a geometry-only change. Reuse the same texture object for successive frames with stable geometry
+/// so updates can redraw without recomposing. Camera acquires each accepted recording snapshot before the
+/// next callback. Serialize other publications to the returned texture with this work.
+///
+/// On Android the capture EGL context is current during the callback. Capture reopening recreates that
+/// context, so resources tied to it must be recreated as well.
+///
+/// Returning an error or throwing fails the capture session and exposes the diagnostic through CameraStatus::error.
+/// @see CameraOptions::frame_processor, PreviewOutput
+using FrameProcessor = std::function<CameraResult<PreviewOutput>(
+    const PreviewOutput& input, std::chrono::nanoseconds capture_time)>;
+
+/// @brief Declarative capture intent applied by UseCamera on recomposition.
+struct CameraOptions {
+  /// Required camera facing, or an empty value to select the platform's default video device.
+  /// An explicit facing requires a matching device. Changing it while active reopens capture.
+  std::optional<Facing> facing;
+  /// Whether capture is requested. Defaults to true.
+  /// False stops capture asynchronously. True starts only with existing camera authorization.
+  /// Backgrounding suspends capture without changing this intent. Foregrounding reevaluates it.
+  bool active = true;
+  /// Optional processor shared by preview and video recording. An empty pointer uses source frames directly.
+  /// Replacing the shared processor reopens active capture. Update synchronized effect parameters in place
+  /// to change an effect during capture.
+  std::shared_ptr<const FrameProcessor> frame_processor;
+
+  bool operator==(const CameraOptions&) const = default;
+};
+
+/// @brief Current observed session state and optional preview metadata.
+///
+/// A returned status value can hold a texture that continues receiving frames.
+/// @see CameraSession::Status(), CameraOptions::active
 struct CameraStatus {
-  /// Observed lifecycle state; Running alone does not guarantee that preview is populated.
+  /// Observed lifecycle state. The first frame may still be pending in SessionState::Running.
   SessionState state = SessionState::Stopped;
   /// Facing reported by the selected device, or empty when unavailable or unknown.
   /// This may differ from an unspecified CameraOptions::facing and determines automatic mirroring.
   std::optional<Facing> actual_facing;
-  /// Failure details when state is SessionState::Failed; empty for other states.
+  /// Failure details when state is SessionState::Failed. Empty for other states.
   std::optional<CameraError> error;
-  /// Available texture and presentation geometry, or empty before output is available or after it is cleared.
-  /// A suspended platform session may retain output; its presence alone does not indicate live capture.
+  /// Latest output texture and geometry, including any frame processing.
+  /// Empty before the first output and after output is cleared. A suspended session can retain its last output.
   std::optional<PreviewOutput> preview;
   /// Whether an accepted photo request is still pending, including platform processing after caller cancellation.
-  /// Capture normally remains Running during a photo; this flag is shared by all session handles.
+  /// Capture normally remains Running during a photo. This flag is shared by all session handles.
   bool capturing_photo = false;
+  /// Whether the session has a recording accepting frames or finalizing its output.
+  /// Closing the session clears this flag. Pending finalization can continue after closure.
+  bool recording_video = false;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -192,23 +239,26 @@ namespace detail {
 struct CameraSessionData;
 } // namespace detail
 
-/// A shared UI-thread handle whose capture lifetime belongs to the owning UseCamera call.
+/// @brief Shared UI-thread handle for a camera session owned by a UseCamera call.
+///
 /// Copies refer to the same session and may be passed to multiple CameraPreview components.
 /// Unmounting the owner closes capture even if a preview, callback, or another object retains a handle.
-/// Read state and request retries on the owning UI thread; frame delivery is managed by the backend.
+/// Read state and call session operations on the owning UI thread. The backend manages frame delivery.
 class CameraSession {
 public:
-  /// Reads the latest observed lifecycle state, failure, and preview metadata.
-  /// Reading during composition subscribes to state and output-metadata changes, not individual frames.
-  /// A previously returned status value does not refresh its metadata, although its shared texture may receive frames.
+  /// @brief Reads the latest observed lifecycle state, failure, and preview metadata.
+  ///
+  /// Reading during composition subscribes to status and output geometry changes. Frames published to the
+  /// same texture can redraw independently. The returned value keeps its metadata from the time of the call.
   /// @return The observed session status at the time of the call.
   [[nodiscard]] CameraStatus Status() const;
 
-  /// Retries a failed session using the latest CameraOptions supplied to its owning UseCamera call.
+  /// @brief Retries a failed session using the latest options from its owning UseCamera call.
+  ///
   /// Clears the failure and reevaluates capture intent. It does not set active to true or request permission UI.
   /// Calls in states other than SessionState::Failed, including SessionState::Closed, have no effect.
-  /// Observe Status() for the asynchronous outcome; obtain missing authorization before retrying.
-  /// @code
+  /// Obtain any missing authorization before retrying and observe Status() for the asynchronous outcome.
+  /// @code{.cpp}
   /// const auto status = session.Status();
   /// return Button("Retry")
   ///     .OnClick([session] { session.Retry(); })
@@ -216,20 +266,22 @@ public:
   /// @endcode
   void Retry() const;
 
-  /// Captures a JPEG photo through the platform still-photo output of the current camera.
-  /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
-  /// Only one request is accepted at a time; additional requests return OperationInProgress without queuing.
+  /// @brief Captures a JPEG photo through the platform still-photo output of the current camera.
+  ///
+  /// Start the lazy task from a UI event or Task. It checks readiness when it runs.
+  /// Only one request is accepted at a time. Additional requests return OperationInProgress immediately.
   /// The target orientation and resolved mirror mode are fixed when the request is accepted.
   /// Success returns an independent ImageAsset with upright pixels, normal EXIF orientation, and scale 1.
   /// Photo dimensions are negotiated by the capture output, independently of the preview's layout or Cover crop.
   /// Stopping, switching, backgrounding, or session failure ends a pending request with Interrupted.
   /// An individual photo error does not set CameraStatus::error or stop otherwise healthy preview capture.
-  /// Task cancellation suppresses delivery; platform cleanup continues before another request is accepted.
+  /// Task cancellation suppresses delivery while platform cleanup continues. Cleanup must finish before
+  /// another request is accepted.
   /// No file or photo-library entry is created. Save EncodedBytes() with the SDK File APIs when needed.
   /// @param options JPEG quality and final mirroring for this request only.
-  /// @return A task yielding an owned JPEG image or CameraError; unavailable still-photo output returns Unavailable.
+  /// @return A task yielding an owned JPEG image or CameraError. Unavailable indicates missing still-photo output.
   /// @throws std::invalid_argument Before returning a task if quality or mirror mode is invalid.
-  /// @code
+  /// @code{.cpp}
   /// auto result = co_await session.CapturePhotoAsync({.jpeg_quality = 90});
   /// if (result.Succeeded()) {
   ///   photo = result.Value();
@@ -239,6 +291,58 @@ public:
   /// @endcode
   Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
+  /// @brief Records a single H.264 video track into a new MP4 file.
+  ///
+  /// Start the lazy task on the owning UI thread from a UI event or TaskScope. The session must be running.
+  /// Each session accepts one recording at a time, including finalization. Call StopRecording() to stop
+  /// accepting frames and finalize the output. Capture shutdown, including a camera switch or backgrounding,
+  /// also requests finalization. Task cancellation requests finalization and suppresses completion delivery.
+  ///
+  /// The encoder receives retained snapshots of the same output used by preview. Timestamps are relative
+  /// to the first submitted frame. The track uses the initial dimensions and stores the initial crop and
+  /// rotation as presentation metadata. Encoded pixels keep their source mirror appearance.
+  /// A change in input video format ends the recording.
+  /// When recording falls behind, Camera can skip input frames while preserving their elapsed capture time.
+  ///
+  /// Use a published GlTexture on Android, a PixelBufferTexture backed by NV12 or BGRA on iOS or macOS, or
+  /// an opaque D3D11Texture on Windows. iOS and macOS require even pixel dimensions. Recording requires
+  /// HuxerUI::Media and platform H.264 encoder support.
+  /// The recording contains video only. An encoding or I/O failure may leave partial output.
+  /// @param destination New file in a writable directory. Camera creates it when the first encoded packet
+  /// is available and preserves an existing file at that path.
+  /// @return A task yielding success after finalization or a CameraError. NotReady means capture has
+  /// not reached SessionState::Running or is stopping. OperationInProgress means another recording is
+  /// active or finalizing. Unavailable indicates missing recording support. Interrupted means recording
+  /// stopped before a frame could be encoded.
+  /// @see StopRecording(), CameraStatus::recording_video, CameraOptions::frame_processor
+  Task<CameraResult<void>> RecordVideoAsync(File destination) const;
+
+  /// @brief Records a single H.264 video track into a writable random-access stream as a regular MP4.
+  ///
+  /// The task owns the destination and writes from offset zero. The capture, cancellation, and finalization
+  /// contract is shared with the file overload.
+  /// @param destination Empty writable stream transferred to the task.
+  /// @return A task yielding success after the muxer finalizes the stream, or CameraError.
+  /// @see RecordVideoAsync(File), StopRecording()
+  Task<CameraResult<void>> RecordVideoAsync(RandomAccessStream destination) const;
+
+  /// @brief Records a single H.264 video track into a sequential output stream as a fragmented MP4.
+  ///
+  /// The task owns the destination. The capture, cancellation, and finalization contract is shared with
+  /// the file overload.
+  /// @param destination Fresh writable stream transferred to the task.
+  /// @return A task yielding success after the muxer finalizes the stream, or CameraError.
+  /// @see RecordVideoAsync(File), StopRecording()
+  Task<CameraResult<void>> RecordVideoAsync(OutputStream destination) const;
+
+  /// @brief Requests finalization of the current recording on the owning UI thread.
+  ///
+  /// The recording stops accepting frames. Already accepted frames drain through the encoder before the
+  /// muxer finalizes the output. Await the original recording task for the outcome. Calling again during
+  /// finalization or with no recording has no effect.
+  /// @see RecordVideoAsync(File), CameraStatus::recording_video
+  void StopRecording() const;
+
 private:
   explicit CameraSession(std::shared_ptr<detail::CameraSessionData> data);
   std::shared_ptr<detail::CameraSessionData> data_;
@@ -246,12 +350,13 @@ private:
   friend CameraSession UseCamera(CameraOptions, const std::source_location&);
 };
 
-/// Installs the camera platform module in the application catalog.
+/// @brief Installs the camera platform module in the application catalog.
+///
 /// Register this function in AppOptions::application_hooks before composing content that calls UseCamera.
 /// Registration neither opens a camera nor requests authorization. Unsupported capture platforms report
 /// CameraErrorCode::Unavailable when capture is requested.
 /// @param context Application context supplied by HuxerUI when it runs the registered hook.
-/// @code
+/// @code{.cpp}
 /// const huxerui::Application application{
 ///     App,
 ///     {
@@ -263,20 +368,20 @@ private:
 /// @endcode
 void Install(ApplicationContext& context);
 
-/// Retains a camera session in the current composition and applies the requested capture intent.
+/// @brief Retains a camera session in the current composition and applies the requested capture intent.
+///
 /// Call from an active composition on the UI thread, with Install registered for its application.
 /// Recomposition at the same retained call site updates the existing session. Distinct calls own separate
-/// sessions; share a returned handle when multiple previews should use one device.
+/// sessions. Share a returned handle when multiple previews should use one device.
 ///
-/// Authorization is checked before starting, but no permission prompt is shown. The application requests
+/// Authorization is checked before starting. The application requests
 /// Permission::Camera through ApplicationHandle::RequestPermissionAsync when appropriate.
-/// Missing authorization is reported through CameraStatus::error. Unmounting the owner closes the session;
-/// merely unmounting a CameraPreview does not stop capture. Mark reusable functions that call this hook
-/// with [[huxerui::composable]].
-/// @param options Requested camera facing and active state. Defaults to the platform's default camera and active=true.
-/// @param location Call-site metadata used to retain composition state; normally leave the default value.
-/// @return A shared handle for observing state, requesting retries, and creating previews.
-/// @code
+/// Missing authorization is reported through CameraStatus::error. Unmounting the owning composition closes
+/// the session. Mark reusable functions that call this hook with [[huxerui::composable]].
+/// @param options Capture intent and optional frame processing. Defaults to active capture from the default camera.
+/// @param location Call-site metadata used to retain composition state. Use the default value for ordinary calls.
+/// @return A shared handle for observing capture, displaying previews, taking photos, and recording video.
+/// @code{.cpp}
 /// #include <huxerui/camera.h>
 /// #include <huxerui/huxerui.h>
 ///
@@ -306,15 +411,14 @@ void Install(ApplicationContext& context);
     const std::source_location& location = std::source_location::current()
 );
 
-/// Displays a shared camera session with centered fitting, source cropping, rotation, and final mirroring.
-/// Supply bounded layout space through the parent or a Frame modifier; the component does not choose
-/// a capture resolution or provide controls, a background, permission prompts, or error placeholders.
-/// No content is drawn when the session has no usable preview output or the drawing bounds are empty.
-/// Live texture updates do not cause UI recomposition for each frame.
-/// @param session Session returned by UseCamera; multiple previews may share it without opening another device.
+/// @brief Displays a shared camera session with centered fitting, source cropping, rotation, and final mirroring.
+///
+/// Supply bounded layout space through the parent or a Frame modifier. Drawing requires usable preview
+/// output and nonempty bounds. Live texture updates redraw independently of UI recomposition.
+/// @param session Session returned by UseCamera. Multiple previews may share it to display the same camera.
 /// @param options Appearance for this preview only. Defaults to ImageFit::Cover and MirrorMode::Auto.
 /// @return A preview View whose lifetime does not control the shared capture session.
-/// @code
+/// @code{.cpp}
 /// return Row {
 ///   camera::CameraPreview(session).With(Frame{.width = 320.0F, .height = 240.0F}),
 ///   camera::CameraPreview(session, {

@@ -13,6 +13,7 @@
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using huxerui::camera::detail::FramePipeline;
 
 namespace {
 
@@ -136,10 +137,13 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   AVCaptureDevice* device_;
   NSMutableArray* observers_;
   std::shared_ptr<macos::PixelBufferTexture> texture_;
+  std::shared_ptr<FramePipeline> frames_;
+  std::optional<PreviewOutput> preview_;
   std::optional<Facing> facing_;
   std::function<void(CameraStatus)> changed_;
 }
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed;
+- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 @end
@@ -163,9 +167,11 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   }
 }
 
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed {
+- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(std::function<void(CameraStatus)>)changed {
   dispatch_async(queue_, ^{
     changed_ = changed;
+    frames_ = frames;
     if (!facing) {
       device_ = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     } else {
@@ -283,17 +289,28 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   try {
     const huxerui::Size size{static_cast<float>(CVPixelBufferGetWidth(buffer)),
                     static_cast<float>(CVPixelBufferGetHeight(buffer))};
-    const bool replaced = !texture_ || texture_->IntrinsicSize() != size;
-    if (replaced) {
+    if (!texture_ || texture_->IntrinsicSize() != size) {
       if (texture_) {
         texture_->Finish();
       }
       texture_ = std::make_shared<macos::PixelBufferTexture>(size);
     }
     texture_->Publish(buffer);
-    if (replaced) {
-      changed_({.state = SessionState::Running, .actual_facing = facing_,
-                .preview = PreviewOutput{.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)}});
+    PreviewOutput frame{.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)};
+    if (frames_) {
+      const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
+                                          kCMTimeRoundingMethod_Default);
+      if (!CMTIME_IS_NUMERIC(time)) return;
+      auto processed = frames_->Process(std::move(frame), std::chrono::nanoseconds(time.value));
+      if (!processed.Succeeded()) {
+        changed_({.state = SessionState::Failed, .error = processed.Error()});
+        return;
+      }
+      frame = std::move(processed).Value();
+    }
+    if (frame != preview_) {
+      preview_ = std::move(frame);
+      changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_});
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
@@ -371,6 +388,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_->Finish();
       texture_.reset();
     }
+    preview_.reset();
+    frames_.reset();
     [self completeStops];
   });
 }
@@ -394,7 +413,7 @@ class AppleCamera final : public CameraBackend {
 public:
   AppleCamera() : capture_([HUXCameraCapture new]) {}
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
-    [capture_ start:facing changed:std::move(changed)];
+    [capture_ start:facing frames:frame_pipeline_ changed:std::move(changed)];
   }
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];

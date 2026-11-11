@@ -1,10 +1,26 @@
 #include "camera_internal.h"
 
+#include <map>
+
 #include <huxerui/android/external_texture.h>
 #include <huxerui/android/platform_registry.h>
 
 namespace huxerui::camera::detail {
 namespace {
+
+// The platform channel passes a per-run identifier. The frame producer acquires the pipeline through JNI.
+std::mutex pipeline_mutex;
+std::map<std::int64_t, std::weak_ptr<FramePipeline>> pipelines;
+std::int64_t next_pipeline = 0;
+
+std::shared_ptr<FramePipeline> FindPipeline(std::int64_t id) {
+  if (id == 0) return {};
+  std::lock_guard lock(pipeline_mutex);
+  const auto found = pipelines.find(id);
+  auto frames = found == pipelines.end() ? nullptr : found->second.lock();
+  if (!frames) throw std::runtime_error("The camera frame pipeline is closed.");
+  return frames;
+}
 
 CameraErrorCode DecodeError(std::string_view code) {
   if (code == "permission-denied") return CameraErrorCode::PermissionDenied;
@@ -25,7 +41,10 @@ CameraErrorCode DecodeError(std::string_view code) {
 class AndroidCamera final : public CameraBackend, public std::enable_shared_from_this<AndroidCamera> {
 public:
   explicit AndroidCamera(PlatformChannel channel) : channel_(std::move(channel)) {}
-  ~AndroidCamera() override { channel_.Close(); }
+  ~AndroidCamera() override {
+    ReleasePipeline();
+    channel_.Close();
+  }
 
   void Connect() {
     auto weak = weak_from_this();
@@ -43,16 +62,19 @@ public:
           }
           const auto& facing = fields.at("facing");
           if (!facing.IsNull()) status.actual_facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
-          const auto& texture = fields.at("texture");
-          if (!texture.IsNull()) {
-            const auto rotation = fields.at("rotation").AsInteger();
-            if (rotation < 0 || rotation > 270 || rotation % 90 != 0) {
+          const auto& output = fields.at("preview");
+          if (!output.IsNull()) {
+            const auto& preview = output.AsObject();
+            const auto rotation = preview.at("rotation").AsInteger();
+            if (rotation < 0 || rotation > 3) {
               throw std::invalid_argument("Invalid camera preview rotation.");
             }
             status.preview = PreviewOutput{
-                .texture = texture.AsExternalTexture(),
-                .rotation = static_cast<PreviewRotation>(rotation / 90),
-                .mirrored = fields.at("mirrored").AsBoolean()};
+                .texture = preview.at("texture").AsExternalTexture(),
+                .crop = {static_cast<float>(preview.at("x").AsDouble()), static_cast<float>(preview.at("y").AsDouble()),
+                         static_cast<float>(preview.at("width").AsDouble()), static_cast<float>(preview.at("height").AsDouble())},
+                .rotation = static_cast<PreviewRotation>(rotation),
+                .mirrored = preview.at("mirrored").AsBoolean()};
           }
           self->changed_(std::move(status));
         } catch (const std::exception& error) {
@@ -65,8 +87,14 @@ public:
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
     changed_ = std::move(changed);
     const auto run = ++run_;
+    if (frame_pipeline_) {
+      std::lock_guard lock(pipeline_mutex);
+      pipeline_ = ++next_pipeline;
+      pipelines.emplace(pipeline_, frame_pipeline_);
+    }
     auto weak = weak_from_this();
-    PlatformPayload::Object arguments{{"run", run}, {"facing", facing ? PlatformPayload(*facing == Facing::Front ? "front" : "back") : PlatformPayload{}}};
+    PlatformPayload::Object arguments{{"run", run}, {"frames", pipeline_},
+        {"facing", facing ? PlatformPayload(*facing == Facing::Front ? "front" : "back") : PlatformPayload{}}};
     channel_.Invoke("start", PlatformPayload(std::move(arguments)), [weak, run](PlatformResult<PlatformPayload> result) {
       if (auto self = weak.lock(); self && self->run_ == run && self->changed_) {
         if (auto* error = std::get_if<PlatformError>(&result)) {
@@ -79,6 +107,7 @@ public:
   void Stop(std::function<void()> completed) override {
     ++run_;
     changed_ = {};
+    ReleasePipeline();
     channel_.Invoke<std::monostate>("stop", [completed = std::move(completed)](PlatformResult<std::monostate>) {
       if (completed) completed();
     });
@@ -104,6 +133,12 @@ public:
   }
 
 private:
+  void ReleasePipeline() {
+    std::lock_guard lock(pipeline_mutex);
+    pipelines.erase(pipeline_);
+    pipeline_ = 0;
+  }
+
   void Fail(CameraErrorCode code, std::string message) {
     changed_({.state = SessionState::Failed, .error = CameraError{code, std::move(message)}});
   }
@@ -111,6 +146,7 @@ private:
   PlatformChannel channel_;
   std::function<void(CameraStatus)> changed_;
   std::int64_t run_ = 0;
+  std::int64_t pipeline_ = 0;
 };
 
 } // namespace
@@ -130,37 +166,63 @@ void InstallPlatformCamera(ApplicationContext& context) {
 
 namespace {
 
+using namespace huxerui;
+using namespace huxerui::camera;
+
+struct CameraOutput {
+  std::shared_ptr<android::GlTexture> texture;
+  std::shared_ptr<camera::detail::FramePipeline> frames;
+  int width;
+  int height;
+  PreviewRotation rotation;
+  bool mirrored;
+  std::optional<PreviewOutput> published;
+};
+
 void ThrowJava(JNIEnv* env, const std::exception& error) {
   if (env->ExceptionCheck()) return;
   huxerui::android::LocalRef<jclass> type(env, env->FindClass("java/lang/IllegalStateException"));
   if (type.Get()) env->ThrowNew(type.Get(), error.what());
 }
 
-std::shared_ptr<huxerui::android::SurfaceStreamTexture> Texture(JNIEnv* env, jobject payload) {
-  auto texture = std::dynamic_pointer_cast<huxerui::android::SurfaceStreamTexture>(
-      huxerui::android::JavaPlatformPayloadToCpp(env, payload).AsExternalTexture());
-  if (!texture) throw std::invalid_argument("Expected a camera Surface stream texture.");
-  return texture;
-}
-
 } // namespace
 
-extern "C" JNIEXPORT jobject JNICALL
-Java_org_huxerui_lib_camera_CameraModule_createOutput(JNIEnv* env, jclass, jint width, jint height, jboolean swap) {
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_huxerui_lib_camera_CameraSurface_createOutput(JNIEnv* env, jclass, jlong pipeline, jint width, jint height,
+                                                       jint rotation, jboolean mirrored) {
   try {
-    huxerui::Size intrinsic{static_cast<float>(swap ? height : width), static_cast<float>(swap ? width : height)};
-    auto texture = huxerui::android::SurfaceStreamTexture::Create(env, intrinsic, width, height);
-    return huxerui::android::PlatformPayloadToJava(env, huxerui::PlatformPayload(std::move(texture))).Release();
+    if (width <= 0 || height <= 0 || rotation < 0 || rotation > 270 || rotation % 90 != 0) {
+      throw std::invalid_argument("Invalid camera output geometry.");
+    }
+    auto output = std::make_unique<CameraOutput>(CameraOutput{
+        std::make_shared<android::GlTexture>(Size{static_cast<float>(width), static_cast<float>(height)}),
+        camera::detail::FindPipeline(pipeline), width, height, static_cast<PreviewRotation>(rotation / 90),
+        mirrored == JNI_TRUE});
+    return reinterpret_cast<jlong>(output.release());
   } catch (const std::exception& error) {
     ThrowJava(env, error);
-    return nullptr;
+    return 0;
   }
 }
 
 extern "C" JNIEXPORT jobject JNICALL
-Java_org_huxerui_lib_camera_CameraModule_outputSurface(JNIEnv* env, jclass, jobject payload) {
+Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlong handle, jint texture, jlong time) {
   try {
-    return Texture(env, payload)->Surface(env).Release();
+    auto& output = *reinterpret_cast<CameraOutput*>(handle);
+    output.texture->PublishCurrent({.texture_name = static_cast<std::uint32_t>(texture),
+        .pixel_width = output.width, .pixel_height = output.height, .alpha = android::GlTexture::Alpha::Opaque});
+    PreviewOutput preview{.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored};
+    if (output.frames) {
+      auto processed = output.frames->Process(std::move(preview), std::chrono::nanoseconds(time));
+      if (!processed.Succeeded()) throw std::runtime_error(processed.Error().message);
+      preview = std::move(processed).Value();
+    }
+    if (preview == output.published) return nullptr;
+    output.published = preview;
+    return android::PlatformPayloadToJava(env, PlatformPayload(PlatformPayload::Object{
+        {"texture", preview.texture}, {"x", double(preview.crop.x)}, {"y", double(preview.crop.y)},
+        {"width", double(preview.crop.width)}, {"height", double(preview.crop.height)},
+        {"rotation", static_cast<std::int64_t>(preview.rotation)}, {"mirrored", preview.mirrored}})).Release();
   } catch (const std::exception& error) {
     ThrowJava(env, error);
     return nullptr;
@@ -168,10 +230,7 @@ Java_org_huxerui_lib_camera_CameraModule_outputSurface(JNIEnv* env, jclass, jobj
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_huxerui_lib_camera_CameraModule_finishOutput(JNIEnv* env, jclass, jobject payload) {
-  try {
-    Texture(env, payload)->Finish();
-  } catch (const std::exception& error) {
-    ThrowJava(env, error);
-  }
+Java_org_huxerui_lib_camera_CameraSurface_finishOutput(JNIEnv*, jclass, jlong handle) {
+  const std::unique_ptr<CameraOutput> output(reinterpret_cast<CameraOutput*>(handle));
+  if (output) output->texture->Finish();
 }

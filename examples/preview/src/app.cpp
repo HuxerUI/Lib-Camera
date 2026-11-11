@@ -294,7 +294,11 @@ View CameraWorkspace() {
   auto photo = UseState(ImageAsset{});
   auto photo_error = UseState(std::string{});
   auto saving_photo = UseState(false);
+  auto video_file = UseState(std::optional<File>{});
+  auto saving_video = UseState(false);
+  auto video_message = UseState(std::string{});
   auto application = UseApplication();
+  auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
   auto session = camera::UseCamera({.facing = facing, .active = active});
@@ -367,6 +371,52 @@ View CameraWorkspace() {
     });
   };
 
+  auto toggle_recording = [session, tasks, application, video_file, saving_video, video_message] {
+    if (session.Status().recording_video) {
+      session.StopRecording();
+      return;
+    }
+    if (saving_video) return;
+    video_message = std::string{};
+    tasks.Launch([session, application, video_file, video_message]() -> Task<void> {
+      try {
+        static std::atomic_uint64_t sequence{0};
+        const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+        const auto name = "camera-video-" + std::to_string(timestamp) + "-" + std::to_string(++sequence) + ".mp4";
+        const auto output = application.Directories().temporary_directory.Child(name);
+        auto result = co_await session.RecordVideoAsync(output);
+        if (result.Succeeded()) {
+          video_file = std::optional{output};
+          video_message = "Recorded " + name;
+        } else {
+          video_message = result.Error().message;
+        }
+      } catch (const std::exception& error) {
+        video_message = std::string(error.what());
+      }
+    });
+  };
+  auto save_video = [session, tasks, picker, video_file, saving_video, video_message] {
+    const auto source = video_file.Get();
+    if (!source || saving_video || session.Status().recording_video || !picker->CanSaveFiles()) return;
+    saving_video = true;
+    tasks.Launch([picker, source = *source, video_file, saving_video, video_message]() -> Task<void> {
+      bool saved = false;
+      try {
+        SaveFileOptions options{
+            .filter = {.name = "MP4 video", .extensions = {"mp4"}, .content_types = {"video/mp4"}},
+        };
+        saved = co_await picker->SaveFileAsync(source, options);
+        video_message = std::string(saved ? "Video saved." : "Video was not saved.");
+        if (saved && video_file.Get() == source) video_file = std::nullopt;
+      } catch (const std::exception& error) {
+        video_message = std::string(error.what());
+      }
+      saving_video = false;
+      if (saved) co_await source.DeleteAsync();
+    });
+  };
+
   View viewfinder = Stack {
     camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
     live ? View() : EmptyPreview(status, authorizing, permission_error),
@@ -424,6 +474,11 @@ View CameraWorkspace() {
       expanded ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
           .With(Background(control_background), CornerRadius(14.0F))),
     }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
+    live || status.recording_video ? View(Button(status.recording_video ? "Stop recording" : "Record video")
+        .OnClick(toggle_recording).With(Enabled(!saving_video))) : View(),
+    video_file->has_value() && picker->CanSaveFiles() ? View(Button(saving_video ? "Saving video" : "Save video")
+        .OnClick(save_video).With(Enabled(!saving_video && !status.recording_video))) : View(),
+    video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
     photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
   }.With(Spacing(18.0F), Padding(EdgeInsets::Symmetric(4.0F, 8.0F)), CrossAlign(CrossAxisAlignment::Stretch));
 

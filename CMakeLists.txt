@@ -58,7 +58,10 @@ if (APPLE AND NOT IOS)
     list(APPEND LIBRARY_SOURCE_FILES ${LIBRARY_MACOS_SOURCE_FILES})
 endif ()
 if (IOS)
-    list(APPEND LIBRARY_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/camera.mm")
+    list(APPEND LIBRARY_SOURCE_FILES
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/camera.mm"
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/recording_frame.mm"
+    )
 endif ()
 if (EMSCRIPTEN)
     file(GLOB_RECURSE LIBRARY_WEB_SOURCE_FILES CONFIGURE_DEPENDS
@@ -80,6 +83,16 @@ huxerui_add_library(huxerui_camera
 
 add_library(HuxerUI::Camera ALIAS huxerui_camera)
 
+if (HUXERUI_LIBRARY_GRAPH_ONLY OR ANDROID OR APPLE OR WIN32)
+    set(HUXERUI_CAMERA_MEDIA_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media"
+            CACHE PATH "Lib-Media source checkout for Camera video recording")
+    if (TARGET HuxerUI::Media)
+        huxerui_use_library(huxerui_camera TARGET HuxerUI::Media)
+    elseif (EXISTS "${HUXERUI_CAMERA_MEDIA_PATH}/CMakeLists.txt")
+        huxerui_use_library(huxerui_camera TARGET HuxerUI::Media PATH "${HUXERUI_CAMERA_MEDIA_PATH}")
+    endif ()
+endif ()
+
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
@@ -90,6 +103,17 @@ target_include_directories(huxerui_camera PUBLIC
 )
 
 target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+if (ANDROID OR APPLE OR WIN32)
+    if (TARGET HuxerUI::Media)
+        target_compile_definitions(huxerui_camera PRIVATE HUXERUI_CAMERA_RECORDING=1)
+        if (APPLE)
+            target_link_libraries(huxerui_camera PRIVATE "-framework Accelerate")
+        endif ()
+    else ()
+        message(STATUS "Camera recording requires HuxerUI::Media or HUXERUI_CAMERA_MEDIA_PATH")
+    endif ()
+endif ()
 
 if (WIN32)
     target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
@@ -111,6 +135,10 @@ if (HUXERUI_CAMERA_BUILD_TESTS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     target_link_libraries(camera_tests PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
     huxerui_enable_codegen(camera_tests)
     add_test(NAME camera_tests COMMAND camera_tests)
+    if (APPLE AND NOT IOS AND TARGET HuxerUI::Media)
+        target_compile_definitions(camera_tests PRIVATE HUXERUI_CAMERA_TEST_RECORDING=1)
+        target_link_libraries(camera_tests PRIVATE HuxerUI::Media)
+    endif ()
     if (WIN32)
         add_executable(camera_windows_tests tests/windows_camera_tests.cpp)
         target_compile_features(camera_windows_tests PRIVATE cxx_std_20)

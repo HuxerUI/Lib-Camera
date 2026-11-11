@@ -17,12 +17,17 @@ let package = Package(
         .target(
             name: "Camera",
             linkerSettings: [
+                .linkedFramework("Accelerate"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("ImageIO"),
                 .linkedFramework("UIKit"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("VideoToolbox"),
+                .linkedFramework("PhotosUI"),
+                .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
     ]

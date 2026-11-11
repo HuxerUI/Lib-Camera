@@ -78,7 +78,8 @@ void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<P
 void CameraSessionData::Publish(SessionState state) {
   status = CameraStatus{.state = state,
                         .error = state == SessionState::Failed ? failure : std::nullopt,
-                        .capturing_photo = photo && state != SessionState::Closed};
+                        .capturing_photo = photo && state != SessionState::Closed,
+                        .recording_video = recording && state != SessionState::Closed};
 }
 
 void CameraSessionData::Update(CameraOptions options, bool is_background) {
@@ -97,12 +98,13 @@ void CameraSessionData::Reconcile() {
   if (closed || !backend || status->state == SessionState::Stopping) {
     return;
   }
+  const bool configuration_changed = desired.facing != opened_facing || desired.frame_processor != opened_processor;
   if (!desired.active || background || failure ||
-      (status->state == SessionState::Starting && desired.facing != opened_facing) ||
-      (engaged && desired.facing != opened_facing)) {
+      ((engaged || status->state == SessionState::Starting) && configuration_changed)) {
     const auto stopping_generation = ++generation;
     permission_check.Cancel();
     InterruptPhoto();
+    StopRecording();
     if (engaged) {
       engaged = false;
       Publish(SessionState::Stopping);
@@ -127,6 +129,7 @@ void CameraSessionData::Reconcile() {
     return;
   }
   opened_facing = desired.facing;
+  opened_processor = desired.frame_processor;
   Publish(SessionState::Starting);
   const auto opening_generation = ++generation;
   const auto weak = weak_from_this();
@@ -148,6 +151,8 @@ void CameraSessionData::Reconcile() {
         self->Settle();
         co_return;
       }
+      self->frames = std::make_shared<FramePipeline>(self->opened_processor);
+      self->backend->SetFramePipeline(self->frames);
       self->engaged = true;
       self->backend->Start(self->opened_facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
         scope.Post([weak, opening_generation, value = std::move(value)]() mutable {
@@ -159,9 +164,12 @@ void CameraSessionData::Reconcile() {
             owner->failure = std::move(value.error);
             owner->Reconcile();
           } else {
-            if (value.state == SessionState::Suspended)
+            if (value.state == SessionState::Suspended) {
               owner->InterruptPhoto();
+              owner->StopRecording();
+            }
             value.capturing_photo = static_cast<bool>(owner->photo);
+            value.recording_video = static_cast<bool>(owner->recording);
             owner->status = std::move(value);
           }
         });
@@ -176,6 +184,9 @@ void CameraSessionData::Reconcile() {
 }
 
 void CameraSessionData::Settle() {
+  if (backend) backend->SetFramePipeline({});
+  frames.reset();
+  opened_processor.reset();
   Publish(failure ? SessionState::Failed
                   : (desired.active && background ? SessionState::Suspended : SessionState::Stopped));
 }
@@ -188,11 +199,15 @@ void CameraSessionData::Close() {
   ++generation;
   permission_check.Cancel();
   InterruptPhoto();
+  StopRecording();
   Publish(SessionState::Closed);
   if (backend) {
     backend->Stop({});
     backend.reset();
   }
+  frames.reset();
+  opened_processor.reset();
+  desired.frame_processor.reset();
 }
 
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options) {

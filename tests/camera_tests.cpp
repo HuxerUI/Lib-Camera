@@ -9,6 +9,14 @@
 #include <thread>
 #include <stdexcept>
 
+#if defined(HUXERUI_CAMERA_TEST_RECORDING)
+#include <CoreVideo/CoreVideo.h>
+#include <filesystem>
+#include <huxerui/macos/external_texture.h>
+#include <huxerui/media_codec.h>
+#include <huxerui/media_container.h>
+#endif
+
 #include "camera_internal.h"
 #include "camera_session.h"
 #include "photo_fixture.h"
@@ -19,6 +27,10 @@ using namespace huxerui;
 using namespace huxerui::camera;
 
 namespace {
+
+using huxerui::Point;
+using huxerui::Rect;
+using huxerui::Size;
 
 void Check(bool condition, const char* message) {
   if (!condition) {
@@ -132,7 +144,7 @@ public:
       Drain(runtime);
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    Check(done(), "Asynchronous photo operation did not complete.");
+    Check(done(), "Asynchronous camera operation did not complete.");
   }
 
   std::mutex mutex;
@@ -435,6 +447,117 @@ void TestPhotoRequests() {
   }
 }
 
+#if defined(HUXERUI_CAMERA_TEST_RECORDING)
+template <class T, class E> T TakeRecordingResult(Result<T, E> result) {
+  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
+  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
+}
+
+std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t green) {
+  constexpr auto size = 64;
+  CVPixelBufferRef pixels = nullptr;
+  Check(CVPixelBufferCreate(nullptr, size, size, kCVPixelFormatType_32BGRA, nullptr, &pixels) == kCVReturnSuccess,
+        "Cannot allocate a test camera frame.");
+  const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
+      owner(pixels, CVPixelBufferRelease);
+  Check(CVPixelBufferLockBaseAddress(pixels, 0) == kCVReturnSuccess, "Cannot lock a test camera frame.");
+  for (int row = 0; row < size; ++row) {
+    auto* pixel = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddress(pixels)) + row * CVPixelBufferGetBytesPerRow(pixels);
+    for (int column = 0; column < size; ++column) {
+      *pixel++ = 0;
+      *pixel++ = green;
+      *pixel++ = red;
+      *pixel++ = 255;
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(pixels, 0);
+  auto texture = std::make_shared<macos::PixelBufferTexture>(Size{size, size});
+  texture->Publish(pixels);
+  return texture;
+}
+
+template <class Destination>
+void TestRecordedFrame(PhotoTestFixture& fixture, const File& file, Destination destination, media::ContainerLayout layout,
+                       bool unmount = false) {
+  using namespace huxerui::media;
+  std::optional<CameraResult<void>> result;
+  const auto owner = fixture.context.owner;
+  auto task = fixture.context.callers->Launch(
+      [owner, &result, destination = std::move(destination)]() mutable -> Task<void> {
+        result = co_await camera::detail::RecordVideo(owner, std::move(destination));
+      });
+  fixture.Drain();
+  Check(owner->status->recording_video, "Recording did not start.");
+
+  const auto input = SolidTexture(255, 0);
+  const auto preview = TakeRecordingResult(owner->frames->Process({.texture = input}, std::chrono::seconds(17)));
+  Check(preview.texture != input && preview.rotation == PreviewRotation::R90, "Preview bypassed the frame processor.");
+  if (unmount) {
+    fixture.context.visible = false;
+    fixture.Drain();
+  } else {
+    owner->StopRecording();
+  }
+  fixture.platform.Await(fixture.runtime, [&] { return result.has_value(); });
+  TakeRecordingResult(std::move(*result));
+  fixture.Drain();
+  Check(!owner->status->recording_video, "Recording remained busy after finalization.");
+
+  auto demuxer = TakeRecordingResult(MediaDemuxer::Open(TakeRecordingResult(file.OpenRandomAccess())));
+  Check(demuxer.Layout() == layout && demuxer.Tracks().size() == 1, "Unexpected recording layout or track count.");
+  const auto& track = demuxer.Tracks().front();
+  const auto& format = track.descriptions.front();
+  Check(track.kind == TrackKind::Video && track.rotation == VideoRotation::Clockwise90 && format.codec == CodecId::H264,
+        "Recording lost the processed frame geometry.");
+  auto decoder = TakeRecordingResult(VideoDecoder::Create({.initialization_data = format.initialization_data,
+      .width = *format.coded_width, .height = *format.coded_height}));
+  Check(TakeRecordingResult(demuxer.Read()).has_value(), "Missing video track configuration.");
+  auto item = TakeRecordingResult(demuxer.Read());
+  Check(item && std::holds_alternative<ContainerPacket>(*item), "Recording has no frame.");
+  const auto& packet = std::get<ContainerPacket>(*item);
+  Check(packet.pts && packet.pts->ticks == 0, "Recording did not start at a relative timestamp of zero.");
+  fixture.platform.Await(fixture.runtime, [&] {
+    return TakeRecordingResult(decoder.TrySubmit({packet.data, *packet.pts, packet.dts, packet.duration,
+                                                 packet.sync_sample.value_or(false)})) == SubmitStatus::Accepted;
+  });
+  TakeRecordingResult(decoder.Finish());
+  fixture.platform.Await(fixture.runtime, [&] {
+    while (auto output = TakeRecordingResult(decoder.TryRead())) {
+      if (auto* frame = std::get_if<VideoFrame>(&*output)) {
+        const auto luma = std::to_integer<int>(frame->planes.front().data.AsBytes().front());
+        Check(luma > 140, "The encoded video contains the red source frame instead of the green processed frame.");
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+void TestRecording() {
+  struct Directory {
+    std::filesystem::path path = std::filesystem::temp_directory_path() /
+        ("huxerui-camera-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    ~Directory() { std::error_code error; std::filesystem::remove_all(path, error); }
+  } directory;
+  Check(std::filesystem::create_directory(directory.path), "Cannot create the recording test directory.");
+  PhotoTestFixture fixture;
+  auto processor = std::make_shared<const FrameProcessor>([green = SolidTexture(0, 255)](const PreviewOutput&,
+      std::chrono::nanoseconds timestamp) {
+    Check(timestamp == std::chrono::seconds(17), "The frame processor received the wrong capture timestamp.");
+    return CameraResult<PreviewOutput>::Success({.texture = green, .rotation = PreviewRotation::R90});
+  });
+  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(std::move(processor));
+  const File file((directory.path / "file.mp4").u8string());
+  const File seekable((directory.path / "seekable.mp4").u8string());
+  const File sequential((directory.path / "sequential.mp4").u8string());
+  TestRecordedFrame(fixture, file, file, media::ContainerLayout::Default);
+  TestRecordedFrame(fixture, seekable,
+      TakeRecordingResult(seekable.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew)),
+      media::ContainerLayout::Default);
+  TestRecordedFrame(fixture, sequential, TakeRecordingResult(sequential.OpenWrite()), media::ContainerLayout::Fragmented, true);
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -442,6 +565,9 @@ int main() {
     TestGeometry();
     TestSessionLifetime();
     TestPhotoRequests();
+#if defined(HUXERUI_CAMERA_TEST_RECORDING)
+    TestRecording();
+#endif
     std::cout << "Camera geometry, session lifetime, and photo request tests passed.\n";
     return 0;
   } catch (const std::exception& error) {

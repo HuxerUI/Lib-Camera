@@ -52,10 +52,6 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         return new Session(context, events);
     }
 
-    private static native PlatformPayload createOutput(int width, int height, boolean swap);
-    private static native Surface outputSurface(PlatformPayload texture);
-    private static native void finishOutput(PlatformPayload texture);
-
     private static final class Session implements HuxerUIPlatformModule, LifecycleOwner,
             DisplayManager.DisplayListener {
         private final Context context;
@@ -74,8 +70,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private Camera camera;
         private Observer<CameraState> cameraObserver;
         private Output current;
+        private CameraSurface.FrameThread frameThread;
+        private boolean frameThreadStopping;
         private long generation;
         private long run;
+        private long frames;
         private boolean active;
         private boolean opened;
         private boolean disposed;
@@ -98,11 +97,12 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             if (disposed) {
                 result.fail("camera/closed", "The camera session is closed.", PlatformPayload.nullValue());
             } else if (method.equals("start")) {
-                if (active || photoPending || !outputs.isEmpty()) {
+                if (active || photoPending || !outputs.isEmpty() || frameThreadStopping) {
                     result.fail("camera/busy", "The previous camera output is still stopping.", PlatformPayload.nullValue());
                     return null;
                 }
                 run = arguments.requireField("run").requireInt64();
+                frames = arguments.requireField("frames").requireInt64();
                 PlatformPayload requested = arguments.requireField("facing");
                 start(requested.isNull() ? null : requested.requireString());
                 result.complete(PlatformPayload.nullValue());
@@ -169,7 +169,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 Output output = new Output(request, token);
                 outputs.add(output);
                 request.addRequestCancellationListener(executor, () -> {
-                    if (output.texture == null) output.release();
+                    if (!output.provided) output.release();
                 });
                 request.setTransformationInfoListener(executor, output::configure);
             });
@@ -301,7 +301,8 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 photoOutput = null;
             }
             for (Output output : new ArrayList<>(outputs)) {
-                if (output.texture == null) {
+                if (output.gpu != null) output.gpu.pause();
+                if (!output.provided) {
                     output.request.willNotProvideSurface();
                     output.release();
                 }
@@ -310,7 +311,16 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         }
 
         private void completeStops() {
-            if (active || photoPending || !outputs.isEmpty()) return;
+            if (active || photoPending || !outputs.isEmpty() || frameThreadStopping) return;
+            if (frameThread != null) {
+                frameThreadStopping = true;
+                frameThread.close(() -> main.post(() -> {
+                    frameThreadStopping = false;
+                    completeStops();
+                }));
+                frameThread = null;
+                return;
+            }
             for (HuxerUIPlatformChannel.Result result : stops) result.complete(PlatformPayload.nullValue());
             stops.clear();
             if (disposed) {
@@ -343,9 +353,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             snapshot.put("run", PlatformPayload.int64(run));
             snapshot.put("facing", facing == null ? PlatformPayload.nullValue() : PlatformPayload.string(facing));
             snapshot.put("error", error == null ? PlatformPayload.nullValue() : error);
-            snapshot.put("texture", current == null ? PlatformPayload.nullValue() : current.texture);
-            snapshot.put("rotation", PlatformPayload.int64(current == null ? 0 : current.rotation));
-            snapshot.put("mirrored", PlatformPayload.booleanValue(current != null && current.mirrored));
+            snapshot.put("preview", current == null || current.output == null ? PlatformPayload.nullValue() : current.output);
             events.emit("snapshot", PlatformPayload.object(snapshot));
         }
 
@@ -364,10 +372,12 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private final class Output {
             final SurfaceRequest request;
             final long token;
-            PlatformPayload texture;
+            CameraSurface gpu;
+            PlatformPayload output;
             int rotation;
             boolean mirrored;
             boolean swapped;
+            boolean provided;
             boolean invalidated;
             boolean released;
 
@@ -385,26 +395,39 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                     fail("configuration-failed", "CameraX returned a cropped Surface without a ViewPort.");
                     return;
                 }
-                // This integration expects the SDK's SurfaceTexture consumer to produce natural
+                // The SurfaceTexture transform produces natural
                 // orientation; the inverse display rotation remains. See the device validation notes.
                 int nextRotation = info.hasCameraTransform()
                         ? (360 - preview.getTargetRotation() * 90) % 360 : info.getRotationDegrees();
                 boolean nextSwap = info.hasCameraTransform()
                         && camera.getCameraInfo().getSensorRotationDegrees(Surface.ROTATION_0) % 180 != 0;
                 boolean nextMirror = info.hasCameraTransform() && "front".equals(facing);
-                if (texture != null) {
+                if (gpu != null) {
                     if (rotation != nextRotation || swapped != nextSwap || mirrored != nextMirror) {
                         invalidated = true;
+                        gpu.pause();
                         request.invalidate();
+                        if (!provided) {
+                            request.willNotProvideSurface();
+                            release();
+                        }
                     }
                     return;
                 }
                 rotation = nextRotation;
                 swapped = nextSwap;
                 mirrored = nextMirror;
+                if (frameThread == null) frameThread = new CameraSurface.FrameThread();
+                gpu = new CameraSurface(frameThread, frames, width, height, swapped, rotation, mirrored);
+                gpu.open(surface -> main.post(() -> provide(surface)),
+                        frame -> main.post(() -> publish(frame)),
+                        error -> main.post(() -> surfaceFailed(error)));
+            }
+
+            void provide(Surface surface) {
+                if (released || invalidated || !active || token != generation) return;
                 try {
-                    texture = createOutput(width, height, swapped);
-                    Surface surface = outputSurface(texture);
+                    // CameraX may still write to the surface after invalidation. Its result callback releases it.
                     request.provideSurface(surface, executor, result -> {
                         release();
                         if (active && token == generation && !invalidated
@@ -413,16 +436,40 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                             fail("configuration-failed", "CameraX rejected the preview Surface: " + result.getResultCode());
                         }
                     });
+                    provided = true;
                 } catch (RuntimeException error) {
-                    request.willNotProvideSurface();
-                    release();
-                    fail("configuration-failed", error.toString());
+                    surfaceFailed(error);
                     return;
                 }
-                Log.d("HuxerUICamera", "Preview Surface " + width + "x" + height
-                        + ", rotation=" + rotation + ", swapped=" + swapped + ", mirrored=" + mirrored);
+                if (current != null && current != this) current.gpu.pause();
                 current = this;
                 if (opened) emit(null);
+            }
+
+            void publish(PlatformPayload frame) {
+                if (released || invalidated || !active || token != generation || current != this) {
+                    frame.requireField("texture").requireExternalTexture().close();
+                    return;
+                }
+                clearOutput();
+                output = frame;
+                if (opened) emit(null);
+            }
+
+            void surfaceFailed(RuntimeException error) {
+                if (released || invalidated || !active || token != generation) return;
+                if (!provided) {
+                    request.willNotProvideSurface();
+                    release();
+                }
+                fail(provided ? "capture-failed" : "configuration-failed", error.toString());
+            }
+
+            void clearOutput() {
+                if (output != null) {
+                    output.requireField("texture").requireExternalTexture().close();
+                    output = null;
+                }
             }
 
             void release() {
@@ -430,15 +477,16 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 released = true;
                 request.clearTransformationInfoListener();
                 // A provided Surface reaches this path only after CameraX releases it.
-                if (texture != null) {
-                    finishOutput(texture);
-                    texture.requireExternalTexture().close();
-                    texture = null;
-                }
+                clearOutput();
                 if (current == this) {
                     current = null;
                     if (opened && active && token == generation) emit(null);
                 }
+                if (gpu != null) gpu.close(() -> main.post(this::finishRelease));
+                else finishRelease();
+            }
+
+            void finishRelease() {
                 outputs.remove(this);
                 completeStops();
             }

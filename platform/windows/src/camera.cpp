@@ -87,7 +87,7 @@ public:
     return result;
   }
 
-  void Fail(HRESULT result) {
+  void Fail(HRESULT result, std::optional<CameraError> error = {}) {
     std::function<void(CameraStatus)> callback;
     {
       std::lock_guard lock(mutex_);
@@ -99,7 +99,17 @@ public:
     }
     ready_.notify_all();
     if (callback)
-      callback({.state = SessionState::Failed, .error = Error(result, CameraErrorCode::CaptureFailed)});
+      callback({.state = SessionState::Failed,
+                .error = error ? std::move(*error) : Error(result, CameraErrorCode::CaptureFailed)});
+  }
+
+  void Publish(CameraStatus status) {
+    std::function<void(CameraStatus)> callback;
+    {
+      std::lock_guard lock(mutex_);
+      if (!reported_ && !silent_) callback = changed;
+    }
+    if (callback) callback(std::move(status));
   }
 
   void Silence() {
@@ -121,10 +131,14 @@ public:
   std::shared_ptr<windows::D3D11Texture> texture;
   ComPtr<CaptureEvents> events;
 
-  void Configure(UINT width, UINT height, LONG stride) {
+  void Configure(UINT width, UINT height, LONG stride, PreviewRotation rotation, std::optional<Facing> facing,
+                 std::shared_ptr<FramePipeline> pipeline) {
     width_ = width;
     height_ = height;
     stride_ = stride;
+    rotation_ = rotation;
+    facing_ = facing;
+    pipeline_ = std::move(pipeline);
     if (!width || !height || width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
       throw E_INVALIDARG;
     Require(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -140,13 +154,14 @@ public:
     description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     Require(device_->CreateTexture2D(&description, nullptr, &upload_));
     texture = std::make_shared<windows::D3D11Texture>(Size{static_cast<float>(width), static_cast<float>(height)});
+    if (!pipeline_) preview_ = PreviewOutput{.texture = texture, .rotation = rotation_};
   }
 
   HRESULT STDMETHODCALLTYPE OnSample(IMFSample* sample) override {
     if (!sample)
       return S_OK;
-    std::lock_guard lock(mutex_);
-    if (finished_)
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock || finished_)
       return S_OK;
     try {
       ComPtr<IMFMediaBuffer> buffer;
@@ -192,6 +207,18 @@ public:
           throw E_INVALIDARG;
       }
       texture->Publish({upload_.Get(), windows::D3D11Texture::Alpha::Opaque});
+      if (pipeline_) {
+        LONGLONG time = 0;
+        Require(sample->GetSampleTime(&time));
+        auto processed = pipeline_->Process({.texture = texture, .rotation = rotation_},
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>(time)));
+        if (!processed.Succeeded()) {
+          events->Fail(E_FAIL, processed.Error());
+        } else if (processed.Value() != preview_) {
+          preview_ = std::move(processed).Value();
+          if (running_) Publish();
+        }
+      }
     } catch (HRESULT result) {
       events->Fail(result);
     } catch (const std::exception&) {
@@ -200,15 +227,26 @@ public:
     return S_OK;
   }
 
+  void StartPublishing() {
+    std::lock_guard lock(mutex_);
+    running_ = true;
+    Publish();
+  }
+
   void Finish() {
     // Publication and Finish share this lock, including the source device's immediate context.
     std::lock_guard lock(mutex_);
     finished_ = true;
     if (texture)
       texture->Finish();
+    preview_.reset();
+    pipeline_.reset();
   }
 
 private:
+  void Publish() {
+    events->Publish({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_});
+  }
   void Upload(const BYTE* first, LONG stride) {
     if (stride < 0) {
       pixels_.resize(static_cast<std::size_t>(width_) * height_ * 4);
@@ -223,6 +261,11 @@ private:
 
   std::mutex mutex_;
   bool finished_ = false;
+  bool running_ = false;
+  std::shared_ptr<FramePipeline> pipeline_;
+  std::optional<PreviewOutput> preview_;
+  std::optional<Facing> facing_;
+  PreviewRotation rotation_ = PreviewRotation::R0;
   UINT width_ = 0;
   UINT height_ = 0;
   LONG stride_ = 0;
@@ -308,7 +351,7 @@ public:
     scheduled_ = true;
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) {
+  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed, std::shared_ptr<FramePipeline> pipeline) {
     changed_ = std::move(changed);
     try {
       Require(com_status_);
@@ -332,13 +375,12 @@ public:
       Require(engine_->Initialize(events_.Get(), attributes.Get(), nullptr, device_.Get()));
       Require(events_->Wait(MF_CAPTURE_ENGINE_INITIALIZED));
       Require(engine_->GetSource(&source_));
-      ConfigurePreview();
+      ConfigurePreview(std::move(pipeline));
       Require(engine_->StartPreview());
       preview_started_ = true;
       Require(events_->Wait(MF_CAPTURE_ENGINE_PREVIEW_STARTED));
       running_ = true;
-      changed_({.state = SessionState::Running, .actual_facing = facing_,
-                .preview = PreviewOutput{.texture = frames_->texture, .rotation = rotation_}});
+      frames_->StartPublishing();
     } catch (HRESULT result) {
       changed_({.state = SessionState::Failed, .error = Error(result, CameraErrorCode::ConfigurationFailed)});
     } catch (const std::exception& error) {
@@ -467,11 +509,11 @@ private:
     }
   }
 
-  void ConfigurePreview() {
+  void ConfigurePreview(std::shared_ptr<FramePipeline> pipeline) {
     constexpr DWORD stream = MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_VIDEO_PREVIEW;
     ComPtr<IMFMediaType> source_type;
     Require(source_->GetCurrentDeviceMediaType(stream, &source_type));
-    rotation_ = Rotation(source_type.Get());
+    const auto rotation = Rotation(source_type.Get());
     ComPtr<IMFMediaType> type;
     Require(MFCreateMediaType(&type));
     Require(source_type->CopyAllItems(type.Get()));
@@ -495,7 +537,7 @@ private:
       Require(MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.Data1, width, &stride));
     frames_ = Make<PreviewFrames>();
     frames_->events = events_;
-    frames_->Configure(width, height, stride);
+    frames_->Configure(width, height, stride, rotation, facing_, std::move(pipeline));
     Require(preview_->SetSampleCallback(output, frames_.Get()));
   }
 
@@ -507,7 +549,6 @@ private:
   bool preview_started_ = false;
   HRESULT com_status_ = S_OK;
   std::optional<Facing> facing_;
-  PreviewRotation rotation_ = PreviewRotation::R0;
   std::function<void(CameraStatus)> changed_;
   ComPtr<IMFMediaSource> device_;
   ComPtr<IMFCaptureEngine> engine_;
@@ -526,7 +567,9 @@ public:
   }
 
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
-    capture_->Post([capture = capture_, facing, changed = std::move(changed)] { capture->Start(facing, changed); });
+    capture_->Post([capture = capture_, facing, changed = std::move(changed), pipeline = frame_pipeline_] {
+      capture->Start(facing, changed, pipeline);
+    });
     needs_stop_ = true;
   }
 

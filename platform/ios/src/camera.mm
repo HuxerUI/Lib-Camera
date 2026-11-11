@@ -17,6 +17,7 @@
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using huxerui::camera::detail::FramePipeline;
 
 namespace {
 
@@ -237,6 +238,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   AVCaptureDevice* device_;
   NSMutableArray* observers_;
   std::shared_ptr<ios::PixelBufferTexture> texture_;
+  std::shared_ptr<FramePipeline> frames_;
+  std::optional<PreviewOutput> preview_;
   std::optional<Facing> facing_;
   PreviewRotation rotation_;
   bool interrupted_;
@@ -244,7 +247,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::function<void(CameraStatus)> changed_;
 }
 - (instancetype)initWithOwner:(UIViewController*)owner;
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed;
+- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 @end
@@ -267,10 +271,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     return;
   }
   CameraStatus status{.state = interrupted_ ? SessionState::Suspended : SessionState::Running,
-                          .actual_facing = facing_};
-  if (texture_) {
-    status.preview = PreviewOutput{.texture = texture_, .rotation = rotation_};
-  }
+                      .actual_facing = facing_, .preview = preview_};
   changed_(std::move(status));
 }
 
@@ -299,7 +300,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   [observers_ addObject:token];
 }
 
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed {
+- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(std::function<void(CameraStatus)>)changed {
   UIViewController* owner = owner_;
   if (!owner) {
     changed({.state = SessionState::Failed,
@@ -317,13 +319,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     HUXIOSCameraCapture* capture = weak;
     if (capture) {
       dispatch_async(capture->queue_, ^{
-        const auto rotation = RotationForOrientation(orientation);
-        if (rotation != capture->rotation_) {
-          capture->rotation_ = rotation;
-          if (capture->texture_) {
-            [capture publish];
-          }
-        }
+        capture->rotation_ = RotationForOrientation(orientation);
       });
     }
   };
@@ -331,6 +327,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 
   dispatch_async(queue_, ^{
     changed_ = changed;
+    frames_ = frames;
     failed_ = false;
     interrupted_ = false;
     facing_.reset();
@@ -456,15 +453,28 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   try {
     const huxerui::Size size{static_cast<float>(CVPixelBufferGetWidth(buffer)),
                             static_cast<float>(CVPixelBufferGetHeight(buffer))};
-    const bool replaced = !texture_ || texture_->IntrinsicSize() != size;
-    if (replaced) {
+    if (!texture_ || texture_->IntrinsicSize() != size) {
       if (texture_) {
         texture_->Finish();
       }
       texture_ = std::make_shared<ios::PixelBufferTexture>(size);
     }
     texture_->Publish(buffer);
-    if (replaced) {
+    PreviewOutput frame{.texture = texture_, .rotation = rotation_};
+    if (frames_) {
+      const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
+                                          kCMTimeRoundingMethod_Default);
+      if (!CMTIME_IS_NUMERIC(time)) return;
+      auto processed = frames_->Process(std::move(frame), std::chrono::nanoseconds(time.value));
+      if (!processed.Succeeded()) {
+        failed_ = true;
+        changed_({.state = SessionState::Failed, .error = processed.Error()});
+        return;
+      }
+      frame = std::move(processed).Value();
+    }
+    if (frame != preview_) {
+      preview_ = std::move(frame);
       [self publish];
     }
   } catch (const std::exception& error) {
@@ -568,6 +578,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_->Finish();
       texture_.reset();
     }
+    preview_.reset();
+    frames_.reset();
     [self completeStops];
   });
 }
@@ -592,7 +604,7 @@ public:
   explicit IOSCamera(UIViewController* owner) : capture_([[HUXIOSCameraCapture alloc] initWithOwner:owner]) {}
 
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
-    [capture_ start:facing changed:std::move(changed)];
+    [capture_ start:facing frames:frame_pipeline_ changed:std::move(changed)];
   }
 
   void Stop(std::function<void()> completed) override {

@@ -1,6 +1,6 @@
 # HuxerUI Camera
 
-Camera preview and JPEG photo capture for HuxerUI applications on Android, iOS, macOS, and Windows.
+Camera preview, frame processing, JPEG photo capture, and silent video recording for HuxerUI applications on Android, iOS, macOS, and Windows.
 
 Use `UseCamera` to control a camera session, `CameraPreview` to display it, and `CapturePhotoAsync` to take photos. Multiple previews can share one session with independent fitting and mirroring. Preview frames update without recomposing the UI on every frame.
 
@@ -117,7 +117,7 @@ Keep the original `ImageAsset` for saving. For photo review on Android, decode a
 
 Only one photo request can be in progress per session. Additional requests return `OperationInProgress`; a session that is not ready returns `NotReady`. `capturing_photo` stays true until platform processing finishes, including after the caller cancels waiting. Stopping, switching cameras, backgrounding, or session failure interrupts a pending photo with `Interrupted`.
 
-A photo failure does not stop an otherwise healthy preview. A captured `ImageAsset` remains usable after the session closes. Devices that cannot provide still-photo output report `Unavailable` for photo requests. Video recording, RAW, HDR, maximum sensor resolution, and metadata preservation are outside the current API's guarantees.
+A photo failure does not stop an otherwise healthy preview. A captured `ImageAsset` remains usable after the session closes. Devices that cannot provide still-photo output report `Unavailable` for photo requests. RAW, HDR, maximum sensor resolution, and metadata preservation are outside the current API's guarantees.
 
 ## Save a Photo
 
@@ -151,6 +151,35 @@ Obtain the picker with `UseService<FilePicker>()` during composition and pass a 
 
 Your application owns temporary-file cleanup. Keep the file available until writing and platform export finish; canceling the caller does not make it safe to delete immediately. The example keeps saving in the camera page's task scope so dismissing photo review does not cancel the export. Saving directly to the system photo library is not provided by this module.
 
+## Process and Record Video
+
+Pass a retained `FrameProcessor` to `CameraOptions::frame_processor`. The callback receives the source texture and geometry together with its capture timestamp on a serial platform frame queue. Return the published output texture and its geometry. Preview and recording use the same result. Keep the output texture identity stable across frames with the same geometry so frame updates only redraw the texture. Update thread-safe parameters in the retained processor to change the effect while recording. Replacing the processor reopens capture.
+
+```cpp
+static const auto processor = std::make_shared<const camera::FrameProcessor>(
+    [](const camera::PreviewOutput& input, std::chrono::nanoseconds) {
+      auto output = input;
+      output.crop = {0.125F, 0.125F, 0.75F, 0.75F};
+      return camera::CameraResult<camera::PreviewOutput>::Success(std::move(output));
+    });
+
+auto session = camera::UseCamera({.active = active, .frame_processor = processor});
+```
+
+Run `session.RecordVideoAsync(destination)` in a task and call `session.StopRecording()` from the stop action. The task returns after the encoder drains and the muxer closes the output. `CameraStatus::recording_video` covers both capture and finalization. Stopping capture, switching cameras, or backgrounding finalizes a recording with captured frames. The file contains one H.264 video track. The recording uses the initial frame's dimensions and stores its crop and rotation as MP4 presentation metadata. Preview fitting and mirroring remain per-view settings.
+
+| Destination | Output |
+| --- | --- |
+| `File` | Creates a new regular MP4 file. |
+| `RandomAccessStream` | Transfers an empty writable stream and writes regular MP4 from offset zero. |
+| `OutputStream` | Transfers a fresh writable sequential stream and writes fragmented MP4. |
+
+Recording links the headless codec and container APIs from `HuxerUI::Media`. On Android, iOS, macOS, and Windows, Camera declares this dependency using an existing Media target or a `Lib-Media` checkout beside Camera. Set `HUXERUI_CAMERA_MEDIA_PATH` to use a different source checkout. Recording without Media support reports `Unavailable`. Android recording requires API 28 or later.
+
+For iOS, use an SDK that discovers the Swift packages at `platform/ios/Camera/` and `platform/ios/Media/`. Register `HuxerUI::Camera` on the application target. The SDK includes Camera's Media dependency in both the generated Swift package integration and the application core archive.
+
+For recording, publish a `GlTexture` on Android, a `PixelBufferTexture` with an NV12 or BGRA buffer on iOS or macOS, or an opaque `D3D11Texture` on Windows. Camera snapshots the processed frame before the next publication. The iOS and macOS backends convert BGRA to NV12 for the encoder.
+
 ## Run the Example
 
 The [preview example](examples/preview) includes permission handling, camera switching, fitting and mirroring controls, a composition grid, simultaneous previews, photo review, and file export.
@@ -164,7 +193,7 @@ huxerui run android --profile debug
 
 Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
 
-Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The photo icon opens the latest photo and its **Save photo** action. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
+Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The photo icon opens the latest photo and its **Save photo** action. Use **Record video** and **Stop recording** to prepare a silent MP4. Select **Save video** to export the latest recording to a location you choose in the system file picker. You can retry if you dismiss the picker. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
