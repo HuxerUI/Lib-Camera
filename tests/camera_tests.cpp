@@ -2,41 +2,25 @@
 
 #include <array>
 #include <cmath>
-#include <deque>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <thread>
 #include <stdexcept>
 
-#if defined(HUXERUI_CAMERA_TEST_RECORDING)
-#include <CoreVideo/CoreVideo.h>
-#include <filesystem>
-#include <huxerui/macos/external_texture.h>
-#include <huxerui/media_codec.h>
-#include <huxerui/media_container.h>
-#endif
-
-#include "camera_internal.h"
-#include "camera_session.h"
+#include "camera_test_fixture.h"
 #include "photo_fixture.h"
 
 #define CAMERA_DISCARD(expression) static_cast<void>(expression)
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using namespace huxerui::camera::test;
 
 namespace {
 
 using huxerui::Point;
 using huxerui::Rect;
 using huxerui::Size;
-
-void Check(bool condition, const char* message) {
-  if (!condition) {
-    throw std::runtime_error(message);
-  }
-}
 
 void Near(float actual, float expected) {
   Check(std::abs(actual - expected) < 0.001F, "Unexpected preview coordinate.");
@@ -173,65 +157,6 @@ void TestProducerSize() {
         "The default output must use the original producer size.");
 }
 
-class TestPlatform final : public UiWindow, public huxerui::Runtime {
-public:
-  TestPlatform()
-      : huxerui::Runtime([this](std::function<void()> work) {
-          std::lock_guard lock(mutex);
-          pending.push_back(std::move(work));
-        }) {}
-  ~TestPlatform() override { UiWindow::Retire(); huxerui::Runtime::Retire(); }
-  void Start(const Application& application) {
-    InitializeApplication(application, LaunchActivation{}, ApplicationLifecycleState::Active);
-    InitializeWindow(*this, application.root_factory, application.options.window,
-                     std::nullopt, WindowLifecycleState::Active);
-  }
-  void OnRuntimeStopped() override {}
-  void RequestFrameAt(double) override {}
-  double Now() const noexcept override { return 0.0; }
-  FontMetrics Metrics(const Font&) override { return {}; }
-  TextRunMetrics MeasureRun(std::string_view, const TextStyle&, const TextShapingOptions&) override { return {}; }
-  TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
-    return {};
-  }
-  void Drain(UiWindow& runtime) {
-    for (int turns = 0; turns < 30; ++turns) {
-      while (RunOne()) {
-      }
-      runtime.BuildFrame();
-      std::lock_guard lock(mutex);
-      if (pending.empty())
-        return;
-    }
-    throw std::runtime_error("UI dispatch did not settle.");
-  }
-
-  bool RunOne() {
-    std::function<void()> work;
-    {
-      std::lock_guard lock(mutex);
-      if (pending.empty())
-        return false;
-      work = std::move(pending.front());
-      pending.pop_front();
-    }
-    work();
-    return true;
-  }
-
-  void Await(UiWindow& runtime, const std::function<bool()>& done) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
-    while (!done() && std::chrono::steady_clock::now() < deadline) {
-      Drain(runtime);
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    Check(done(), "Asynchronous camera operation did not complete.");
-  }
-
-  std::mutex mutex;
-  std::deque<std::function<void()>> pending;
-};
-
 class TestBackend final : public camera::detail::CameraBackend {
 public:
   int starts = 0;
@@ -326,93 +251,6 @@ void TestSessionLifetime() {
   backends.clear();
   retained_session.reset();
 }
-
-class PhotoBackend final : public camera::detail::CameraBackend {
-public:
-  std::function<void(camera::CameraResult<ImageAsset>)> pending;
-  std::function<void()> stopped;
-  camera::PhotoOptions options;
-  int captures = 0;
-
-  void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
-  void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
-  void CapturePhoto(camera::PhotoOptions value,
-                    std::function<void(camera::CameraResult<ImageAsset>)> completed) override {
-    ++captures;
-    options = value;
-    pending = std::move(completed);
-  }
-  void Complete(camera::CameraResult<ImageAsset> result) {
-    auto completed = std::exchange(pending, {});
-    completed(std::move(result));
-    if (auto stop = std::exchange(stopped, {}))
-      stop();
-  }
-};
-
-struct PhotoTestContext {
-  std::shared_ptr<camera::detail::CameraSessionData> owner;
-  std::shared_ptr<PhotoBackend> backend = std::make_shared<PhotoBackend>();
-  std::optional<TaskScope> callers;
-  State<bool> visible;
-  Facing facing = Facing::Front;
-};
-
-[[huxerui::composable]]
-View PhotoTestOwner(PhotoTestContext* context) {
-  auto status = UseState(CameraStatus{.state = SessionState::Running, .actual_facing = context->facing});
-  auto tasks = UseTaskScope();
-  auto retained = UseState(std::make_shared<camera::detail::CameraSessionData>(status, tasks, UseApplication()));
-  context->owner = retained;
-  Lifecycle([owner = context->owner, backend = context->backend] {
-    owner->backend = backend;
-    owner->engaged = true;
-    return [owner] { owner->Close(); };
-  }, context->owner);
-  return Canvas([](PaintContext&, Size) {});
-}
-
-PhotoTestContext* active_photo_test = nullptr;
-
-[[huxerui::composable]]
-View PhotoTestContent(PhotoTestContext* context) {
-  context->callers = UseTaskScope();
-  context->visible = UseState(true);
-  return context->visible ? PhotoTestOwner(context) : View{};
-}
-
-View PhotoTestRoot() { return PhotoTestContent(active_photo_test); }
-
-class PhotoTestFixture {
-public:
-  PhotoTestContext context;
-  Application application;
-  TestPlatform platform;
-  UiWindow& runtime = platform;
-
-  explicit PhotoTestFixture(Facing facing = Facing::Front)
-      : application(PhotoTestRoot, {.show_debug_overlay = false}) {
-    Check(!active_photo_test, "Photo fixtures must not overlap.");
-    active_photo_test = &context;
-    context.facing = facing;
-    platform.Start(application);
-    runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
-    Drain();
-  }
-
-  ~PhotoTestFixture() { active_photo_test = nullptr; }
-
-  TaskHandle Launch(std::optional<CameraResult<ImageAsset>>& result, PhotoOptions options = {}) {
-    return context.callers->Launch([&result, options, owner = context.owner]() -> Task<void> {
-      result = co_await camera::detail::CapturePhoto(owner, options);
-    });
-  }
-
-  void Drain() { platform.Drain(runtime); }
-  void Await(const std::optional<CameraResult<ImageAsset>>& result) {
-    platform.Await(runtime, [&] { return result.has_value(); });
-  }
-};
 
 void TestPhotoRequests() {
   {
@@ -534,209 +372,6 @@ void TestPhotoRequests() {
   }
 }
 
-#if defined(HUXERUI_CAMERA_TEST_RECORDING)
-template <class T, class E> T TakeRecordingResult(Result<T, E> result) {
-  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
-  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
-}
-
-std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t green, int width = 64, int height = 64) {
-  CVPixelBufferRef pixels = nullptr;
-  Check(CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_32BGRA, nullptr, &pixels) == kCVReturnSuccess,
-        "Cannot allocate a test camera frame.");
-  const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
-      owner(pixels, CVPixelBufferRelease);
-  Check(CVPixelBufferLockBaseAddress(pixels, 0) == kCVReturnSuccess, "Cannot lock a test camera frame.");
-  for (int row = 0; row < height; ++row) {
-    auto* pixel = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddress(pixels)) + row * CVPixelBufferGetBytesPerRow(pixels);
-    for (int column = 0; column < width; ++column) {
-      *pixel++ = 0;
-      *pixel++ = green;
-      *pixel++ = red;
-      *pixel++ = 255;
-    }
-  }
-  CVPixelBufferUnlockBaseAddress(pixels, 0);
-  auto texture = std::make_shared<macos::PixelBufferTexture>(Size{static_cast<float>(width), static_cast<float>(height)});
-  texture->Publish(pixels);
-  return texture;
-}
-
-void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
-  using namespace std::chrono_literals;
-  using namespace huxerui::media;
-  const auto owner = fixture.context.owner;
-  owner->frames = std::make_shared<camera::detail::FramePipeline>(CameraOptions{});
-  std::optional<CameraResult<void>> result;
-  auto task = fixture.context.callers->Launch([owner, file, &result]() -> Task<void> {
-    result = co_await camera::detail::RecordVideo(owner, file);
-  });
-  fixture.Drain();
-  Check(owner->status->recording_video, "Recording did not start.");
-
-  camera::detail::FrameProducer producer;
-  owner->SetRecordingPaused(true);
-  owner->SetRecordingPaused(true);
-  Check(owner->status->recording_paused && owner->status->recording_video,
-        "Pausing must keep the recording in progress.");
-  const auto unpublished = std::make_shared<macos::PixelBufferTexture>(Size{64.0F, 64.0F});
-  const auto preview = TakeRecordingResult(owner->frames->Process(producer, {.texture = unpublished}, 1s, 64, 64));
-  Check(preview.texture == unpublished, "Preview must continue while recording is paused.");
-  owner->SetRecordingPaused(false);
-  Check(!owner->status->recording_paused, "Resuming must clear the pause state.");
-
-  const auto input = SolidTexture(255, 0);
-  std::chrono::microseconds timestamp = 17s;
-  const auto capture_until = [&](std::chrono::microseconds duration, std::chrono::milliseconds step) {
-    fixture.platform.Await(fixture.runtime, [&] {
-      if (result || owner->RecordedDuration() > duration) return true;
-      TakeRecordingResult(owner->frames->Process(producer, {.texture = input}, timestamp, 64, 64));
-      timestamp += step;
-      return false;
-    });
-    Check(!result, "Recording ended before it was stopped.");
-  };
-  capture_until(0us, 1ms);
-  const auto before_pause = timestamp - 17s;
-  owner->SetRecordingPaused(true);
-  timestamp += 30s;
-  owner->SetRecordingPaused(false);
-  capture_until(before_pause, 10ms);
-
-  owner->SetRecordingPaused(true);
-  owner->StopRecording();
-  owner->SetRecordingPaused(false);
-  Check(!owner->status->recording_paused, "Stopping a paused recording must clear the pause state.");
-  fixture.platform.Await(fixture.runtime, [&] { return result.has_value(); });
-  TakeRecordingResult(std::move(*result));
-  fixture.Drain();
-  Check(!owner->status->recording_video, "A paused recording must finalize on stop.");
-
-  const auto duration = owner->RecordedDuration();
-  Check(duration > before_pause && duration < 30s, "The recording timeline must exclude the pause gap.");
-  auto demuxer = TakeRecordingResult(MediaDemuxer::Open(TakeRecordingResult(file.OpenRandomAccess())));
-  const auto written_duration = demuxer.Duration();
-  Check(written_duration && *written_duration == MediaTimestamp{duration.count(), 1'000'000},
-        "Reported duration must match the MP4 after resuming.");
-}
-
-constexpr std::uint32_t recording_width = 96;
-constexpr std::uint32_t recording_height = 64;
-
-template <class Destination>
-std::shared_ptr<ExternalTexture> TestRecordedFrame(PhotoTestFixture& fixture, camera::detail::FrameProducer& producer,
-    const File& file, Destination destination, media::ContainerLayout layout, bool unmount = false) {
-  using namespace huxerui::media;
-  std::optional<CameraResult<void>> result;
-  const auto owner = fixture.context.owner;
-  auto task = fixture.context.callers->Launch(
-      [owner, &result, destination = std::move(destination)]() mutable -> Task<void> {
-        result = co_await camera::detail::RecordVideo(owner, std::move(destination));
-      });
-  fixture.Drain();
-  Check(owner->status->recording_video, "Recording did not start.");
-  Check(owner->RecordedDuration().count() == 0, "A new recording must start at zero duration.");
-
-  const auto input = SolidTexture(255, 0);
-  const auto preview = TakeRecordingResult(
-      owner->frames->Process(producer, {.texture = input}, std::chrono::seconds(17), 64, 64));
-  Check(preview.rotation == PreviewRotation::R90 && preview.mirrored && preview.crop == Rect{0, 0, 1, 1},
-        "Sizing must consume the processed crop and preserve rotation and mirroring.");
-  const auto* texture = dynamic_cast<const macos::PixelBufferTexture*>(preview.texture.get());
-  const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
-      pixels(texture ? texture->AcquireFrame() : nullptr, CVPixelBufferRelease);
-  Check(pixels && CVPixelBufferGetWidth(pixels.get()) == recording_width &&
-            CVPixelBufferGetHeight(pixels.get()) == recording_height,
-        "Preview texture must have the requested physical dimensions.");
-  if (unmount) {
-    fixture.context.visible = false;
-    fixture.Drain();
-  } else {
-    owner->StopRecording();
-  }
-  fixture.platform.Await(fixture.runtime, [&] { return result.has_value(); });
-  TakeRecordingResult(std::move(*result));
-  fixture.Drain();
-  Check(!owner->status->recording_video, "Recording remained busy after finalization.");
-
-  auto demuxer = TakeRecordingResult(MediaDemuxer::Open(TakeRecordingResult(file.OpenRandomAccess())));
-  Check(demuxer.Layout() == layout && demuxer.Tracks().size() == 1, "Unexpected recording layout or track count.");
-  const auto& track = demuxer.Tracks().front();
-  const auto& format = track.descriptions.front();
-  Check(track.kind == TrackKind::Video && track.rotation == VideoRotation::Clockwise90 && format.codec == CodecId::H264,
-        "Recording lost the processed frame geometry.");
-  const auto visible = format.visible.value_or(VideoRectangle{0, 0, *format.coded_width, *format.coded_height});
-  Check(visible.width == recording_width && visible.height == recording_height,
-        "The visible video frame must have the requested preview texture dimensions.");
-  auto decoder = TakeRecordingResult(VideoDecoder::Create({.initialization_data = format.initialization_data,
-      .width = *format.coded_width, .height = *format.coded_height}));
-  Check(TakeRecordingResult(demuxer.Read()).has_value(), "Missing video track configuration.");
-  auto item = TakeRecordingResult(demuxer.Read());
-  Check(item && std::holds_alternative<ContainerPacket>(*item), "Recording has no frame.");
-  const auto& packet = std::get<ContainerPacket>(*item);
-  Check(packet.pts && packet.pts->ticks == 0, "Recording did not start at a relative timestamp of zero.");
-  const auto duration = owner->RecordedDuration();
-  if (unmount) {
-    Check(duration.count() == 0, "A closed session must report zero recorded duration.");
-  } else {
-    Check(packet.duration && MediaTimestamp{duration.count(), 1'000'000} == *packet.duration,
-          "The final recorded duration must match the MP4 sample duration.");
-  }
-  fixture.platform.Await(fixture.runtime, [&] {
-    return TakeRecordingResult(decoder.TrySubmit({packet.data, *packet.pts, packet.dts, packet.duration,
-                                                 packet.sync_sample.value_or(false)})) == SubmitStatus::Accepted;
-  });
-  TakeRecordingResult(decoder.Finish());
-  fixture.platform.Await(fixture.runtime, [&] {
-    while (auto output = TakeRecordingResult(decoder.TryRead())) {
-      if (auto* frame = std::get_if<VideoFrame>(&*output)) {
-        const auto luma = std::to_integer<int>(frame->planes.front().data.AsBytes().front());
-        Check(luma > 140, "The encoded video contains the red source frame instead of the green processed frame.");
-        return true;
-      }
-    }
-    return false;
-  });
-  return preview.texture;
-}
-
-void TestRecording() {
-  struct Directory {
-    std::filesystem::path path = std::filesystem::temp_directory_path() /
-        ("huxerui-camera-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    ~Directory() { std::error_code error; std::filesystem::remove_all(path, error); }
-  } directory;
-  Check(std::filesystem::create_directory(directory.path), "Cannot create the recording test directory.");
-  int factory_calls = 0;
-  PhotoTestFixture fixture;
-  TestRecordingPause(fixture, File((directory.path / "paused.mp4").u8string()));
-  auto factory = std::make_shared<const FrameProcessorFactory>([&](std::uint32_t width, std::uint32_t height) -> FrameProcessor {
-    Check(width == 64 && height == 64, "The recording factory must receive the source frame size.");
-    ++factory_calls;
-    return [green = SolidTexture(0, 255, 128, 96)](const PreviewOutput&, std::chrono::nanoseconds timestamp) {
-      Check(timestamp == std::chrono::seconds(17), "The frame processor received the wrong capture timestamp.");
-      return CameraResult<PreviewOutput>::Success({.texture = green, .crop = {0.125F, 0.125F, 0.75F, 0.75F},
-                                                  .rotation = PreviewRotation::R90, .mirrored = true});
-    };
-  });
-  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(
-      CameraOptions{.frame_processor_factory = std::move(factory), .output_pixel_width = recording_width,
-                    .output_pixel_height = recording_height});
-  camera::detail::FrameProducer producer;
-  const File file((directory.path / "file.mp4").u8string());
-  const File seekable((directory.path / "seekable.mp4").u8string());
-  const File sequential((directory.path / "sequential.mp4").u8string());
-  const auto first = TestRecordedFrame(fixture, producer, file, file, media::ContainerLayout::Default);
-  const auto second = TestRecordedFrame(fixture, producer, seekable,
-      TakeRecordingResult(seekable.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew)),
-      media::ContainerLayout::Default);
-  const auto third = TestRecordedFrame(fixture, producer, sequential, TakeRecordingResult(sequential.OpenWrite()),
-                                       media::ContainerLayout::Fragmented, true);
-  Check(first == second && first == third, "Sized frames must reuse the preview texture identity.");
-  Check(factory_calls == 1, "Recording starts and stops must share the producer's processor.");
-}
-#endif
-
 } // namespace
 
 int main() {
@@ -747,9 +382,6 @@ int main() {
     TestProducerSize();
     TestSessionLifetime();
     TestPhotoRequests();
-#if defined(HUXERUI_CAMERA_TEST_RECORDING)
-    TestRecording();
-#endif
     std::cout << "Camera tests passed.\n";
     return 0;
   } catch (const std::exception& error) {

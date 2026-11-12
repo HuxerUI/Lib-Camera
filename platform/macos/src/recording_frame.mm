@@ -1,5 +1,3 @@
-#if defined(HUXERUI_CAMERA_RECORDING)
-
 #import <Accelerate/Accelerate.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -96,5 +94,3 @@ media::CodecResult<media::VideoFrame> AcquireRecordingFrame(
 }
 
 } // namespace huxerui::camera::detail
-
-#endif

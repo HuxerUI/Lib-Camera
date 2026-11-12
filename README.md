@@ -1,6 +1,6 @@
 # HuxerUI Camera
 
-Camera preview, frame processing, JPEG photo capture, and silent video recording for HuxerUI applications on Android, iOS, macOS, and Windows.
+Camera preview, frame processing, JPEG photo capture, and video recording with optional microphone audio for HuxerUI applications on Android, iOS, macOS, and Windows.
 
 Use `UseCamera` to control a camera session, `CameraPreview` to display it, and `CapturePhotoAsync` to take photos. Multiple previews can share one session with independent fitting and mirroring. Preview frames update without recomposing the UI on every frame.
 
@@ -16,6 +16,11 @@ huxerui_use_library(my_app
         PATH "/path/to/Lib-Camera"
 )
 ```
+
+Camera requires `HuxerUI::Media` and `HuxerUI::AudioCapture`. Use existing CMake targets or place `Lib-Media`
+and `Lib-AudioCapture` beside `Lib-Camera`. Set `HUXERUI_CAMERA_MEDIA_PATH` and
+`HUXERUI_CAMERA_AUDIO_CAPTURE_PATH` to use other source checkouts. AudioCapture must provide
+`AudioReader::FinishInput()`.
 
 Include the public headers and register the camera module in your application's `application_hooks`:
 
@@ -188,7 +193,26 @@ Poll `session.RecordedDuration()` on the UI thread for the current recording dur
 | `RandomAccessStream` | Transfers an empty writable stream and writes regular MP4 from offset zero. |
 | `OutputStream` | Transfers a fresh writable sequential stream and writes fragmented MP4. |
 
-Recording links the headless codec and container APIs from `HuxerUI::Media`. On Android, iOS, macOS, and Windows, Camera declares this dependency using an existing Media target or a `Lib-Media` checkout beside Camera. Set `HUXERUI_CAMERA_MEDIA_PATH` to use a different source checkout. Recording without Media support reports `Unavailable`. Android recording requires API 28 or later.
+Android recording requires API 28 or later.
+
+## Record with a Microphone
+
+Register `huxerui::audio::Install` in the application's hooks alongside `camera::Install`. After granting microphone
+permission, activate `audio::UseAudioCapture()` in the owning composition. Pass the resulting session as the second
+argument to `RecordVideoAsync(destination, microphone)` from a UI task. All three destinations accept an
+optional microphone session. The default is `std::nullopt` for silent recording. Camera attaches the microphone's sole
+reader when the task starts. Configure microphone effects through `audio::CaptureOptions::pcm_processor` with
+`PcmTiming::CaptureTime` to preserve the source timestamps. Use interleaved S16 mono or stereo at 44.1 or 48 kHz.
+
+Pause and resume the recording through the Camera session. The recorder maps both sources to a shared capture clock
+and excludes the same pause intervals from both tracks. On stop, Camera seals the audio reader at the recording cutoff,
+drains its processor and both encoders, and closes the MP4. Keep microphone capture active until the recording task
+completes. The recorder releases the reader so a later task can use the same capture session. A device that cannot
+provide camera timestamps on the shared clock reports `Unavailable` for microphone recording.
+
+`File` and `RandomAccessStream` write regular MP4 with known AAC priming and padding represented as presentation
+trim. `OutputStream` writes fragmented MP4 with the same audio and video timing and complete AAC access units,
+including any encoder priming and padding.
 
 For iOS, use an SDK that discovers the Swift packages at `platform/ios/Camera/` and `platform/ios/Media/`. Register `HuxerUI::Camera` on the application target. The SDK includes Camera's Media dependency in both the generated Swift package integration and the application core archive.
 
@@ -205,15 +229,18 @@ huxerui build android --profile debug
 huxerui run android --profile debug
 ```
 
-Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
+Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera and microphone usage descriptions.
 
-The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter to start recording. The recording badge shows the recorded video duration in whole seconds. Use the control to the left of the shutter to pause or resume. Press the shutter again to finalize the silent MP4, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
+The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter and allow microphone access to start recording. The recording badge shows the recorded video duration in whole seconds. Use the control to the left of the shutter to pause or resume. Press the shutter again to finalize the MP4 with microphone audio, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
 ## Tests
 
-Configure with `-DHUXERUI_CAMERA_BUILD_TESTS=ON` and run `ctest --test-dir <build-directory> --output-on-failure`. On Windows, this includes JPEG corner checks for all stream rotations, all eight EXIF orientations, and final mirroring without opening a camera.
+Configure with `-DHUXERUI_CAMERA_BUILD_TESTS=ON` and run `ctest --test-dir <build-directory> --output-on-failure`.
+On macOS, recording tests cover the three output types. The microphone tests use a synthetic input from the
+AudioCapture source checkout. On Windows, the suite includes JPEG corner checks for all stream rotations,
+all eight EXIF orientations, and final mirroring without opening a camera.
 
 Run `<build-directory>/camera_windows_tests.exe --device` explicitly to check live preview, photos, facing selection, stopping during pending operations, and restart. A camera and camera access are required. The Windows backend was tested with an ACER HD User Facing camera at 1280×720, and the example was manually verified. Device removal, permission revocation during capture, and sustained performance remain unverified.
 

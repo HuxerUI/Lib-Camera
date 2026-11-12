@@ -48,8 +48,11 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
 };
 
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options);
-Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, File destination);
-Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, RandomAccessStream destination);
-Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, OutputStream destination);
+Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, File destination,
+                                    std::optional<audio::AudioCaptureSession> microphone = std::nullopt);
+Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, RandomAccessStream destination,
+                                    std::optional<audio::AudioCaptureSession> microphone = std::nullopt);
+Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, OutputStream destination,
+                                    std::optional<audio::AudioCaptureSession> microphone = std::nullopt);
 
 } // namespace huxerui::camera::detail

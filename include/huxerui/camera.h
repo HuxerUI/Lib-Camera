@@ -20,6 +20,7 @@
 #include <huxerui/file.h>
 #include <huxerui/resource.h>
 #include <huxerui/app.h>
+#include <huxerui/audiocapture.h>
 #include <huxerui/task.h>
 #include <huxerui/view.h>
 
@@ -325,7 +326,7 @@ public:
   /// @endcode
   Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
-  /// @brief Records a single H.264 video track into a new MP4 file.
+  /// @brief Records H.264 video and optional AAC-LC microphone audio into a new MP4 file.
   ///
   /// Start the lazy task on the owning UI thread from a UI event or TaskScope. The session must be running.
   /// Each session accepts one recording at a time, including pauses and finalization. Call StopRecording()
@@ -333,42 +334,56 @@ public:
   /// backgrounding, also requests finalization. Task cancellation requests finalization and suppresses
   /// completion delivery.
   ///
-  /// The encoder receives retained snapshots of the same output used by preview. Timestamps are relative
-  /// to the first submitted frame. The track uses the initial dimensions and stores the initial crop and
-  /// rotation as presentation metadata. Encoded pixels keep their source mirror appearance.
+  /// The encoder receives retained snapshots of the same output used by preview. The track uses the
+  /// initial dimensions and stores the initial crop and rotation as presentation metadata. Encoded
+  /// pixels keep their source mirror appearance.
   /// A change in input video format ends the recording.
   /// When recording falls behind, Camera can skip input frames while preserving their elapsed capture time.
   ///
   /// Use a published GlTexture on Android, a PixelBufferTexture backed by NV12 or BGRA on iOS or macOS, or
-  /// an opaque D3D11Texture on Windows. iOS and macOS require even pixel dimensions. Recording requires
-  /// HuxerUI::Media and platform H.264 encoder support.
-  /// The recording contains video only. An encoding or I/O failure may leave partial output.
+  /// an opaque D3D11Texture on Windows. iOS and macOS require even pixel dimensions.
+  ///
+  /// With no microphone, the recording has one video track starting at the first submitted frame.
+  /// With a microphone in Starting or Running, Camera opens its sole PCM reader and releases it after
+  /// recording. Keep the microphone active until the task completes. The caller owns permission and
+  /// capture intent. Use capture-timed PCM, including any configured capture-time processing, in
+  /// interleaved S16 mono or stereo at 44.1 or 48 kHz. Both tracks use the same capture clock and pause
+  /// intervals. On stop, Camera finishes input at the capture cutoff and drains the processor and encoders.
+  ///
+  /// An encoding or I/O failure may leave partial output.
   /// @param destination New file in a writable directory. Camera creates it when the first encoded packet
-  /// is available and preserves an existing file at that path.
+  /// for each requested track is ready to write and preserves an existing file at that path.
+  /// @param microphone Optional active microphone session on the same owning UI thread.
   /// @return A task yielding success after finalization or a CameraError. NotReady means capture has
-  /// not reached SessionState::Running or is stopping. OperationInProgress means another recording is
-  /// active or finalizing. Unavailable indicates missing recording support. Interrupted means recording
-  /// stopped before a frame could be encoded.
+  /// not reached SessionState::Running or is stopping. OperationInProgress means a recording or a
+  /// microphone reader is already active. Unavailable indicates missing platform, codec, or clock support.
+  /// Interrupted means capture ended before the required media arrived.
   /// @see PauseRecording(), StopRecording(), RecordedDuration(), CameraOptions::frame_processor_factory
-  Task<CameraResult<void>> RecordVideoAsync(File destination) const;
+  Task<CameraResult<void>> RecordVideoAsync(
+      File destination, std::optional<audio::AudioCaptureSession> microphone = std::nullopt) const;
 
-  /// @brief Records a single H.264 video track into a writable random-access stream as a regular MP4.
+  /// @brief Records video and optional microphone audio into a writable random-access stream as a regular MP4.
   ///
   /// The task owns the destination and writes from offset zero. The capture, cancellation, and finalization
   /// contract is shared with the file overload.
   /// @param destination Empty writable stream transferred to the task.
+  /// @param microphone Optional active microphone session supplying capture-timed PCM.
   /// @return A task yielding success after the muxer finalizes the stream, or CameraError.
-  /// @see RecordVideoAsync(File), StopRecording()
-  Task<CameraResult<void>> RecordVideoAsync(RandomAccessStream destination) const;
+  /// @see RecordVideoAsync(File, std::optional<audio::AudioCaptureSession>), StopRecording()
+  Task<CameraResult<void>> RecordVideoAsync(
+      RandomAccessStream destination, std::optional<audio::AudioCaptureSession> microphone = std::nullopt) const;
 
-  /// @brief Records a single H.264 video track into a sequential output stream as a fragmented MP4.
+  /// @brief Records video and optional microphone audio into a sequential stream as a fragmented MP4.
   ///
   /// The task owns the destination. The capture, cancellation, and finalization contract is shared with
-  /// the file overload.
+  /// the file overload. With audio, the stream contains complete AAC access units and can include
+  /// encoder priming and final padding.
   /// @param destination Fresh writable stream transferred to the task.
+  /// @param microphone Optional active microphone session supplying capture-timed PCM.
   /// @return A task yielding success after the muxer finalizes the stream, or CameraError.
-  /// @see RecordVideoAsync(File), StopRecording()
-  Task<CameraResult<void>> RecordVideoAsync(OutputStream destination) const;
+  /// @see RecordVideoAsync(File, std::optional<audio::AudioCaptureSession>), StopRecording()
+  Task<CameraResult<void>> RecordVideoAsync(
+      OutputStream destination, std::optional<audio::AudioCaptureSession> microphone = std::nullopt) const;
 
   /// @brief Reads the video duration on the MP4 timeline of the current or latest recording.
   ///
@@ -379,7 +394,7 @@ public:
   /// @return The duration in microseconds. A new recording starts at zero and a successful final
   /// duration remains available until the next recording starts. Returns zero before any recording,
   /// after a failed recording settles, or after the session closes.
-  /// @see RecordVideoAsync(File), CameraStatus::recording_video
+  /// @see RecordVideoAsync(File, std::optional<audio::AudioCaptureSession>), CameraStatus::recording_video
   std::chrono::microseconds RecordedDuration() const noexcept;
 
   /// @brief Pauses acceptance of new frames for the current recording on the owning UI thread.
@@ -391,9 +406,9 @@ public:
 
   /// @brief Continues a paused recording into the same output on the owning UI thread.
   ///
-  /// The first new frame continues the output timeline after the last frame before the pause, using up to
-  /// one nominal frame interval at the join. Later frames retain their capture intervals. Calling while
-  /// already recording, during finalization, or with no recording has no effect.
+  /// Video-only recording uses up to one nominal frame interval at the join. With microphone audio,
+  /// both tracks exclude the same pause interval. Calling while already recording, during finalization,
+  /// or with no recording has no effect.
   /// @see PauseRecording(), RecordedDuration(), CameraStatus::recording_paused
   void ResumeRecording() const;
 
@@ -402,7 +417,7 @@ public:
   /// A running or paused recording drains accepted frames through the encoder before the muxer finalizes
   /// the output. Await the original recording task for the outcome. Calling again during finalization or
   /// with no recording has no effect.
-  /// @see RecordVideoAsync(File), CameraStatus::recording_video
+  /// @see RecordVideoAsync(File, std::optional<audio::AudioCaptureSession>), CameraStatus::recording_video
   void StopRecording() const;
 
 private:

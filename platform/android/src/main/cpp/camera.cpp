@@ -176,6 +176,7 @@ struct CameraOutput {
   int height;
   PreviewRotation rotation;
   bool mirrored;
+  bool realtime_timestamps;
   std::optional<PreviewOutput> published;
   camera::detail::FrameProducer producer;
 };
@@ -190,7 +191,7 @@ void ThrowJava(JNIEnv* env, const std::exception& error) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_huxerui_lib_camera_CameraSurface_createOutput(JNIEnv* env, jclass, jlong pipeline, jintArray render_size,
-                                                       jint rotation, jboolean mirrored) {
+                                                       jint rotation, jboolean mirrored, jboolean realtime_timestamps) {
   try {
     jint dimensions[2]{};
     env->GetIntArrayRegion(render_size, 0, 2, dimensions);
@@ -217,7 +218,7 @@ Java_org_huxerui_lib_camera_CameraSurface_createOutput(JNIEnv* env, jclass, jlon
     auto output = std::make_unique<CameraOutput>(
         std::make_shared<android::GlTexture>(Size{static_cast<float>(width), static_cast<float>(height)}),
         std::move(frames), width, height, static_cast<PreviewRotation>(rotation / 90),
-        mirrored == JNI_TRUE);
+        mirrored == JNI_TRUE, realtime_timestamps == JNI_TRUE);
     return reinterpret_cast<jlong>(output.release());
   } catch (const std::exception& error) {
     ThrowJava(env, error);
@@ -233,8 +234,10 @@ Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlon
         .pixel_width = output.width, .pixel_height = output.height, .alpha = android::GlTexture::Alpha::Opaque});
     PreviewOutput preview{.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored};
     if (output.frames) {
-      auto processed = output.frames->Process(output.producer, std::move(preview), std::chrono::nanoseconds(time),
-          static_cast<std::uint32_t>(output.width), static_cast<std::uint32_t>(output.height));
+      const auto capture_time = std::chrono::nanoseconds(time);
+      const auto synchronized_time = output.realtime_timestamps ? std::optional{capture_time} : std::nullopt;
+      auto processed = output.frames->Process(output.producer, std::move(preview), capture_time,
+          static_cast<std::uint32_t>(output.width), static_cast<std::uint32_t>(output.height), synchronized_time);
       if (!processed.Succeeded()) throw std::runtime_error(processed.Error().message);
       preview = std::move(processed).Value();
     }

@@ -24,6 +24,8 @@
   <string>LaunchScreen</string>
   <key>NSCameraUsageDescription</key>
   <string>Show a live camera preview.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Record microphone audio with video.</string>
   <key>UISupportedInterfaceOrientations</key>
   <array>
     <string>UIInterfaceOrientationPortrait</string>

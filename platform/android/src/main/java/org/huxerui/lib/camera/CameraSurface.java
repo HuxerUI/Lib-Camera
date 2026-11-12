@@ -95,6 +95,7 @@ final class CameraSurface {
     private final int[] renderSize;
     private final int rotation;
     private final boolean mirrored;
+    private final boolean realtimeTimestamps;
     private final long frames;
     private final FloatBuffer vertices = ByteBuffer.allocateDirect(8 * Float.BYTES)
             .order(ByteOrder.nativeOrder()).asFloatBuffer();
@@ -111,7 +112,8 @@ final class CameraSurface {
     private long lastTimestamp = Long.MIN_VALUE;
     private volatile boolean paused;
 
-    CameraSurface(FrameThread worker, long frames, int width, int height, boolean swapped, int rotation, boolean mirrored) {
+    CameraSurface(FrameThread worker, long frames, int width, int height, boolean swapped, int rotation,
+                  boolean mirrored, boolean realtimeTimestamps) {
         this.worker = worker;
         this.frames = frames;
         sourceWidth = width;
@@ -119,6 +121,7 @@ final class CameraSurface {
         renderSize = swapped ? new int[]{height, width} : new int[]{width, height};
         this.rotation = rotation;
         this.mirrored = mirrored;
+        this.realtimeTimestamps = realtimeTimestamps;
         vertices.put(new float[]{-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
     }
 
@@ -190,7 +193,7 @@ final class CameraSurface {
         source = new SurfaceTexture(textures[0]);
         source.setDefaultBufferSize(sourceWidth, sourceHeight);
         surface = new Surface(source);
-        output = createOutput(frames, renderSize, rotation, mirrored);
+        output = createOutput(frames, renderSize, rotation, mirrored, realtimeTimestamps);
     }
 
     private PlatformPayload render() {
@@ -278,7 +281,8 @@ final class CameraSurface {
         }
     }
 
-    private static native long createOutput(long frames, int[] renderSize, int rotation, boolean mirrored);
+    private static native long createOutput(long frames, int[] renderSize, int rotation, boolean mirrored,
+                                            boolean realtimeTimestamps);
     private static native PlatformPayload processFrame(long output, int texture, long timestamp);
     private static native void finishOutput(long output);
 }

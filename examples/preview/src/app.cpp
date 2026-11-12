@@ -1,4 +1,5 @@
 #include <huxerui/huxerui.h>
+#include <huxerui/audiocapture.h>
 #include <huxerui/camera.h>
 #include <app_resources.h>
 
@@ -29,7 +30,7 @@ const Color accent = Color::Rgb(111, 226, 190);
 const Color record_red = Color::Rgb(255, 78, 89);
 
 enum class CaptureMode { Photo, Video };
-enum class VideoPhase { Idle, Recording, Finishing };
+enum class VideoPhase { Idle, Authorizing, Starting, Recording, Finishing };
 
 Text Label(StringVariant text, float size = 13.0F, Color color = secondary,
            FontWeight weight = FontWeight::Regular) {
@@ -390,7 +391,14 @@ View CameraWorkspace() {
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
   auto session = camera::UseCamera({.facing = facing, .active = active});
+  const VideoPhase phase = video_phase;
+  const auto microphone = audio::UseAudioCapture({
+      .active = phase == VideoPhase::Starting || phase == VideoPhase::Recording || phase == VideoPhase::Finishing,
+      .sample_rate = 48'000,
+      .channel_layout = media::AudioChannelLayout::Mono,
+  });
   const auto status = session.Status();
+  const auto microphone_status = microphone.Status();
   const ImageFit selected_fit = fit;
   const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
   const bool failed = status.state == camera::SessionState::Failed;
@@ -460,7 +468,7 @@ View CameraWorkspace() {
     });
   };
 
-  auto toggle_recording = [session, tasks, application, video_phase, video_file, saving_video, video_message] {
+  auto toggle_recording = [session, tasks, application, active, video_phase, saving_video, video_message] {
     if (video_phase != VideoPhase::Idle) {
       if (video_phase == VideoPhase::Recording && session.Status().recording_video) {
         video_phase = VideoPhase::Finishing;
@@ -469,15 +477,49 @@ View CameraWorkspace() {
       return;
     }
     if (saving_video) return;
-    video_phase = VideoPhase::Recording;
+    video_phase = VideoPhase::Authorizing;
     video_message = std::string{};
-    tasks.Launch([session, application, video_phase, video_file, video_message]() -> Task<void> {
+    tasks.Launch([application, active, video_phase, video_message]() -> Task<void> {
+      try {
+        auto permission = co_await application.CheckPermissionAsync(Permission::Microphone);
+        if (permission != PermissionStatus::Granted && active) {
+          permission = co_await application.RequestPermissionAsync(Permission::Microphone);
+        }
+        if (permission == PermissionStatus::Granted && active) {
+          video_phase = VideoPhase::Starting;
+          co_return;
+        }
+        if (active) video_message = "Allow microphone access to record video.";
+      } catch (const std::exception& error) {
+        video_message = std::string(error.what());
+      }
+      video_phase = VideoPhase::Idle;
+    });
+  };
+
+  Lifecycle([session, microphone, tasks, application, active, status, microphone_status,
+             video_phase, video_file, video_message] {
+    if (video_phase != VideoPhase::Starting) return;
+    if (!active || status.state == camera::SessionState::Failed) {
+      video_phase = VideoPhase::Idle;
+      return;
+    }
+    if (microphone_status.error) {
+      video_message = microphone_status.error->message;
+      video_phase = VideoPhase::Idle;
+      return;
+    }
+    if (status.state != camera::SessionState::Running || microphone_status.state != audio::SessionState::Running) {
+      return;
+    }
+    video_phase = VideoPhase::Recording;
+    tasks.Launch([session, microphone, application, video_phase, video_file, video_message]() -> Task<void> {
       try {
         static std::atomic_uint64_t sequence{0};
         const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
         const auto name = "camera-video-" + std::to_string(timestamp) + "-" + std::to_string(++sequence) + ".mp4";
         const auto output = application.Directories().temporary_directory.Child(name);
-        auto result = co_await session.RecordVideoAsync(output);
+        auto result = co_await session.RecordVideoAsync(output, microphone);
         if (result.Succeeded()) {
           video_file = std::optional{output};
           video_message = "Recorded " + name;
@@ -489,7 +531,8 @@ View CameraWorkspace() {
       }
       video_phase = VideoPhase::Idle;
     });
-  };
+  }, phase, active.Get(), status.state, microphone_status);
+
   auto save_video = [tasks, picker, video_phase, video_file, saving_video, video_message] {
     const auto source = video_file.Get();
     if (!source || saving_video || video_phase != VideoPhase::Idle || !picker->CanSaveFiles()) return;
@@ -557,7 +600,8 @@ View CameraWorkspace() {
   );
 
   const char* photo_action = status.capturing_photo ? "Taking photo" : "Take photo";
-  const char* video_action = recording ? "Stop recording" : video_busy ? "Processing video" : "Record video";
+  const char* video_action = recording ? "Stop recording" : phase == VideoPhase::Authorizing ? "Requesting microphone access"
+      : phase == VideoPhase::Starting ? "Starting microphone" : video_busy ? "Processing video" : "Record video";
   const bool shutter_enabled = video ? recording || (!video_busy && !saving_video) : !status.capturing_photo;
   View primary = live || video_busy
       ? ShutterButton(video ? video_action : photo_action, video, video_busy, shutter_enabled)
@@ -671,6 +715,7 @@ const Application application{
         .show_debug_overlay = false,
         .application_hooks = {
             huxerui::camera::Install,
+            huxerui::audio::Install,
 #if defined(__ANDROID__)
             [](ApplicationContext& context) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;

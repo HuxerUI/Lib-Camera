@@ -19,11 +19,18 @@ if (IOS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     enable_language(OBJCXX)
 endif ()
 
-file(GLOB_RECURSE LIBRARY_SOURCE_FILES CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
+set(LIBRARY_SOURCE_FILES
+        src/camera.cpp
+        src/camera_frame_pipeline.cpp
+        src/camera_preview.cpp
+        src/camera_session.cpp
 )
+if (ANDROID OR APPLE OR WIN32)
+    list(APPEND LIBRARY_SOURCE_FILES src/camera_recording.cpp src/camera_recording_audio.cpp)
+else ()
+    list(APPEND LIBRARY_SOURCE_FILES src/camera_unavailable.cpp)
+endif ()
+
 if (ANDROID)
     file(GLOB_RECURSE LIBRARY_ANDROID_SOURCE_FILES CONFIGURE_DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/src/main/cpp/*.cpp"
@@ -84,14 +91,21 @@ huxerui_add_library(huxerui_camera
 
 add_library(HuxerUI::Camera ALIAS huxerui_camera)
 
-if (HUXERUI_LIBRARY_GRAPH_ONLY OR ANDROID OR APPLE OR WIN32)
-    set(HUXERUI_CAMERA_MEDIA_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media"
-            CACHE PATH "Lib-Media source checkout for Camera video recording")
-    if (TARGET HuxerUI::Media)
-        huxerui_use_library(huxerui_camera TARGET HuxerUI::Media)
-    elseif (EXISTS "${HUXERUI_CAMERA_MEDIA_PATH}/CMakeLists.txt")
-        huxerui_use_library(huxerui_camera TARGET HuxerUI::Media PATH "${HUXERUI_CAMERA_MEDIA_PATH}")
-    endif ()
+set(HUXERUI_CAMERA_MEDIA_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media"
+        CACHE PATH "Lib-Media source checkout required by Camera")
+if (TARGET HuxerUI::Media)
+    huxerui_use_library(huxerui_camera TARGET HuxerUI::Media)
+else ()
+    huxerui_use_library(huxerui_camera TARGET HuxerUI::Media PATH "${HUXERUI_CAMERA_MEDIA_PATH}")
+endif ()
+
+set(HUXERUI_CAMERA_AUDIO_CAPTURE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-AudioCapture"
+        CACHE PATH "Lib-AudioCapture source checkout required by Camera")
+if (TARGET HuxerUI::AudioCapture)
+    huxerui_use_library(huxerui_camera PUBLIC TARGET HuxerUI::AudioCapture)
+else ()
+    huxerui_use_library(huxerui_camera PUBLIC
+            TARGET HuxerUI::AudioCapture PATH "${HUXERUI_CAMERA_AUDIO_CAPTURE_PATH}")
 endif ()
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
@@ -105,17 +119,6 @@ target_include_directories(huxerui_camera PUBLIC
 
 target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-if (ANDROID OR APPLE OR WIN32)
-    if (TARGET HuxerUI::Media)
-        target_compile_definitions(huxerui_camera PRIVATE HUXERUI_CAMERA_RECORDING=1)
-        if (APPLE)
-            target_link_libraries(huxerui_camera PRIVATE "-framework Accelerate")
-        endif ()
-    else ()
-        message(STATUS "Camera recording requires HuxerUI::Media or HUXERUI_CAMERA_MEDIA_PATH")
-    endif ()
-endif ()
-
 if (WIN32)
     target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
     target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 d2d1 windowscodecs runtimeobject ole32 oleaut32)
@@ -128,21 +131,31 @@ endif ()
 if (APPLE)
     target_compile_options(huxerui_camera PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
-        "-framework CoreImage" "-framework ImageIO")
+        "-framework CoreImage" "-framework ImageIO" "-framework Accelerate")
 endif ()
 
 option(HUXERUI_CAMERA_BUILD_TESTS "Build Camera module tests" OFF)
 if (HUXERUI_CAMERA_BUILD_TESTS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     enable_testing()
-    add_executable(camera_tests tests/camera_tests.cpp)
-    target_compile_features(camera_tests PRIVATE cxx_std_20)
-    target_include_directories(camera_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-    target_link_libraries(camera_tests PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
-    huxerui_enable_codegen(camera_tests)
-    add_test(NAME camera_tests COMMAND camera_tests)
-    if (APPLE AND NOT IOS AND TARGET HuxerUI::Media)
-        target_compile_definitions(camera_tests PRIVATE HUXERUI_CAMERA_TEST_RECORDING=1)
-        target_link_libraries(camera_tests PRIVATE HuxerUI::Media)
+    function(camera_add_test name)
+        add_executable(${name} "tests/${name}.cpp" tests/camera_test_fixture.cpp)
+        target_compile_features(${name} PRIVATE cxx_std_20)
+        target_include_directories(${name} PRIVATE src tests)
+        target_link_libraries(${name} PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
+        huxerui_enable_codegen(${name})
+        add_test(NAME ${name} COMMAND ${name})
+    endfunction()
+
+    camera_add_test(camera_tests)
+    if (APPLE AND NOT IOS)
+        camera_add_test(camera_recording_tests)
+        target_link_libraries(camera_recording_tests PRIVATE HuxerUI::Media)
+        get_target_property(camera_audio_capture_source HuxerUI::AudioCapture SOURCE_DIR)
+        if (EXISTS "${camera_audio_capture_source}/src/capture_run.h")
+            camera_add_test(camera_audio_recording_tests)
+            target_link_libraries(camera_audio_recording_tests PRIVATE HuxerUI::Media)
+            target_include_directories(camera_audio_recording_tests PRIVATE "${camera_audio_capture_source}/src")
+        endif ()
     endif ()
     if (WIN32)
         add_executable(camera_windows_tests tests/windows_camera_tests.cpp)

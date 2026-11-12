@@ -4,6 +4,8 @@
 <dict>
   <key>NSCameraUsageDescription</key>
   <string>Show a live camera preview in the HuxerUI Camera example.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Record microphone audio with video.</string>
   <key>CFBundleDisplayName</key>
   <string>Camera Preview</string>
   <key>CFBundleExecutable</key>

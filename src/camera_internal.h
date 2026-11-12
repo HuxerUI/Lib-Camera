@@ -59,11 +59,15 @@ public:
   std::pair<std::uint32_t, std::uint32_t> ProducerSize(std::uint32_t width, std::uint32_t height) const noexcept;
   /// Acquires the recording snapshot before return. A success without a texture skips the frame.
   CameraResult<PreviewOutput> Process(FrameProducer& producer, PreviewOutput input,
-      std::chrono::nanoseconds capture_time, std::uint32_t pixel_width, std::uint32_t pixel_height);
+      std::chrono::nanoseconds capture_time, std::uint32_t pixel_width, std::uint32_t pixel_height,
+      std::optional<std::chrono::nanoseconds> synchronized_time = {});
   /// Called on the UI thread. An empty pointer detaches the recorder from subsequent frames.
   void SetRecording(std::shared_ptr<VideoRecording> recording);
 
 private:
+  void OfferRecordingFrame(const PreviewOutput& output, std::chrono::nanoseconds capture_time,
+                           std::optional<std::chrono::nanoseconds> synchronized_time);
+
   std::shared_ptr<const FrameProcessorFactory> factory_;
   std::uint32_t output_width_;
   std::uint32_t output_height_;

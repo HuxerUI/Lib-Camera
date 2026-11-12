@@ -22,6 +22,14 @@ using huxerui::camera::detail::FrameProducer;
 
 namespace {
 
+CMClockRef SessionClock(AVCaptureSession* session) {
+  if (@available(iOS 15.4, *)) return session.synchronizationClock;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  return session.masterClock;
+#pragma clang diagnostic pop
+}
+
 PreviewRotation RotationForOrientation(UIInterfaceOrientation orientation) {
   switch (orientation) {
     case UIInterfaceOrientationLandscapeLeft: return PreviewRotation::R90;
@@ -469,7 +477,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
                                           kCMTimeRoundingMethod_Default);
       if (!CMTIME_IS_NUMERIC(time)) return;
-      auto processed = frames_->Process(producer_, std::move(frame), std::chrono::nanoseconds(time.value), width, height);
+      std::optional<std::chrono::nanoseconds> synchronized_time;
+      if (const auto clock = SessionClock(session_)) {
+        const auto host = CMSyncConvertTime(time, clock, CMClockGetHostTimeClock());
+        const auto timestamp = CMTimeConvertScale(host, 1'000'000'000, kCMTimeRoundingMethod_Default);
+        if (CMTIME_IS_NUMERIC(timestamp)) synchronized_time = std::chrono::nanoseconds(timestamp.value);
+      }
+      auto processed = frames_->Process(producer_, std::move(frame), std::chrono::nanoseconds(time.value), width, height,
+                                        synchronized_time);
       if (!processed.Succeeded()) {
         failed_ = true;
         changed_({.state = SessionState::Failed, .error = processed.Error()});

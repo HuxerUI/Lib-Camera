@@ -254,6 +254,29 @@ Task<CameraResult<ImageAsset>> CameraSession::CapturePhotoAsync(PhotoOptions opt
   return detail::CapturePhoto(data_, options);
 }
 
+Task<CameraResult<void>> CameraSession::RecordVideoAsync(
+    File destination, std::optional<audio::AudioCaptureSession> microphone) const {
+  return detail::RecordVideo(data_, std::move(destination), std::move(microphone));
+}
+
+Task<CameraResult<void>> CameraSession::RecordVideoAsync(
+    RandomAccessStream destination, std::optional<audio::AudioCaptureSession> microphone) const {
+  return detail::RecordVideo(data_, std::move(destination), std::move(microphone));
+}
+
+Task<CameraResult<void>> CameraSession::RecordVideoAsync(
+    OutputStream destination, std::optional<audio::AudioCaptureSession> microphone) const {
+  return detail::RecordVideo(data_, std::move(destination), std::move(microphone));
+}
+
+std::chrono::microseconds CameraSession::RecordedDuration() const noexcept { return data_->RecordedDuration(); }
+
+void CameraSession::PauseRecording() const { data_->SetRecordingPaused(true); }
+
+void CameraSession::ResumeRecording() const { data_->SetRecordingPaused(false); }
+
+void CameraSession::StopRecording() const { data_->StopRecording(); }
+
 CameraSession UseCamera(CameraOptions options, const std::source_location& location) {
   auto status = UseState(CameraStatus{}, location);
   auto tasks = UseTaskScope();

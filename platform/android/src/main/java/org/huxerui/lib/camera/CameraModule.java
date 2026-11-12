@@ -5,6 +5,7 @@ import android.graphics.Rect;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
+import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -13,6 +14,7 @@ import android.view.Surface;
 import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
+import androidx.camera.camera2.interop.Camera2CameraInfo;
 import androidx.camera.core.Camera;
 import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
@@ -46,6 +48,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class CameraModule implements HuxerUIPlatformModule.Factory {
+    @androidx.camera.camera2.interop.ExperimentalCamera2Interop
+    private static boolean usesRealtimeTimestamps(CameraInfo info) {
+        try {
+            Integer source = Camera2CameraInfo.from(info)
+                    .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+            return source != null && source == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+        } catch (IllegalArgumentException unavailable) {
+            return false;
+        }
+    }
+
     @Override
     public HuxerUIPlatformModule create(Context context, PlatformPayload options,
                                        HuxerUIPlatformChannel.Events events) {
@@ -418,7 +431,8 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 swapped = nextSwap;
                 mirrored = nextMirror;
                 if (frameThread == null) frameThread = new CameraSurface.FrameThread();
-                gpu = new CameraSurface(frameThread, frames, width, height, swapped, rotation, mirrored);
+                gpu = new CameraSurface(frameThread, frames, width, height, swapped, rotation, mirrored,
+                        usesRealtimeTimestamps(camera.getCameraInfo()));
                 gpu.open(surface -> main.post(() -> provide(surface)),
                         frame -> main.post(() -> publish(frame)),
                         error -> main.post(() -> surfaceFailed(error)));

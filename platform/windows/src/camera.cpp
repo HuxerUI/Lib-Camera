@@ -213,8 +213,15 @@ public:
         Require(sample->GetSampleTime(&time));
         const auto capture_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>(time));
+        std::optional<std::chrono::nanoseconds> synchronized_time;
+        // DeviceTimestamp uses the QPC epoch also used by WASAPI capture.
+        UINT64 device_time = 0;
+        if (SUCCEEDED(sample->GetUINT64(MFSampleExtension_DeviceTimestamp, &device_time)) &&
+            device_time <= static_cast<UINT64>(std::chrono::nanoseconds::max().count() / 100)) {
+          synchronized_time = std::chrono::nanoseconds(device_time * 100);
+        }
         auto processed = pipeline_->Process(producer_, {.texture = texture, .rotation = rotation_},
-            capture_time, width_, height_);
+            capture_time, width_, height_, synchronized_time);
         if (!processed.Succeeded()) {
           finished_ = true;
           events->Fail(E_FAIL, processed.Error());
