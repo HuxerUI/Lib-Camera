@@ -532,6 +532,64 @@ std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t gre
   return texture;
 }
 
+void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
+  using namespace std::chrono_literals;
+  using namespace huxerui::media;
+  const auto owner = fixture.context.owner;
+  owner->frames = std::make_shared<camera::detail::FramePipeline>(nullptr);
+  std::optional<CameraResult<void>> result;
+  auto task = fixture.context.callers->Launch([owner, file, &result]() -> Task<void> {
+    result = co_await camera::detail::RecordVideo(owner, file);
+  });
+  fixture.Drain();
+  Check(owner->status->recording_video, "Recording did not start.");
+
+  FrameProcessor processor;
+  owner->SetRecordingPaused(true);
+  owner->SetRecordingPaused(true);
+  Check(owner->status->recording_paused && owner->status->recording_video,
+        "Pausing must keep the recording in progress.");
+  const auto unpublished = std::make_shared<macos::PixelBufferTexture>(Size{64.0F, 64.0F});
+  const auto preview = TakeRecordingResult(owner->frames->Process(processor, {.texture = unpublished}, 1s, 64, 64));
+  Check(preview.texture == unpublished, "Preview must continue while recording is paused.");
+  owner->SetRecordingPaused(false);
+  Check(!owner->status->recording_paused, "Resuming must clear the pause state.");
+
+  const auto input = SolidTexture(255, 0);
+  std::chrono::microseconds timestamp = 17s;
+  const auto capture_until = [&](std::chrono::microseconds duration, std::chrono::milliseconds step) {
+    fixture.platform.Await(fixture.runtime, [&] {
+      if (result || owner->RecordedDuration() > duration) return true;
+      TakeRecordingResult(owner->frames->Process(processor, {.texture = input}, timestamp, 64, 64));
+      timestamp += step;
+      return false;
+    });
+    Check(!result, "Recording ended before it was stopped.");
+  };
+  capture_until(0us, 1ms);
+  const auto before_pause = timestamp - 17s;
+  owner->SetRecordingPaused(true);
+  timestamp += 30s;
+  owner->SetRecordingPaused(false);
+  capture_until(before_pause, 10ms);
+
+  owner->SetRecordingPaused(true);
+  owner->StopRecording();
+  owner->SetRecordingPaused(false);
+  Check(!owner->status->recording_paused, "Stopping a paused recording must clear the pause state.");
+  fixture.platform.Await(fixture.runtime, [&] { return result.has_value(); });
+  TakeRecordingResult(std::move(*result));
+  fixture.Drain();
+  Check(!owner->status->recording_video, "A paused recording must finalize on stop.");
+
+  const auto duration = owner->RecordedDuration();
+  Check(duration > before_pause && duration < 30s, "The recording timeline must exclude the pause gap.");
+  auto demuxer = TakeRecordingResult(MediaDemuxer::Open(TakeRecordingResult(file.OpenRandomAccess())));
+  const auto written_duration = demuxer.Duration();
+  Check(written_duration && *written_duration == MediaTimestamp{duration.count(), 1'000'000},
+        "Reported duration must match the MP4 after resuming.");
+}
+
 template <class Destination>
 void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, const File& file, Destination destination,
                        media::ContainerLayout layout, bool unmount = false) {
@@ -607,6 +665,7 @@ void TestRecording() {
   Check(std::filesystem::create_directory(directory.path), "Cannot create the recording test directory.");
   int factory_calls = 0;
   PhotoTestFixture fixture;
+  TestRecordingPause(fixture, File((directory.path / "paused.mp4").u8string()));
   auto factory = std::make_shared<const FrameProcessorFactory>([&](std::uint32_t width, std::uint32_t height) -> FrameProcessor {
     Check(width == 64 && height == 64, "The recording factory must receive the source frame size.");
     ++factory_calls;

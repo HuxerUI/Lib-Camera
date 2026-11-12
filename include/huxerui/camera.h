@@ -244,9 +244,12 @@ struct CameraStatus {
   /// Whether an accepted photo request is still pending, including platform processing after caller cancellation.
   /// Capture normally remains Running during a photo. This flag is shared by all session handles.
   bool capturing_photo = false;
-  /// Whether the session has a recording accepting frames or finalizing its output.
+  /// Whether the session has a recording in progress, including pauses and finalization.
   /// Closing the session clears this flag. Pending finalization can continue after closure.
   bool recording_video = false;
+  /// Whether the current recording is skipping new frames after PauseRecording().
+  /// Preview and frame processing continue. Resuming or ending the recording clears this flag.
+  bool recording_paused = false;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -310,9 +313,10 @@ public:
   /// @brief Records a single H.264 video track into a new MP4 file.
   ///
   /// Start the lazy task on the owning UI thread from a UI event or TaskScope. The session must be running.
-  /// Each session accepts one recording at a time, including finalization. Call StopRecording() to stop
-  /// accepting frames and finalize the output. Capture shutdown, including a camera switch or backgrounding,
-  /// also requests finalization. Task cancellation requests finalization and suppresses completion delivery.
+  /// Each session accepts one recording at a time, including pauses and finalization. Call StopRecording()
+  /// to stop accepting frames and finalize the output. Capture shutdown, including a camera switch or
+  /// backgrounding, also requests finalization. Task cancellation requests finalization and suppresses
+  /// completion delivery.
   ///
   /// The encoder receives retained snapshots of the same output used by preview. Timestamps are relative
   /// to the first submitted frame. The track uses the initial dimensions and stores the initial crop and
@@ -330,7 +334,7 @@ public:
   /// not reached SessionState::Running or is stopping. OperationInProgress means another recording is
   /// active or finalizing. Unavailable indicates missing recording support. Interrupted means recording
   /// stopped before a frame could be encoded.
-  /// @see StopRecording(), RecordedDuration(), CameraStatus::recording_video, CameraOptions::frame_processor_factory
+  /// @see PauseRecording(), StopRecording(), RecordedDuration(), CameraOptions::frame_processor_factory
   Task<CameraResult<void>> RecordVideoAsync(File destination) const;
 
   /// @brief Records a single H.264 video track into a writable random-access stream as a regular MP4.
@@ -354,7 +358,8 @@ public:
   /// @brief Reads the video duration on the MP4 timeline of the current or latest recording.
   ///
   /// The duration advances to the presentation end of each sample accepted by the muxer. It can
-  /// lag capture while the encoder buffers frames and advance during finalization as frames drain.
+  /// lag capture while the encoder buffers frames and advance while queued frames drain after a pause or stop.
+  /// The output timeline excludes the gaps between recording intervals.
   /// Read the snapshot on the owning UI thread. Poll from a UI task at the display refresh interval.
   /// @return The duration in microseconds. A new recording starts at zero and a successful final
   /// duration remains available until the next recording starts. Returns zero before any recording,
@@ -362,11 +367,26 @@ public:
   /// @see RecordVideoAsync(File), CameraStatus::recording_video
   std::chrono::microseconds RecordedDuration() const noexcept;
 
+  /// @brief Pauses acceptance of new frames for the current recording on the owning UI thread.
+  ///
+  /// Preview and frame processing continue. The recording keeps its encoder and output open while accepted
+  /// frames drain. Calling again while paused, during finalization, or with no recording has no effect.
+  /// @see ResumeRecording(), StopRecording(), CameraStatus::recording_paused
+  void PauseRecording() const;
+
+  /// @brief Continues a paused recording into the same output on the owning UI thread.
+  ///
+  /// The first new frame continues the output timeline after the last frame before the pause, using up to
+  /// one nominal frame interval at the join. Later frames retain their capture intervals. Calling while
+  /// already recording, during finalization, or with no recording has no effect.
+  /// @see PauseRecording(), RecordedDuration(), CameraStatus::recording_paused
+  void ResumeRecording() const;
+
   /// @brief Requests finalization of the current recording on the owning UI thread.
   ///
-  /// The recording stops accepting frames. Already accepted frames drain through the encoder before the
-  /// muxer finalizes the output. Await the original recording task for the outcome. Calling again during
-  /// finalization or with no recording has no effect.
+  /// A running or paused recording drains accepted frames through the encoder before the muxer finalizes
+  /// the output. Await the original recording task for the outcome. Calling again during finalization or
+  /// with no recording has no effect.
   /// @see RecordVideoAsync(File), CameraStatus::recording_video
   void StopRecording() const;
 

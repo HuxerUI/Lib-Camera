@@ -81,7 +81,7 @@ View StatusBadge(StringVariant text, Color color) {
 }
 
 [[huxerui::composable]]
-View RecordingBadge(camera::CameraSession session, bool recording) {
+View RecordingBadge(camera::CameraSession session, bool recording, bool paused) {
   using namespace std::chrono_literals;
   auto elapsed = UseState(0s);
   auto tasks = UseTaskScope();
@@ -98,7 +98,8 @@ View RecordingBadge(camera::CameraSession session, bool recording) {
   char time[32];
   std::snprintf(time, sizeof(time), "%02lld:%02lld",
                 static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60));
-  return StatusBadge(std::string(recording ? "REC " : "FINALIZING ") + time, recording ? record_red : secondary);
+  const char* label = paused ? "PAUSED " : recording ? "REC " : "FINALIZING ";
+  return StatusBadge(std::string(label) + time, recording && !paused ? record_red : secondary);
 }
 
 [[huxerui::composable]]
@@ -397,6 +398,7 @@ View CameraWorkspace() {
   const bool video = mode == CaptureMode::Video;
   const bool video_busy = video_phase != VideoPhase::Idle;
   const bool recording = status.recording_video && video_phase == VideoPhase::Recording;
+  const bool paused = recording && status.recording_paused;
 
   auto show_settings = [sheets, facing, fit, mirror, grid, comparison] {
     sheets.Show([facing, fit, mirror, grid, comparison](BottomSheetContext sheet) {
@@ -511,7 +513,7 @@ View CameraWorkspace() {
 
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
   View badge = recording || video_phase == VideoPhase::Finishing
-      ? RecordingBadge(session, recording && live)
+      ? RecordingBadge(session, recording && live, paused)
       : StatusBadge(StateName(status.state), status_color);
 
   View viewfinder = Stack {
@@ -571,6 +573,15 @@ View CameraWorkspace() {
             else start_camera();
           }).With(Enabled(!authorizing && !stopping));
 
+  View left_control = (recording && live
+      ? IconButton(paused ? app::images::resume : app::images::pause,
+                   paused ? "Resume recording" : "Pause recording").OnClick([session] {
+          if (session.Status().recording_paused) session.ResumeRecording();
+          else session.PauseRecording();
+        })
+      : IconButton(app::images::photo, "View last photo").OnClick(show_photo).With(Enabled(photo->HasValue())))
+      .With(Background(control_background), CornerRadius(14.0F));
+
   View controls = Column {
     video_file->has_value() && picker->CanSaveFiles() ? View(Button(saving_video ? "Saving video" : "Save video")
         .OnClick(save_video).With(Enabled(!saving_video && !video_busy))) : View(),
@@ -579,8 +590,7 @@ View CameraWorkspace() {
     CaptureModePicker(mode, !video_busy && !status.capturing_photo),
     Stack {
       Row {
-        IconButton(app::images::photo, "View last photo").OnClick(show_photo)
-            .With(Enabled(photo->HasValue()), Background(control_background), CornerRadius(14.0F)),
+        left_control,
         Spacer(),
         primary,
         Spacer(),

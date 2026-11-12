@@ -168,9 +168,11 @@ static const auto factory = std::make_shared<const camera::FrameProcessorFactory
 auto session = camera::UseCamera({.active = active, .frame_processor_factory = factory});
 ```
 
-Run `session.RecordVideoAsync(destination)` in a task and call `session.StopRecording()` from the stop action. The task returns after the encoder drains and the muxer closes the output. `CameraStatus::recording_video` covers both capture and finalization. Stopping capture, switching cameras, or backgrounding finalizes a recording with captured frames. The file contains one H.264 video track. The recording uses the initial frame's dimensions and stores its crop and rotation as MP4 presentation metadata. Preview fitting and mirroring remain per-view settings.
+Run `session.RecordVideoAsync(destination)` in a task and call `session.StopRecording()` from the stop action. The task returns after the encoder drains and the muxer closes the output. `CameraStatus::recording_video` stays true during recording, pauses, and finalization. Stopping capture, switching cameras, or backgrounding finalizes a recording with captured frames. The file contains one H.264 video track. The recording uses the initial frame's dimensions and stores its crop and rotation as MP4 presentation metadata. Preview fitting and mirroring remain per-view settings.
 
-Poll `session.RecordedDuration()` on the UI thread for the current recording duration in microseconds. It advances as the MP4 muxer accepts video samples, including frames that drain during finalization. After success, the final duration remains available until the next recording starts or the session closes.
+Use `session.PauseRecording()` to skip new frames while preview and frame processing continue. `session.ResumeRecording()` appends to the same MP4 and joins the recording intervals without the pause gap. Read `CameraStatus::recording_paused` for the pause state. The stop action can finalize a paused recording.
+
+Poll `session.RecordedDuration()` on the UI thread for the current recording duration in microseconds. It advances as the MP4 muxer accepts video samples, including frames that drain after a pause or stop. After success, the final duration remains available until the next recording starts or the session closes.
 
 | Destination | Output |
 | --- | --- |
@@ -197,7 +199,7 @@ huxerui run android --profile debug
 
 Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
 
-The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter to start recording. The recording badge shows the recorded video duration in whole seconds. Press the shutter again to finalize the silent MP4, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
+The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter to start recording. The recording badge shows the recorded video duration in whole seconds. Use the control to the left of the shutter to pause or resume. Press the shutter again to finalize the silent MP4, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 

@@ -51,11 +51,13 @@ CodecResult<VideoFrame> AcquireRecordingFrame(const std::shared_ptr<ExternalText
 namespace {
 
 constexpr std::uint32_t recording_timescale = 1'000'000;
+constexpr std::int64_t nominal_frame_duration = recording_timescale / 30;
 
 struct RecordingFrame {
   VideoFrame video;
   Rect crop;
   PreviewRotation rotation;
+  std::uint64_t generation;
 };
 
 using OpenMuxer = std::function<MediaMuxer(const MediaTrack&)>;
@@ -134,6 +136,14 @@ public:
     return std::chrono::microseconds(duration_ticks_.load(std::memory_order_relaxed));
   }
 
+  bool SetPaused(bool paused) {
+    std::lock_guard lock(mutex_);
+    if (stopping_ || paused_ == paused) return false;
+    paused_ = paused;
+    if (!paused) ++generation_;
+    return true;
+  }
+
   void Stop() noexcept {
     std::lock_guard lock(mutex_);
     stopping_ = true;
@@ -141,22 +151,25 @@ public:
   }
 
   void Offer(const PreviewOutput& output, std::chrono::nanoseconds capture_time) {
+    std::uint64_t generation;
     {
       std::lock_guard lock(mutex_);
       // Leave the producer free to deliver the next preview frame when the recorder falls behind.
-      if (stopping_ || pending_ || finished_) return;
+      if (stopping_ || paused_ || pending_) return;
+      generation = generation_;
     }
     try {
       const auto ticks = std::chrono::duration_cast<std::chrono::microseconds>(capture_time).count();
       auto frame = Require(AcquireRecordingFrame(output.texture, {ticks, recording_timescale}));
       std::lock_guard lock(mutex_);
-      if (stopping_ || finished_) return;
-      pending_ = RecordingFrame{std::move(frame), output.crop, output.rotation};
+      // A pause and resume can both occur while acquiring a snapshot.
+      if (stopping_ || paused_ || generation != generation_ || pending_) return;
+      pending_ = RecordingFrame{std::move(frame), output.crop, output.rotation, generation};
       Signal();
     } catch (const CameraError& error) {
-      Fail(error);
+      Fail(error, generation);
     } catch (const std::exception& error) {
-      Fail({CameraErrorCode::CaptureFailed, error.what()});
+      Fail({CameraErrorCode::CaptureFailed, error.what()}, generation);
     }
   }
 
@@ -171,9 +184,9 @@ private:
     Signal();
   }
 
-  void Fail(CameraError error) {
+  void Fail(CameraError error, std::uint64_t generation) {
     std::lock_guard lock(mutex_);
-    if (stopping_ || finished_) return;
+    if (stopping_ || paused_ || generation != generation_) return;
     failure_ = std::move(error);
     stopping_ = true;
     Signal();
@@ -208,9 +221,10 @@ private:
     VideoFormat input_format;
     Rect crop;
     PreviewRotation rotation = PreviewRotation::R0;
-    std::int64_t start = 0;
+    std::int64_t timeline_origin = 0;
     std::int64_t last_input = -1;
-    std::int64_t duration = recording_timescale / 30;
+    std::int64_t duration = nominal_frame_duration;
+    std::uint64_t input_generation = 0;
     bool draining = false;
 
     for (;;) {
@@ -267,7 +281,8 @@ private:
         if (input) {
           auto& frame = input->video;
           if (!encoder) {
-            start = frame.pts.ticks;
+            timeline_origin = frame.pts.ticks;
+            input_generation = input->generation;
             input_format = frame.format;
             crop = input->crop;
             rotation = input->rotation;
@@ -282,10 +297,24 @@ private:
             continue;
           }
           auto relative = frame;
-          relative.pts.ticks -= start;
+          relative.pts.ticks -= timeline_origin;
+          if (relative.pts.ticks <= last_input) {
+            input.reset();
+            progress = true;
+            continue;
+          }
+          const bool resumed = input->generation != input_generation;
+          if (resumed) {
+            // Limit the sample spanning a pause to one nominal frame interval.
+            relative.pts.ticks = last_input + std::min(relative.pts.ticks - last_input, nominal_frame_duration);
+          }
           // Keep the same retained input across WouldBlock until the encoder signals readiness.
-          if (relative.pts.ticks <= last_input || Require(encoder->TrySubmit(relative)) == SubmitStatus::Accepted) {
-            if (relative.pts.ticks > last_input) last_input = relative.pts.ticks;
+          if (Require(encoder->TrySubmit(relative)) == SubmitStatus::Accepted) {
+            if (resumed) {
+              timeline_origin = frame.pts.ticks - relative.pts.ticks;
+              input_generation = input->generation;
+            }
+            last_input = relative.pts.ticks;
             input.reset();
             progress = true;
           }
@@ -305,8 +334,10 @@ private:
   std::condition_variable work_;
   std::optional<RecordingFrame> pending_;
   std::optional<CameraError> failure_;
+  std::uint64_t generation_ = 0;
   bool ready_ = false;
   bool stopping_ = false;
+  bool paused_ = false;
   std::atomic<std::int64_t> duration_ticks_ = 0;
   std::atomic<bool> finished_ = false;
   std::thread worker_;
@@ -338,6 +369,7 @@ Task<CameraResult<void>> RecordVideoTask(std::shared_ptr<CameraSessionData> owne
                     if (owner->frames) owner->frames->SetRecording({});
                     CameraStatus value = owner->status;
                     value.recording_video = false;
+                    value.recording_paused = false;
                     owner->status = std::move(value);
                   }
                 });
@@ -351,6 +383,7 @@ Task<CameraResult<void>> RecordVideoTask(std::shared_ptr<CameraSessionData> owne
           owner->frames->SetRecording(recording);
           CameraStatus value = owner->status;
           value.recording_video = true;
+          value.recording_paused = false;
           owner->status = std::move(value);
           return cancel;
         } catch (const std::exception& error) {
@@ -419,9 +452,25 @@ std::chrono::microseconds CameraSessionData::RecordedDuration() const noexcept {
   return completed_recording_duration;
 }
 
+void CameraSessionData::SetRecordingPaused(bool paused) {
+#if defined(HUXERUI_CAMERA_RECORDING)
+  if (closed || !recording || !recording->SetPaused(paused)) return;
+  CameraStatus value = status;
+  value.recording_paused = paused;
+  status = std::move(value);
+#else
+  (void)paused;
+#endif
+}
+
 void CameraSessionData::StopRecording() {
 #if defined(HUXERUI_CAMERA_RECORDING)
   if (recording) recording->Stop();
+  if (status->recording_paused) {
+    CameraStatus value = status;
+    value.recording_paused = false;
+    status = std::move(value);
+  }
 #endif
 }
 
@@ -454,6 +503,10 @@ Task<CameraResult<void>> CameraSession::RecordVideoAsync(OutputStream destinatio
 }
 
 std::chrono::microseconds CameraSession::RecordedDuration() const noexcept { return data_->RecordedDuration(); }
+
+void CameraSession::PauseRecording() const { data_->SetRecordingPaused(true); }
+
+void CameraSession::ResumeRecording() const { data_->SetRecordingPaused(false); }
 
 void CameraSession::StopRecording() const { data_->StopRecording(); }
 

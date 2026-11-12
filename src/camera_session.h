@@ -38,6 +38,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app);
   void InterruptPhoto();
   std::chrono::microseconds RecordedDuration() const noexcept;
+  void SetRecordingPaused(bool paused);
   void StopRecording();
   void BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request);
   void Publish(SessionState state);

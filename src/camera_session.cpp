@@ -171,6 +171,7 @@ void CameraSessionData::Reconcile() {
             }
             value.capturing_photo = static_cast<bool>(owner->photo);
             value.recording_video = static_cast<bool>(owner->recording);
+            value.recording_paused = value.recording_video && owner->status->recording_paused;
             owner->status = std::move(value);
           }
         });
