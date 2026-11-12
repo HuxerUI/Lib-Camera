@@ -6,8 +6,10 @@
 #include <huxerui/android/platform_registry.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 
 #define CAMERA_DISCARD(expression) static_cast<void>(expression)
@@ -19,10 +21,15 @@ namespace {
 const Color background = Color::Rgb(15, 18, 22);
 const Color surface = Color::Rgb(24, 28, 33);
 const Color control_background = Color::Rgb(34, 40, 47);
+const Color overlay_background = Color::Rgb(15, 18, 22, 0.88F);
 const Color outline = Color::Rgb(48, 55, 63);
 const Color foreground = Color::Rgb(242, 245, 247);
 const Color secondary = Color::Rgb(155, 166, 178);
 const Color accent = Color::Rgb(111, 226, 190);
+const Color record_red = Color::Rgb(255, 78, 89);
+
+enum class CaptureMode { Photo, Video };
+enum class VideoPhase { Idle, Recording, Finishing };
 
 Text Label(StringVariant text, float size = 13.0F, Color color = secondary,
            FontWeight weight = FontWeight::Regular) {
@@ -59,23 +66,101 @@ const char* StateName(camera::SessionState state) {
   }
 }
 
-const char* FacingName(std::optional<camera::Facing> facing) {
-  if (!facing) return "Default camera";
-  return *facing == camera::Facing::Front ? "Front camera" : "Rear camera";
-}
-
-View StatusBadge(camera::SessionState state) {
-  const Color color = state == camera::SessionState::Running ? accent : secondary;
+View StatusBadge(StringVariant text, Color color) {
   return Row {
     Stack {}.With(Frame{.width = 6.0F, .height = 6.0F}, Background(color), CornerRadius(3.0F)),
-    Label(StateName(state), 11.0F, color, FontWeight::SemiBold),
+    Label(text, 11.0F, color, FontWeight::SemiBold),
   }.With(
       Padding(EdgeInsets::Symmetric(12.0F, 8.0F)),
       Spacing(7.0F),
       CrossAlign(CrossAxisAlignment::Center),
-      Background(Color::Rgb(15, 18, 22, 0.88F)),
+      Background(overlay_background),
       Border(outline, 1.0F),
       CornerRadius(20.0F)
+  );
+}
+
+[[huxerui::composable]]
+View RecordingBadge(camera::CameraSession session, bool recording) {
+  using namespace std::chrono_literals;
+  auto elapsed = UseState(0s);
+  auto tasks = UseTaskScope();
+  Lifecycle([session, elapsed, tasks] {
+    tasks.Launch([session, elapsed]() -> Task<void> {
+      for (;;) {
+        elapsed = std::chrono::duration_cast<std::chrono::seconds>(session.RecordedDuration());
+        co_await Delay(250ms);
+      }
+    });
+  });
+
+  const auto seconds = elapsed.Get().count();
+  char time[32];
+  std::snprintf(time, sizeof(time), "%02lld:%02lld",
+                static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60));
+  return StatusBadge(std::string(recording ? "REC " : "FINALIZING ") + time, recording ? record_red : secondary);
+}
+
+[[huxerui::composable]]
+View CaptureModePicker(State<CaptureMode> mode, bool enabled) {
+  static constexpr float tab_width = 88.0F;
+  auto drag = UseState(std::optional<float>{});
+  const CaptureMode selected = mode;
+  const bool video = selected == CaptureMode::Video;
+  const float centered = video ? -tab_width / 2.0F : tab_width / 2.0F;
+  const auto displacement = drag.Get();
+  auto select = [mode, drag](CaptureMode value) {
+    mode = value;
+    drag = std::nullopt;
+  };
+  auto tab = [selected, select](CaptureMode value, const char* title) {
+    const bool current = selected == value;
+    return Stack {
+      Label(title, 13.0F, current ? accent : secondary, FontWeight::SemiBold),
+    }.With(
+        Frame{.width = tab_width, .height = 44.0F},
+        Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+        Focusable(),
+        PointerCursor(PointerCursorKind::Hand),
+        Semantics{.role = SemanticRole::Tab, .label = title, .selected = current,
+                  .descendants = SemanticDescendantPolicy::Exclude}
+    ).OnClick([select, value] { select(value); });
+  };
+  return Stack {
+    Row {
+      tab(CaptureMode::Photo, "PHOTO"),
+      tab(CaptureMode::Video, "VIDEO"),
+    }.With(displacement ? Offset(Point{centered + *displacement, 0.0F})
+        : Offset(AnimateTo(Point{centered, 0.0F}, TweenSpec{0.18, Easing::EaseOut}))),
+  }.With(
+      Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+      Semantics{.role = SemanticRole::TabList, .label = "Capture mode"},
+      Enabled(enabled),
+      DragGesture{.axis = Axis::Horizontal}
+  ).On<DragEvents::Changed>([drag, video](const DragEvent& event) {
+    drag = video ? std::clamp(event.translation.x, 0.0F, tab_width)
+                 : std::clamp(event.translation.x, -tab_width, 0.0F);
+  }).On<DragEvents::Ended>([selected, video, select](const DragEvent& event) {
+    const float travel = video ? event.translation.x : -event.translation.x;
+    select(travel >= tab_width * 0.4F ? (video ? CaptureMode::Photo : CaptureMode::Video) : selected);
+  }).On<DragEvents::Canceled>([drag](const DragEvent&) { drag = std::nullopt; });
+}
+
+View ShutterButton(const char* label, bool video, bool recording, bool enabled) {
+  const float size = recording ? 28.0F : 52.0F;
+  View mark = Stack {}.With(Frame{.width = size, .height = size}, Background(video ? record_red : foreground),
+                            CornerRadius(recording ? 6.0F : size / 2.0F));
+  return Stack {
+    mark,
+  }.With(
+      Frame{.width = 68.0F, .height = 68.0F},
+      Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+      Border(foreground, 3.0F),
+      CornerRadius(34.0F),
+      Focusable(),
+      PointerCursor(PointerCursorKind::Hand),
+      Semantics{.role = SemanticRole::Button, .label = label},
+      Enabled(enabled)
   );
 }
 
@@ -131,15 +216,14 @@ View CompositionGrid() {
 
 View EmptyPreview(const camera::CameraStatus& status, bool authorizing, const std::string& permission_error) {
   const bool pending = authorizing || status.state == camera::SessionState::Starting
-      || status.state == camera::SessionState::Stopping;
-  std::string title = "Your view starts here";
-  std::string message = "Start the camera to open a live preview.";
+      || status.state == camera::SessionState::Running || status.state == camera::SessionState::Stopping;
+  std::string title = "Camera stopped";
+  std::string message;
   if (pending) {
     title = authorizing ? "Camera access" : "Connecting to camera";
-    message = authorizing ? "Allow camera access to continue." : "Your preview will appear shortly.";
+    if (authorizing) message = "Allow camera access to continue.";
     if (status.state == camera::SessionState::Stopping) {
       title = "Stopping camera";
-      message = "Finishing the current session.";
     }
   } else if (!permission_error.empty()) {
     title = "Camera access needed";
@@ -155,9 +239,10 @@ View EmptyPreview(const camera::CameraStatus& status, bool authorizing, const st
     pending ? View(ProgressCircle().With(Frame{.width = 32.0F, .height = 32.0F}))
         : View(Image(app::images::camera).Tint(secondary).With(Frame{.width = 36.0F, .height = 36.0F})),
     Label(title, 20.0F, foreground, FontWeight::SemiBold).Align(TextAlign::Center),
-    Label(message, 13.0F).Align(TextAlign::Center).With(Frame{.max_width = 300.0F}),
+    message.empty() ? View() : View(Label(message, 13.0F).Align(TextAlign::Center).With(Frame{.max_width = 300.0F})),
   }.With(
       Padding(24.0F),
+      SafeAreaPadding{.bottom = false},
       Spacing(16.0F),
       MainAlign(MainAxisAlignment::Center),
       CrossAlign(CrossAxisAlignment::Center),
@@ -284,6 +369,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
 [[huxerui::composable]]
 View CameraWorkspace() {
   auto active = UseState(false);
+  auto mode = UseState(CaptureMode::Photo);
   auto facing = UseState(std::optional<camera::Facing>{});
   auto fit = UseState(ImageFit::Cover);
   auto mirror = UseState(camera::MirrorMode::Auto);
@@ -294,6 +380,7 @@ View CameraWorkspace() {
   auto photo = UseState(ImageAsset{});
   auto photo_error = UseState(std::string{});
   auto saving_photo = UseState(false);
+  auto video_phase = UseState(VideoPhase::Idle);
   auto video_file = UseState(std::optional<File>{});
   auto saving_video = UseState(false);
   auto video_message = UseState(std::string{});
@@ -304,10 +391,12 @@ View CameraWorkspace() {
   auto session = camera::UseCamera({.facing = facing, .active = active});
   const auto status = session.Status();
   const ImageFit selected_fit = fit;
-  const bool expanded = UseViewportClass() == ViewportClass::Expanded;
   const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
+  const bool video = mode == CaptureMode::Video;
+  const bool video_busy = video_phase != VideoPhase::Idle;
+  const bool recording = status.recording_video && video_phase == VideoPhase::Recording;
 
   auto show_settings = [sheets, facing, fit, mirror, grid, comparison] {
     sheets.Show([facing, fit, mirror, grid, comparison](BottomSheetContext sheet) {
@@ -322,11 +411,8 @@ View CameraWorkspace() {
     });
   };
 
-  auto toggle_camera = [active, authorizing, permission_error, application, tasks, session, failed] {
-    if (active && !failed) {
-      active = false;
-      return;
-    }
+  auto start_camera = [active, authorizing, permission_error, application, tasks, session] {
+    if (authorizing) return;
     authorizing = true;
     permission_error = std::string{};
     tasks.Launch([active, authorizing, permission_error, application, session]() -> Task<void> {
@@ -349,6 +435,7 @@ View CameraWorkspace() {
       authorizing = false;
     });
   };
+  Lifecycle(start_camera);
 
   auto take_photo = [session, tasks, photo, photo_error] {
     if (session.Status().capturing_photo) return;
@@ -371,14 +458,18 @@ View CameraWorkspace() {
     });
   };
 
-  auto toggle_recording = [session, tasks, application, video_file, saving_video, video_message] {
-    if (session.Status().recording_video) {
-      session.StopRecording();
+  auto toggle_recording = [session, tasks, application, video_phase, video_file, saving_video, video_message] {
+    if (video_phase != VideoPhase::Idle) {
+      if (video_phase == VideoPhase::Recording && session.Status().recording_video) {
+        video_phase = VideoPhase::Finishing;
+        session.StopRecording();
+      }
       return;
     }
     if (saving_video) return;
+    video_phase = VideoPhase::Recording;
     video_message = std::string{};
-    tasks.Launch([session, application, video_file, video_message]() -> Task<void> {
+    tasks.Launch([session, application, video_phase, video_file, video_message]() -> Task<void> {
       try {
         static std::atomic_uint64_t sequence{0};
         const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
@@ -394,11 +485,12 @@ View CameraWorkspace() {
       } catch (const std::exception& error) {
         video_message = std::string(error.what());
       }
+      video_phase = VideoPhase::Idle;
     });
   };
-  auto save_video = [session, tasks, picker, video_file, saving_video, video_message] {
+  auto save_video = [tasks, picker, video_phase, video_file, saving_video, video_message] {
     const auto source = video_file.Get();
-    if (!source || saving_video || session.Status().recording_video || !picker->CanSaveFiles()) return;
+    if (!source || saving_video || video_phase != VideoPhase::Idle || !picker->CanSaveFiles()) return;
     saving_video = true;
     tasks.Launch([picker, source = *source, video_file, saving_video, video_message]() -> Task<void> {
       bool saved = false;
@@ -417,17 +509,34 @@ View CameraWorkspace() {
     });
   };
 
+  const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
+  View badge = recording || video_phase == VideoPhase::Finishing
+      ? RecordingBadge(session, recording && live)
+      : StatusBadge(StateName(status.state), status_color);
+
   View viewfinder = Stack {
     camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
     live ? View() : EmptyPreview(status, authorizing, permission_error),
     live && grid ? CompositionGrid() : View(),
     Column {
       Row {
-        StatusBadge(status.state),
+        badge,
         Spacer(),
-        Label("PREVIEW", 10.0F, foreground, FontWeight::SemiBold)
-            .With(Padding(8.0F), Background(Color::Rgb(15, 18, 22, 0.88F)), CornerRadius(8.0F)),
-      }.With(CrossAlign(CrossAxisAlignment::Center)),
+        live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
+            .With(Background(overlay_background), CornerRadius(14.0F))) : View(),
+        IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
+            .With(Background(overlay_background), CornerRadius(14.0F)),
+      }.With(
+          Padding(12.0F),
+          SafeAreaPadding{.bottom = false},
+          Spacing(8.0F),
+          CrossAlign(CrossAxisAlignment::Center),
+          Background(LinearGradient{
+              .start = {0.0F, 0.0F},
+              .end = {0.0F, 1.0F},
+              .stops = {{0.0F, Color::Rgb(0, 0, 0, 0.65F)}, {1.0F, Color::Rgb(0, 0, 0, 0.0F)}},
+          })
+      ),
       Spacer(),
       live && comparison ? View(Row {
         Spacer(),
@@ -436,83 +545,61 @@ View CameraWorkspace() {
               .With(Frame{.width = 144.0F, .height = 96.0F}, Background(Color::Black()), ClipChildren()),
           Label("FULL FRAME / MIRROR OFF", 9.0F, foreground, FontWeight::Medium).With(Padding(8.0F)),
         }.With(Background(background), Border(outline, 1.0F), CornerRadius(12.0F), ClipChildren()),
-      }) : View(),
-    }.With(Padding(16.0F)),
+      }.With(Padding(16.0F), SafeAreaPadding{.top = false, .bottom = false})) : View(),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch)),
   }.With(
       Grow(),
       Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch),
       Background(Color::Black()),
-      Border(outline, 1.0F),
-      CornerRadius(20.0F),
       ClipChildren()
   );
 
+  const char* photo_action = status.capturing_photo ? "Taking photo" : "Take photo";
+  const char* video_action = recording ? "Stop recording" : video_busy ? "Processing video" : "Record video";
+  const bool shutter_enabled = video ? recording || (!video_busy && !saving_video) : !status.capturing_photo;
+  View primary = live || video_busy
+      ? ShutterButton(video ? video_action : photo_action, video, video_busy, shutter_enabled)
+          .OnClick([video, take_photo, toggle_recording] {
+            if (video) toggle_recording();
+            else take_photo();
+          })
+      : Button(authorizing ? "Requesting access" : stopping ? "Stopping camera"
+                           : failed || !permission_error->empty() ? "Try again"
+                           : active ? "Stop camera" : "Start camera")
+          .OnClick([active, failed, start_camera] {
+            if (active && !failed) active = false;
+            else start_camera();
+          }).With(Enabled(!authorizing && !stopping));
+
   View controls = Column {
-    Row {
-      Column {
-        Label(FacingName(status.actual_facing ? status.actual_facing : facing.Get()),
-              14.0F, foreground, FontWeight::Medium),
-        Label(selected_fit == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
-      }.With(Spacing(4.0F)),
-      Spacer(),
-      IconButton(app::images::photo, "View last photo").OnClick(show_photo)
-          .With(Enabled(photo->HasValue()), Background(control_background), CornerRadius(14.0F)),
-    }.With(CrossAlign(CrossAxisAlignment::Center)),
-    Row {
-      IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
-        const auto current = status.actual_facing ? status.actual_facing : facing.Get();
-        facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
-      }).With(Enabled(!authorizing && !stopping), Background(control_background), CornerRadius(14.0F)),
-      Button(authorizing ? "Requesting access" : stopping ? "Stopping camera"
-          : status.capturing_photo ? "Taking photo" : live ? "Take photo"
-          : failed || !permission_error->empty() ? "Try again"
-          : active ? "Stop camera" : "Start camera")
-          .OnClick([live, take_photo, toggle_camera] { if (live) take_photo(); else toggle_camera(); })
-          .With(Grow(), Enabled(!authorizing && !stopping && !status.capturing_photo)),
-      live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
-          .With(Background(control_background), CornerRadius(14.0F))) : View(),
-      expanded ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
-          .With(Background(control_background), CornerRadius(14.0F))),
-    }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
-    live || status.recording_video ? View(Button(status.recording_video ? "Stop recording" : "Record video")
-        .OnClick(toggle_recording).With(Enabled(!saving_video))) : View(),
     video_file->has_value() && picker->CanSaveFiles() ? View(Button(saving_video ? "Saving video" : "Save video")
-        .OnClick(save_video).With(Enabled(!saving_video && !status.recording_video))) : View(),
+        .OnClick(save_video).With(Enabled(!saving_video && !video_busy))) : View(),
     video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
     photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
-  }.With(Spacing(18.0F), Padding(EdgeInsets::Symmetric(4.0F, 8.0F)), CrossAlign(CrossAxisAlignment::Stretch));
-
-  View preview = Column {
-    viewfinder,
-    controls,
-  }.With(Grow(), Spacing(16.0F), CrossAlign(CrossAxisAlignment::Stretch));
-
-  View workspace = preview;
-  if (expanded) {
-    workspace = Row {
-      preview,
-      Column {
-        Label("Preview settings", 18.0F, foreground, FontWeight::SemiBold),
-        Label("Make the frame your own.", 13.0F),
-        Divider(),
-        ScrollView(CameraSettings(facing, fit, mirror, grid, comparison)).With(Grow()),
-      }.With(
-          Frame{.width = 300.0F},
-          Padding(22.0F),
-          Spacing(18.0F),
-          CrossAlign(CrossAxisAlignment::Stretch),
-          Background(surface),
-          Border(outline, 1.0F),
-          CornerRadius(20.0F)
-      ),
-    }.With(Spacing(24.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  }
+    CaptureModePicker(mode, !video_busy && !status.capturing_photo),
+    Stack {
+      Row {
+        IconButton(app::images::photo, "View last photo").OnClick(show_photo)
+            .With(Enabled(photo->HasValue()), Background(control_background), CornerRadius(14.0F)),
+        Spacer(),
+        primary,
+        Spacer(),
+        IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
+          const auto current = status.actual_facing ? status.actual_facing : facing.Get();
+          facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
+        }).With(Enabled(!authorizing && !stopping), Background(control_background), CornerRadius(14.0F)),
+      }.With(Frame{.width = 288.0F}, CrossAlign(CrossAxisAlignment::Center)),
+    }.With(Frame{.height = 68.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center)),
+  }.With(
+      Spacing(8.0F),
+      Padding(EdgeInsets::Symmetric(16.0F, 8.0F)),
+      SafeAreaPadding{.top = false},
+      CrossAlign(CrossAxisAlignment::Stretch)
+  );
 
   return Column {
-    TopAppBar("Camera", Image(app::images::camera).Tint(accent).With(Frame{.width = 24.0F, .height = 24.0F}), {
-      Label("HUXERUI", 11.0F, secondary, FontWeight::SemiBold),
-    }),
-    View(workspace).With(Grow(), Padding(EdgeInsets{.top = 0.0F, .right = 16.0F, .bottom = 16.0F, .left = 16.0F})),
+    viewfinder,
+    controls,
   }.With(
       CrossAlign(CrossAxisAlignment::Stretch),
       Background(background),
@@ -553,15 +640,6 @@ View StyledWorkspace() {
   segmented.corner_radii = CornerRadii{10.0F};
   theme.Set(segmented);
 
-  theme.Set(TopAppBarStyle{
-      .background = background,
-      .title_style = {Font::System(20.0F).WithWeight(FontWeight::SemiBold), foreground},
-      .height = 68.0F,
-      .horizontal_padding = 16.0F,
-      .title_inset = 0.0F,
-      .title_spacing = 12.0F,
-      .action_spacing = 8.0F,
-  });
   return Theme(theme, CameraWorkspace());
 }
 
@@ -578,6 +656,7 @@ const Application application{
             .title = "Camera Preview",
             .initial_size = {1180.0F, 820.0F},
             .minimum_size = Size{360.0F, 480.0F},
+            .content_mode = WindowContentMode::EdgeToEdge,
         },
         .show_debug_overlay = false,
         .application_hooks = {

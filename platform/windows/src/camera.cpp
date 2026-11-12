@@ -210,9 +210,12 @@ public:
       if (pipeline_) {
         LONGLONG time = 0;
         Require(sample->GetSampleTime(&time));
-        auto processed = pipeline_->Process({.texture = texture, .rotation = rotation_},
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>(time)));
+        const auto capture_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>(time));
+        auto processed = pipeline_->Process(processor_, {.texture = texture, .rotation = rotation_},
+            capture_time, width_, height_);
         if (!processed.Succeeded()) {
+          finished_ = true;
           events->Fail(E_FAIL, processed.Error());
         } else if (processed.Value() != preview_) {
           preview_ = std::move(processed).Value();
@@ -237,6 +240,7 @@ public:
     // Publication and Finish share this lock, including the source device's immediate context.
     std::lock_guard lock(mutex_);
     finished_ = true;
+    processor_ = {};
     if (texture)
       texture->Finish();
     preview_.reset();
@@ -273,6 +277,7 @@ private:
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<ID3D11Texture2D> upload_;
+  FrameProcessor processor_;
 };
 
 std::optional<Facing> DeviceFacing(IMFActivate* device) {
@@ -382,7 +387,11 @@ public:
       running_ = true;
       frames_->StartPublishing();
     } catch (HRESULT result) {
-      changed_({.state = SessionState::Failed, .error = Error(result, CameraErrorCode::ConfigurationFailed)});
+      auto error = Error(result, CameraErrorCode::ConfigurationFailed);
+      if (events_)
+        events_->Fail(result, std::move(error));
+      else
+        changed_({.state = SessionState::Failed, .error = std::move(error)});
     } catch (const std::exception& error) {
       changed_({.state = SessionState::Failed, .error = CameraError{CameraErrorCode::ConfigurationFailed, error.what()}});
     }

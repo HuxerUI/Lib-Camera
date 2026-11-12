@@ -98,7 +98,8 @@ void CameraSessionData::Reconcile() {
   if (closed || !backend || status->state == SessionState::Stopping) {
     return;
   }
-  const bool configuration_changed = desired.facing != opened_facing || desired.frame_processor != opened_processor;
+  const bool configuration_changed = desired.facing != opened_facing ||
+      desired.frame_processor_factory != opened_processor_factory;
   if (!desired.active || background || failure ||
       ((engaged || status->state == SessionState::Starting) && configuration_changed)) {
     const auto stopping_generation = ++generation;
@@ -129,7 +130,7 @@ void CameraSessionData::Reconcile() {
     return;
   }
   opened_facing = desired.facing;
-  opened_processor = desired.frame_processor;
+  opened_processor_factory = desired.frame_processor_factory;
   Publish(SessionState::Starting);
   const auto opening_generation = ++generation;
   const auto weak = weak_from_this();
@@ -151,7 +152,7 @@ void CameraSessionData::Reconcile() {
         self->Settle();
         co_return;
       }
-      self->frames = std::make_shared<FramePipeline>(self->opened_processor);
+      self->frames = std::make_shared<FramePipeline>(self->opened_processor_factory);
       self->backend->SetFramePipeline(self->frames);
       self->engaged = true;
       self->backend->Start(self->opened_facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
@@ -186,7 +187,7 @@ void CameraSessionData::Reconcile() {
 void CameraSessionData::Settle() {
   if (backend) backend->SetFramePipeline({});
   frames.reset();
-  opened_processor.reset();
+  opened_processor_factory.reset();
   Publish(failure ? SessionState::Failed
                   : (desired.active && background ? SessionState::Suspended : SessionState::Stopped));
 }
@@ -206,8 +207,8 @@ void CameraSessionData::Close() {
     backend.reset();
   }
   frames.reset();
-  opened_processor.reset();
-  desired.frame_processor.reset();
+  opened_processor_factory.reset();
+  desired.frame_processor_factory.reset();
 }
 
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options) {

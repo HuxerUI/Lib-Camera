@@ -153,20 +153,24 @@ Your application owns temporary-file cleanup. Keep the file available until writ
 
 ## Process and Record Video
 
-Pass a retained `FrameProcessor` to `CameraOptions::frame_processor`. The callback receives the source texture and geometry together with its capture timestamp on a serial platform frame queue. Return the published output texture and its geometry. Preview and recording use the same result. Keep the output texture identity stable across frames with the same geometry so frame updates only redraw the texture. Update thread-safe parameters in the retained processor to change the effect while recording. Replacing the processor reopens capture.
+Pass a retained `FrameProcessorFactory` to `CameraOptions::frame_processor_factory`. Each frame producer calls the factory with the source texture's pixel width and height on its first usable frame. It retains the returned processor until the producer retires or the input dimensions change. The processor receives the published source texture, its geometry, and the capture timestamp. Return a published texture and its matching geometry. Preview and recording use the same result. Reuse the output texture identity across frames with stable geometry so frame updates only redraw the texture. Keep the factory identity stable during capture and update synchronized effect parameters to change an effect while recording.
 
 ```cpp
-static const auto processor = std::make_shared<const camera::FrameProcessor>(
-    [](const camera::PreviewOutput& input, std::chrono::nanoseconds) {
-      auto output = input;
-      output.crop = {0.125F, 0.125F, 0.75F, 0.75F};
-      return camera::CameraResult<camera::PreviewOutput>::Success(std::move(output));
+static const auto factory = std::make_shared<const camera::FrameProcessorFactory>(
+    [](std::uint32_t, std::uint32_t) -> camera::FrameProcessor {
+      return [](const camera::PreviewOutput& input, std::chrono::nanoseconds) {
+        auto output = input;
+        output.crop = {0.125F, 0.125F, 0.75F, 0.75F};
+        return camera::CameraResult<camera::PreviewOutput>::Success(std::move(output));
+      };
     });
 
-auto session = camera::UseCamera({.active = active, .frame_processor = processor});
+auto session = camera::UseCamera({.active = active, .frame_processor_factory = factory});
 ```
 
 Run `session.RecordVideoAsync(destination)` in a task and call `session.StopRecording()` from the stop action. The task returns after the encoder drains and the muxer closes the output. `CameraStatus::recording_video` covers both capture and finalization. Stopping capture, switching cameras, or backgrounding finalizes a recording with captured frames. The file contains one H.264 video track. The recording uses the initial frame's dimensions and stores its crop and rotation as MP4 presentation metadata. Preview fitting and mirroring remain per-view settings.
+
+Poll `session.RecordedDuration()` on the UI thread for the current recording duration in microseconds. It advances as the MP4 muxer accepts video samples, including frames that drain during finalization. After success, the final duration remains available until the next recording starts or the session closes.
 
 | Destination | Output |
 | --- | --- |
@@ -193,7 +197,7 @@ huxerui run android --profile debug
 
 Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
 
-Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The photo icon opens the latest photo and its **Save photo** action. Use **Record video** and **Stop recording** to prepare a silent MP4. Select **Save video** to export the latest recording to a location you choose in the system file picker. You can retry if you dismiss the picker. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
+The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter to start recording. The recording badge shows the recorded video duration in whole seconds. Press the shutter again to finalize the silent MP4, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 

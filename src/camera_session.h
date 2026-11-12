@@ -23,9 +23,10 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   std::shared_ptr<CameraBackend> backend;
   CameraOptions desired;
   std::optional<Facing> opened_facing;
-  std::shared_ptr<const FrameProcessor> opened_processor;
+  std::shared_ptr<const FrameProcessorFactory> opened_processor_factory;
   std::shared_ptr<FramePipeline> frames;
   std::shared_ptr<VideoRecording> recording;
+  std::chrono::microseconds completed_recording_duration{};
   std::optional<CameraError> failure;
   TaskHandle permission_check;
   std::uint64_t generation = 0;
@@ -36,6 +37,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
 
   CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app);
   void InterruptPhoto();
+  std::chrono::microseconds RecordedDuration() const noexcept;
   void StopRecording();
   void BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request);
   void Publish(SessionState state);

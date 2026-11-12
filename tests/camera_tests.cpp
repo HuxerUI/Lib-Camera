@@ -92,6 +92,62 @@ void TestGeometry() {
   Check(!camera::detail::PlacePreview(source, output, {}, {}, source), "Non-finite geometry must not draw.");
 }
 
+void TestFrameProcessorFactory() {
+  struct TestTexture final : ExternalTexture {
+    TestTexture() : ExternalTexture({64.0F, 64.0F}) {}
+  };
+  const PreviewOutput input{.texture = std::make_shared<TestTexture>(), .rotation = PreviewRotation::R270};
+  const auto timestamp = std::chrono::seconds(1);
+  constexpr std::uint32_t width = 720;
+  constexpr std::uint32_t height = 1280;
+  std::array expected_dimensions{width, height};
+  int factory_calls = 0;
+  std::weak_ptr<int> last_instance;
+  camera::detail::FramePipeline pipeline(std::make_shared<const FrameProcessorFactory>(
+      [&](std::uint32_t pixel_width, std::uint32_t pixel_height) -> FrameProcessor {
+        Check(pixel_width == expected_dimensions[0] && pixel_height == expected_dimensions[1],
+              "The factory must receive the source texture's pixel dimensions.");
+        ++factory_calls;
+        auto count = std::make_shared<int>(0);
+        last_instance = count;
+        return [count = std::move(count)](const PreviewOutput& source, std::chrono::nanoseconds) {
+          auto output = source;
+          output.rotation = ++*count == 1 ? PreviewRotation::R90 : PreviewRotation::R180;
+          return CameraResult<PreviewOutput>::Success(std::move(output));
+        };
+      }));
+  FrameProcessor first;
+  Check(factory_calls == 0, "The factory must wait for a source frame.");
+  auto output = pipeline.Process(first, input, timestamp, width, height);
+  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 1,
+        "The first frame must create and use the processor.");
+  const auto first_instance = last_instance;
+  output = pipeline.Process(first, input, timestamp, width, height);
+  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R180 && factory_calls == 1,
+        "Successive frames must retain the producer's processor state.");
+  FrameProcessor next;
+  expected_dimensions = {height, width};
+  output = pipeline.Process(next, input, timestamp, height, width);
+  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 2,
+        "A new producer must get independent processor state.");
+  first = {};
+  Check(first_instance.expired() && !last_instance.expired(), "Retiring one producer must release its processor.");
+
+  camera::detail::FramePipeline empty(
+      std::make_shared<const FrameProcessorFactory>([](std::uint32_t, std::uint32_t) { return FrameProcessor{}; }));
+  FrameProcessor invalid;
+  const auto missing = empty.Process(invalid, input, timestamp, width, height);
+  Check(!missing.Succeeded() && missing.Error().code == CameraErrorCode::CaptureFailed,
+        "An empty processor returned by the factory must fail capture.");
+  camera::detail::FramePipeline throwing(std::make_shared<const FrameProcessorFactory>(
+      [](std::uint32_t, std::uint32_t) -> FrameProcessor {
+        throw std::runtime_error("Injected factory failure.");
+      }));
+  const auto failed = throwing.Process(invalid, input, timestamp, width, height);
+  Check(!failed.Succeeded() && failed.Error().message == "Injected factory failure.",
+        "The factory failure must reach the capture error.");
+}
+
 class TestPlatform final : public UiWindow, public huxerui::Runtime {
 public:
   TestPlatform()
@@ -477,8 +533,8 @@ std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t gre
 }
 
 template <class Destination>
-void TestRecordedFrame(PhotoTestFixture& fixture, const File& file, Destination destination, media::ContainerLayout layout,
-                       bool unmount = false) {
+void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, const File& file, Destination destination,
+                       media::ContainerLayout layout, bool unmount = false) {
   using namespace huxerui::media;
   std::optional<CameraResult<void>> result;
   const auto owner = fixture.context.owner;
@@ -488,9 +544,11 @@ void TestRecordedFrame(PhotoTestFixture& fixture, const File& file, Destination 
       });
   fixture.Drain();
   Check(owner->status->recording_video, "Recording did not start.");
+  Check(owner->RecordedDuration().count() == 0, "A new recording must start at zero duration.");
 
   const auto input = SolidTexture(255, 0);
-  const auto preview = TakeRecordingResult(owner->frames->Process({.texture = input}, std::chrono::seconds(17)));
+  const auto preview = TakeRecordingResult(
+      owner->frames->Process(processor, {.texture = input}, std::chrono::seconds(17), 64, 64));
   Check(preview.texture != input && preview.rotation == PreviewRotation::R90, "Preview bypassed the frame processor.");
   if (unmount) {
     fixture.context.visible = false;
@@ -516,6 +574,13 @@ void TestRecordedFrame(PhotoTestFixture& fixture, const File& file, Destination 
   Check(item && std::holds_alternative<ContainerPacket>(*item), "Recording has no frame.");
   const auto& packet = std::get<ContainerPacket>(*item);
   Check(packet.pts && packet.pts->ticks == 0, "Recording did not start at a relative timestamp of zero.");
+  const auto duration = owner->RecordedDuration();
+  if (unmount) {
+    Check(duration.count() == 0, "A closed session must report zero recorded duration.");
+  } else {
+    Check(packet.duration && MediaTimestamp{duration.count(), 1'000'000} == *packet.duration,
+          "The final recorded duration must match the MP4 sample duration.");
+  }
   fixture.platform.Await(fixture.runtime, [&] {
     return TakeRecordingResult(decoder.TrySubmit({packet.data, *packet.pts, packet.dts, packet.duration,
                                                  packet.sync_sample.value_or(false)})) == SubmitStatus::Accepted;
@@ -540,21 +605,28 @@ void TestRecording() {
     ~Directory() { std::error_code error; std::filesystem::remove_all(path, error); }
   } directory;
   Check(std::filesystem::create_directory(directory.path), "Cannot create the recording test directory.");
+  int factory_calls = 0;
   PhotoTestFixture fixture;
-  auto processor = std::make_shared<const FrameProcessor>([green = SolidTexture(0, 255)](const PreviewOutput&,
-      std::chrono::nanoseconds timestamp) {
-    Check(timestamp == std::chrono::seconds(17), "The frame processor received the wrong capture timestamp.");
-    return CameraResult<PreviewOutput>::Success({.texture = green, .rotation = PreviewRotation::R90});
+  auto factory = std::make_shared<const FrameProcessorFactory>([&](std::uint32_t width, std::uint32_t height) -> FrameProcessor {
+    Check(width == 64 && height == 64, "The recording factory must receive the source frame size.");
+    ++factory_calls;
+    return [green = SolidTexture(0, 255)](const PreviewOutput&, std::chrono::nanoseconds timestamp) {
+      Check(timestamp == std::chrono::seconds(17), "The frame processor received the wrong capture timestamp.");
+      return CameraResult<PreviewOutput>::Success({.texture = green, .rotation = PreviewRotation::R90});
+    };
   });
-  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(std::move(processor));
+  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(std::move(factory));
+  FrameProcessor processor;
   const File file((directory.path / "file.mp4").u8string());
   const File seekable((directory.path / "seekable.mp4").u8string());
   const File sequential((directory.path / "sequential.mp4").u8string());
-  TestRecordedFrame(fixture, file, file, media::ContainerLayout::Default);
-  TestRecordedFrame(fixture, seekable,
+  TestRecordedFrame(fixture, processor, file, file, media::ContainerLayout::Default);
+  TestRecordedFrame(fixture, processor, seekable,
       TakeRecordingResult(seekable.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew)),
       media::ContainerLayout::Default);
-  TestRecordedFrame(fixture, sequential, TakeRecordingResult(sequential.OpenWrite()), media::ContainerLayout::Fragmented, true);
+  TestRecordedFrame(fixture, processor, sequential, TakeRecordingResult(sequential.OpenWrite()),
+                    media::ContainerLayout::Fragmented, true);
+  Check(factory_calls == 1, "Recording starts and stops must share the producer's processor.");
 }
 #endif
 
@@ -563,12 +635,13 @@ void TestRecording() {
 int main() {
   try {
     TestGeometry();
+    TestFrameProcessorFactory();
     TestSessionLifetime();
     TestPhotoRequests();
 #if defined(HUXERUI_CAMERA_TEST_RECORDING)
     TestRecording();
 #endif
-    std::cout << "Camera geometry, session lifetime, and photo request tests passed.\n";
+    std::cout << "Camera tests passed.\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

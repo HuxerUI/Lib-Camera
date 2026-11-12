@@ -100,14 +100,6 @@ template <class Stream> OpenMuxer MakeOutput(Stream destination) {
   };
 }
 
-void WritePacket(MediaMuxer& muxer, const EncodedPacket& packet, std::int64_t duration) {
-  // H.264 Baseline has no reordered frames, so decode time equals presentation time.
-  if (Require(muxer.TryWrite({1, packet.data, packet.pts, packet.pts,
-                              MediaTimestamp{duration, recording_timescale}, packet.key_frame}))) {
-    throw std::logic_error("The single-track MP4 writer requested another track.");
-  }
-}
-
 } // namespace
 
 class VideoRecording : public std::enable_shared_from_this<VideoRecording> {
@@ -137,6 +129,10 @@ public:
   }
 
   bool Finished() const noexcept { return finished_; }
+
+  std::chrono::microseconds Duration() const noexcept {
+    return std::chrono::microseconds(duration_ticks_.load(std::memory_order_relaxed));
+  }
 
   void Stop() noexcept {
     std::lock_guard lock(mutex_);
@@ -192,6 +188,15 @@ private:
     } catch (const std::exception& error) {
       return CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, error.what()});
     }
+  }
+
+  void WritePacket(MediaMuxer& muxer, const EncodedPacket& packet, std::int64_t duration) {
+    // H.264 Baseline has no reordered frames, so decode time equals presentation time.
+    if (Require(muxer.TryWrite({1, packet.data, packet.pts, packet.pts,
+                                MediaTimestamp{duration, recording_timescale}, packet.key_frame}))) {
+      throw std::logic_error("The single-track MP4 writer requested another track.");
+    }
+    duration_ticks_.store(packet.pts.ticks + duration, std::memory_order_relaxed);
   }
 
   void Encode() {
@@ -302,6 +307,7 @@ private:
   std::optional<CameraError> failure_;
   bool ready_ = false;
   bool stopping_ = false;
+  std::atomic<std::int64_t> duration_ticks_ = 0;
   std::atomic<bool> finished_ = false;
   std::thread worker_;
 };
@@ -323,9 +329,11 @@ Task<CameraResult<void>> RecordVideoTask(std::shared_ptr<CameraSessionData> owne
         try {
           auto recording = std::make_shared<VideoRecording>(MakeOutput(std::move(destination)),
               [weak = owner->weak_from_this(), scope = owner->tasks, complete](auto finished, auto result) {
+                const auto duration = result.Succeeded() ? finished->Duration() : std::chrono::microseconds{};
                 // Update shared session state even when the calling task was canceled.
-                scope.Post([weak, finished = std::move(finished)] {
+                scope.Post([weak, finished = std::move(finished), duration] {
                   if (auto owner = weak.lock(); owner && owner->recording == finished) {
+                    owner->completed_recording_duration = duration;
                     owner->recording.reset();
                     if (owner->frames) owner->frames->SetRecording({});
                     CameraStatus value = owner->status;
@@ -359,12 +367,21 @@ Task<CameraResult<void>> RecordVideoTask(std::shared_ptr<CameraSessionData>, Des
 }
 #endif
 
-FramePipeline::FramePipeline(std::shared_ptr<const FrameProcessor> processor) : processor_(std::move(processor)) {}
+FramePipeline::FramePipeline(std::shared_ptr<const FrameProcessorFactory> factory) : factory_(std::move(factory)) {}
 
-CameraResult<PreviewOutput> FramePipeline::Process(PreviewOutput input, std::chrono::nanoseconds capture_time) {
+CameraResult<PreviewOutput> FramePipeline::Process(
+    FrameProcessor& processor, PreviewOutput input, std::chrono::nanoseconds capture_time,
+    std::uint32_t pixel_width, std::uint32_t pixel_height) {
   try {
-    if (processor_) {
-      auto result = (*processor_)(input, capture_time);
+    if (factory_) {
+      if (!processor) {
+        processor = (*factory_)(pixel_width, pixel_height);
+        if (!processor) {
+          return CameraResult<PreviewOutput>::Failure(
+              {CameraErrorCode::CaptureFailed, "The camera frame processor factory returned an empty processor."});
+        }
+      }
+      auto result = processor(input, capture_time);
       if (!result.Succeeded()) return result;
       input = std::move(result).Value();
     }
@@ -392,6 +409,14 @@ CameraResult<PreviewOutput> FramePipeline::Process(PreviewOutput input, std::chr
 void FramePipeline::SetRecording(std::shared_ptr<VideoRecording> recording) {
   std::lock_guard lock(mutex_);
   recording_ = std::move(recording);
+}
+
+std::chrono::microseconds CameraSessionData::RecordedDuration() const noexcept {
+  if (closed) return {};
+#if defined(HUXERUI_CAMERA_RECORDING)
+  if (recording) return recording->Duration();
+#endif
+  return completed_recording_duration;
 }
 
 void CameraSessionData::StopRecording() {
@@ -427,6 +452,8 @@ Task<CameraResult<void>> CameraSession::RecordVideoAsync(RandomAccessStream dest
 Task<CameraResult<void>> CameraSession::RecordVideoAsync(OutputStream destination) const {
   return detail::RecordVideo(data_, std::move(destination));
 }
+
+std::chrono::microseconds CameraSession::RecordedDuration() const noexcept { return data_->RecordedDuration(); }
 
 void CameraSession::StopRecording() const { data_->StopRecording(); }
 

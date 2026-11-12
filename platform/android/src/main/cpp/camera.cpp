@@ -177,6 +177,7 @@ struct CameraOutput {
   PreviewRotation rotation;
   bool mirrored;
   std::optional<PreviewOutput> published;
+  FrameProcessor processor;
 };
 
 void ThrowJava(JNIEnv* env, const std::exception& error) {
@@ -213,7 +214,8 @@ Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlon
         .pixel_width = output.width, .pixel_height = output.height, .alpha = android::GlTexture::Alpha::Opaque});
     PreviewOutput preview{.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored};
     if (output.frames) {
-      auto processed = output.frames->Process(std::move(preview), std::chrono::nanoseconds(time));
+      auto processed = output.frames->Process(output.processor, std::move(preview), std::chrono::nanoseconds(time),
+          static_cast<std::uint32_t>(output.width), static_cast<std::uint32_t>(output.height));
       if (!processed.Succeeded()) throw std::runtime_error(processed.Error().message);
       preview = std::move(processed).Value();
     }
@@ -232,5 +234,8 @@ Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlon
 extern "C" JNIEXPORT void JNICALL
 Java_org_huxerui_lib_camera_CameraSurface_finishOutput(JNIEnv*, jclass, jlong handle) {
   const std::unique_ptr<CameraOutput> output(reinterpret_cast<CameraOutput*>(handle));
-  if (output) output->texture->Finish();
+  if (output) {
+    output->processor = {};
+    output->texture->Finish();
+  }
 }

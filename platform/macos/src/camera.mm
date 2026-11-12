@@ -138,8 +138,10 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   NSMutableArray* observers_;
   std::shared_ptr<macos::PixelBufferTexture> texture_;
   std::shared_ptr<FramePipeline> frames_;
+  FrameProcessor processor_;
   std::optional<PreviewOutput> preview_;
   std::optional<Facing> facing_;
+  bool failed_;
   std::function<void(CameraStatus)> changed_;
 }
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
@@ -161,7 +163,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 }
 
 - (void)fail:(CameraErrorCode)code message:(NSString*)message {
-  if (changed_) {
+  if (changed_ && !failed_) {
+    failed_ = true;
     changed_({.state = SessionState::Failed,
               .error = CameraError{code, message.UTF8String ?: "Camera capture failed."}});
   }
@@ -172,6 +175,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   dispatch_async(queue_, ^{
     changed_ = changed;
     frames_ = frames;
+    failed_ = false;
     if (!facing) {
       device_ = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     } else {
@@ -279,7 +283,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 
 - (void)captureOutput:(AVCaptureOutput*)output didOutputSampleBuffer:(CMSampleBufferRef)sample
        fromConnection:(AVCaptureConnection*)connection {
-  if (output != output_ || !changed_) {
+  if (output != output_ || !changed_ || failed_) {
     return;
   }
   CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
@@ -287,9 +291,11 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     return;
   }
   try {
-    const huxerui::Size size{static_cast<float>(CVPixelBufferGetWidth(buffer)),
-                    static_cast<float>(CVPixelBufferGetHeight(buffer))};
+    const auto width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(buffer));
+    const auto height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(buffer));
+    const huxerui::Size size{static_cast<float>(width), static_cast<float>(height)};
     if (!texture_ || texture_->IntrinsicSize() != size) {
+      processor_ = {};
       if (texture_) {
         texture_->Finish();
       }
@@ -301,8 +307,9 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
                                           kCMTimeRoundingMethod_Default);
       if (!CMTIME_IS_NUMERIC(time)) return;
-      auto processed = frames_->Process(std::move(frame), std::chrono::nanoseconds(time.value));
+      auto processed = frames_->Process(processor_, std::move(frame), std::chrono::nanoseconds(time.value), width, height);
       if (!processed.Succeeded()) {
+        failed_ = true;
         changed_({.state = SessionState::Failed, .error = processed.Error()});
         return;
       }
@@ -319,7 +326,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
   dispatch_async(queue_, ^{
-    if (!changed_ || !session_.isRunning) {
+    if (!changed_ || !session_.isRunning || failed_) {
       completed(
           CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
       return;
@@ -382,6 +389,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     [observers_ removeAllObjects];
     [output_ setSampleBufferDelegate:nil queue:nullptr];
     [session_ stopRunning];
+    processor_ = {};
     output_ = nil;
     device_ = nil;
     if (texture_) {

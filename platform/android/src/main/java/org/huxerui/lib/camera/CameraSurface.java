@@ -151,11 +151,16 @@ final class CameraSurface {
         pause();
         worker.handler.post(() -> {
             try {
-                if (output != 0) finishOutput(output);
-                if (surface != null) surface.release();
-                if (source != null) source.release();
-                if (program != 0 || textures[0] != 0 || framebuffer != 0) {
-                    worker.makeCurrent();
+                boolean hasGlResources = program != 0 || textures[0] != 0 || framebuffer != 0;
+                try {
+                    if (hasGlResources) worker.makeCurrent();
+                } finally {
+                    // Release the processor with the capture context current when available.
+                    if (output != 0) finishOutput(output);
+                    if (surface != null) surface.release();
+                    if (source != null) source.release();
+                }
+                if (hasGlResources) {
                     GLES20.glDeleteFramebuffers(1, new int[]{framebuffer}, 0);
                     GLES20.glDeleteTextures(2, textures, 0);
                     GLES20.glDeleteProgram(program);

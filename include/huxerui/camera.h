@@ -8,6 +8,7 @@
 /// capture photos or record video. Recording uses the codec and container APIs from HuxerUI::Media.
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -175,7 +176,7 @@ struct PreviewOutput {
 
 /// @brief Processes a camera frame for both live preview and video recording.
 ///
-/// The callback runs on the platform's serial frame queue. `input` holds the published source texture and
+/// The platform serializes frame callbacks. `input` holds the published source texture and
 /// its geometry. `capture_time` is the frame timestamp in nanoseconds on the capture source's clock.
 /// Read the source during the callback and acquire a snapshot if its pixels must outlive the call. Any
 /// shared effect parameters read on the frame queue must be synchronized with writes from other threads.
@@ -185,13 +186,28 @@ struct PreviewOutput {
 /// so updates can redraw without recomposing. Camera acquires each accepted recording snapshot before the
 /// next callback. Serialize other publications to the returned texture with this work.
 ///
-/// On Android the capture EGL context is current during the callback. Capture reopening recreates that
-/// context, so resources tied to it must be recreated as well.
-///
 /// Returning an error or throwing fails the capture session and exposes the diagnostic through CameraStatus::error.
-/// @see CameraOptions::frame_processor, PreviewOutput
+/// @see FrameProcessorFactory, PreviewOutput
 using FrameProcessor = std::function<CameraResult<PreviewOutput>(
     const PreviewOutput& input, std::chrono::nanoseconds capture_time)>;
+
+/// @brief Creates a processor when a frame producer delivers its first usable frame.
+///
+/// `pixel_width` and `pixel_height` are the source texture dimensions in physical pixels,
+/// before applying PreviewOutput::crop or PreviewOutput::rotation.
+///
+/// Return a callable with its own per-producer state. Camera uses it for the first frame and retains it until
+/// the producer is replaced, capture stops, or the input texture dimensions change. Recording starts and
+/// stops can share the same instance.
+///
+/// Creation, processing, and destruction for one producer are serialized by its backend. A shared factory can
+/// be called concurrently by different sessions. On Android the capture EGL context is current on entry
+/// to the factory, processor, and normal destruction. Restore that context if a callback changes it.
+/// Processor cleanup must also handle context loss.
+///
+/// Throwing or returning an empty callable fails capture and reports the error through CameraStatus::error.
+/// @see CameraOptions::frame_processor_factory, FrameProcessor
+using FrameProcessorFactory = std::function<FrameProcessor(std::uint32_t pixel_width, std::uint32_t pixel_height)>;
 
 /// @brief Declarative capture intent applied by UseCamera on recomposition.
 struct CameraOptions {
@@ -202,10 +218,10 @@ struct CameraOptions {
   /// False stops capture asynchronously. True starts only with existing camera authorization.
   /// Backgrounding suspends capture without changing this intent. Foregrounding reevaluates it.
   bool active = true;
-  /// Optional processor shared by preview and video recording. An empty pointer uses source frames directly.
-  /// Replacing the shared processor reopens active capture. Update synchronized effect parameters in place
-  /// to change an effect during capture.
-  std::shared_ptr<const FrameProcessor> frame_processor;
+  /// Optional factory for the processor shared by preview and recording. An empty pointer uses source frames.
+  /// Reuse the same factory across recompositions to keep capture open. Replacing it reopens active capture.
+  /// Update synchronized effect parameters in place to change an effect during capture.
+  std::shared_ptr<const FrameProcessorFactory> frame_processor_factory;
 
   bool operator==(const CameraOptions&) const = default;
 };
@@ -314,7 +330,7 @@ public:
   /// not reached SessionState::Running or is stopping. OperationInProgress means another recording is
   /// active or finalizing. Unavailable indicates missing recording support. Interrupted means recording
   /// stopped before a frame could be encoded.
-  /// @see StopRecording(), CameraStatus::recording_video, CameraOptions::frame_processor
+  /// @see StopRecording(), RecordedDuration(), CameraStatus::recording_video, CameraOptions::frame_processor_factory
   Task<CameraResult<void>> RecordVideoAsync(File destination) const;
 
   /// @brief Records a single H.264 video track into a writable random-access stream as a regular MP4.
@@ -334,6 +350,17 @@ public:
   /// @return A task yielding success after the muxer finalizes the stream, or CameraError.
   /// @see RecordVideoAsync(File), StopRecording()
   Task<CameraResult<void>> RecordVideoAsync(OutputStream destination) const;
+
+  /// @brief Reads the video duration on the MP4 timeline of the current or latest recording.
+  ///
+  /// The duration advances to the presentation end of each sample accepted by the muxer. It can
+  /// lag capture while the encoder buffers frames and advance during finalization as frames drain.
+  /// Read the snapshot on the owning UI thread. Poll from a UI task at the display refresh interval.
+  /// @return The duration in microseconds. A new recording starts at zero and a successful final
+  /// duration remains available until the next recording starts. Returns zero before any recording,
+  /// after a failed recording settles, or after the session closes.
+  /// @see RecordVideoAsync(File), CameraStatus::recording_video
+  std::chrono::microseconds RecordedDuration() const noexcept;
 
   /// @brief Requests finalization of the current recording on the owning UI thread.
   ///

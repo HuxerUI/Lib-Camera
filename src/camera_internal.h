@@ -15,14 +15,15 @@ class VideoRecording;
 /// Applies one processor per capture frame and forwards its output to the active recording.
 class FramePipeline {
 public:
-  explicit FramePipeline(std::shared_ptr<const FrameProcessor> processor);
-  /// Called on the serial frame queue. Acquires any recording snapshot before returning the preview output.
-  CameraResult<PreviewOutput> Process(PreviewOutput input, std::chrono::nanoseconds capture_time);
+  explicit FramePipeline(std::shared_ptr<const FrameProcessorFactory> factory);
+  /// Initializes the producer-owned processor on its first frame. Acquires the recording snapshot before return.
+  CameraResult<PreviewOutput> Process(FrameProcessor& processor, PreviewOutput input,
+      std::chrono::nanoseconds capture_time, std::uint32_t pixel_width, std::uint32_t pixel_height);
   /// Called on the UI thread. An empty pointer detaches the recorder from subsequent frames.
   void SetRecording(std::shared_ptr<VideoRecording> recording);
 
 private:
-  std::shared_ptr<const FrameProcessor> processor_;
+  std::shared_ptr<const FrameProcessorFactory> factory_;
   std::mutex mutex_;
   std::shared_ptr<VideoRecording> recording_;
 };
