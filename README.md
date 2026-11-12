@@ -83,6 +83,16 @@ Configure each preview through `PreviewOptions`:
 
 The component calling `UseCamera` owns the session lifetime. Removing that component closes capture, even if another object retains a session handle. Removing an individual `CameraPreview` does not stop its shared session.
 
+## Adjust Zoom
+
+Read `session.Status().zoom` for the active camera's applied zoom ratio and supported range. When it is
+available, call `session.SetZoomRatioAsync(ratio)` from a UI task to adjust preview, photos, and recording
+together. Adjusting zoom keeps the camera open and continues any active recording. Zoom is available on
+supported Android and iOS cameras and on Windows cameras exposing extended zoom control.
+
+The example shows a multiplier button when zoom is available. Tap it to open the slider and any supported
+`1×` and `2×` shortcuts. Pinch the viewfinder to change the same camera zoom during preview or recording.
+
 ## Capture a Photo
 
 Launch `CapturePhotoAsync` from a UI event or task. It returns `CameraResult<ImageAsset>`, an alias for `Result<ImageAsset, CameraError>`.

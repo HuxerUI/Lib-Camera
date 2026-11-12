@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 
@@ -101,6 +102,78 @@ View RecordingBadge(camera::CameraSession session, bool recording, bool paused) 
                 static_cast<long long>(seconds / 60), static_cast<long long>(seconds % 60));
   const char* label = paused ? "PAUSED " : recording ? "REC " : "FINALIZING ";
   return StatusBadge(std::string(label) + time, recording && !paused ? record_red : secondary);
+}
+
+struct ZoomControlState {
+  bool expanded = false;
+  bool adjusting = false;
+  bool applying = false;
+  std::optional<float> proposal;
+  std::uint64_t request_id = 0;
+  std::string error;
+
+  bool operator==(const ZoomControlState&) const = default;
+};
+
+void RequestZoom(camera::CameraSession session, TaskScope tasks, State<ZoomControlState> state, float ratio) {
+  const auto id = state->request_id + 1;
+  state.Update([&](ZoomControlState& value) {
+    value.request_id = id;
+    value.applying = true;
+    value.proposal = ratio;
+    value.error.clear();
+  });
+  tasks.Launch([session, ratio, id, state]() -> Task<void> {
+    const auto result = co_await session.SetZoomRatioAsync(ratio);
+    if (state->request_id != id) co_return;
+    state.Update([&](ZoomControlState& value) {
+      value.applying = false;
+      if (!value.adjusting) value.proposal.reset();
+      if (!result.Succeeded() && result.Error().code != camera::CameraErrorCode::Interrupted) {
+        value.error = result.Error().message;
+      }
+    });
+  });
+}
+
+void SetZoomAdjusting(State<ZoomControlState> state, bool adjusting) {
+  state.Update([adjusting](ZoomControlState& value) {
+    value.adjusting = adjusting;
+    if (!adjusting && !value.applying) value.proposal.reset();
+  });
+}
+
+View ZoomControls(camera::CameraSession session, camera::ZoomState zoom, TaskScope tasks,
+                  State<ZoomControlState> state) {
+  const auto set_zoom = [session, tasks, state](float ratio) {
+    RequestZoom(session, tasks, state, ratio);
+  };
+  const float ratio = std::clamp(state->proposal.value_or(zoom.ratio), zoom.min_ratio, zoom.max_ratio);
+  char label[24];
+  std::snprintf(label, sizeof(label), "%.1f×", static_cast<double>(ratio));
+  const auto supports = [zoom](float value) { return zoom.min_ratio <= value && value <= zoom.max_ratio; };
+
+  return Column {
+    state->expanded ? View(Column {
+      Row {
+        supports(1.0F) ? View(Button("1×").OnClick([set_zoom] { set_zoom(1.0F); })) : View(),
+        supports(2.0F) ? View(Button("2×").OnClick([set_zoom] { set_zoom(2.0F); })) : View(),
+      }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
+      Slider(ratio).Range(zoom.min_ratio, zoom.max_ratio)
+          .OnStarted([state](float) { SetZoomAdjusting(state, true); })
+          .OnChanged(set_zoom)
+          .OnCommitted([state](float) { SetZoomAdjusting(state, false); })
+          .OnCanceled([state] { SetZoomAdjusting(state, false); })
+          .Key("zoom-slider"),
+      state->error.empty() ? View() : View(Label(state->error, 12.0F, foreground)),
+    }.With(Frame{.width = 216.0F}, Padding(10.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch),
+           Background(overlay_background), CornerRadius(16.0F))) : View(),
+    Button(std::string(label)).OnClick([state] {
+      SetZoomAdjusting(state, false);
+      state.Update([](ZoomControlState& value) { value.expanded = !value.expanded; });
+    }).Key("zoom-toggle"),
+  }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center),
+         Align(HorizontalAlignment::Center, VerticalAlignment::Center), Padding(8.0F));
 }
 
 [[huxerui::composable]]
@@ -386,6 +459,7 @@ View CameraWorkspace() {
   auto video_file = UseState(std::optional<File>{});
   auto saving_video = UseState(false);
   auto video_message = UseState(std::string{});
+  auto zoom_controls = UseState(ZoomControlState{});
   auto application = UseApplication();
   auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
@@ -399,6 +473,10 @@ View CameraWorkspace() {
   });
   const auto status = session.Status();
   const auto microphone_status = microphone.Status();
+  const bool zoom_available = status.zoom.has_value();
+  Lifecycle([zoom_controls, zoom_available] {
+    if (!zoom_available) zoom_controls = ZoomControlState{.request_id = zoom_controls->request_id + 1};
+  }, zoom_available);
   const ImageFit selected_fit = fit;
   const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
   const bool failed = status.state == camera::SessionState::Failed;
@@ -559,10 +637,29 @@ View CameraWorkspace() {
       ? RecordingBadge(session, recording && live, paused)
       : StatusBadge(StateName(status.state), status_color);
 
-  View viewfinder = Stack {
+  View preview = Stack {
     camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
-    live ? View() : EmptyPreview(status, authorizing, permission_error),
     live && grid ? CompositionGrid() : View(),
+  }.With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
+  if (live && zoom_available) {
+    const auto finish_zoom = [zoom_controls](const TransformEvent&) { SetZoomAdjusting(zoom_controls, false); };
+    preview = std::move(preview).With(TransformGesture{})
+        .On<TransformEvents::Started>([zoom_controls](const TransformEvent&) { SetZoomAdjusting(zoom_controls, true); })
+        .On<TransformEvents::Changed>([session, tasks, zoom_controls](const TransformEvent& event) {
+          if (!std::isfinite(event.scale) || event.scale <= 0.0F || event.scale == 1.0F) return;
+          const auto zoom = session.Status().zoom;
+          if (!zoom) return;
+          const auto current = zoom_controls->proposal.value_or(zoom->ratio);
+          const auto target = std::clamp(current * event.scale, zoom->min_ratio, zoom->max_ratio);
+          if (target != current) RequestZoom(session, tasks, zoom_controls, target);
+        })
+        .On<TransformEvents::Ended>(finish_zoom)
+        .On<TransformEvents::Canceled>(finish_zoom);
+  }
+
+  View viewfinder = Stack {
+    std::move(preview).Key("preview-surface"),
+    live ? View() : EmptyPreview(status, authorizing, permission_error),
     Column {
       Row {
         badge,
@@ -591,6 +688,7 @@ View CameraWorkspace() {
           Label("FULL FRAME / MIRROR OFF", 9.0F, foreground, FontWeight::Medium).With(Padding(8.0F)),
         }.With(Background(background), Border(outline, 1.0F), CornerRadius(12.0F), ClipChildren()),
       }.With(Padding(16.0F), SafeAreaPadding{.top = false, .bottom = false})) : View(),
+      zoom_available ? ZoomControls(session, *status.zoom, tasks, zoom_controls).Key("camera-zoom") : View(),
     }.With(CrossAlign(CrossAxisAlignment::Stretch)),
   }.With(
       Grow(),

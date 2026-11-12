@@ -242,6 +242,18 @@ struct CameraOptions {
   bool operator==(const CameraOptions&) const = default;
 };
 
+/// @brief The active camera's applied zoom ratio and supported range.
+struct ZoomState {
+  /// Latest ratio confirmed by the camera.
+  float ratio = 1.0F;
+  /// Smallest zoom ratio for the active capture configuration.
+  float min_ratio = 1.0F;
+  /// Largest zoom ratio for the active capture configuration.
+  float max_ratio = 1.0F;
+
+  bool operator==(const ZoomState&) const = default;
+};
+
 /// @brief Current observed session state and optional preview metadata.
 ///
 /// A returned status value can hold a texture that continues receiving frames.
@@ -266,6 +278,8 @@ struct CameraStatus {
   /// Whether the current recording is skipping new frames after PauseRecording().
   /// Preview and frame processing continue. Resuming or ending the recording clears this flag.
   bool recording_paused = false;
+  /// Zoom control for the current camera. Empty while unavailable or before the range has been read.
+  std::optional<ZoomState> zoom;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -300,6 +314,19 @@ public:
   ///     .With(Enabled(status.state == camera::SessionState::Failed));
   /// @endcode
   void Retry() const;
+
+  /// @brief Adjusts the running camera's zoom for preview, still capture, and recording.
+  ///
+  /// Start the lazy task on the owning UI thread. The camera stays open and the recording continues.
+  /// The ratio is constrained to the device's current range and rounded to the nearest supported step.
+  /// A newer request can supersede an earlier adjustment. A superseded request, camera switch,
+  /// or capture shutdown returns Interrupted. Canceling a task withdraws a pending request and suppresses
+  /// delivery. An adjustment already submitted to the camera can still update CameraStatus::zoom.
+  /// @param ratio Positive finite zoom multiplier.
+  /// @return Success when the device accepts the adjustment. Read CameraStatus::zoom for the applied value.
+  /// NotReady means the camera is not running. Unavailable means it has no zoom control.
+  /// @throws std::invalid_argument Before returning a task if the ratio is nonpositive or nonfinite.
+  Task<CameraResult<void>> SetZoomRatioAsync(float ratio) const;
 
   /// @brief Captures a JPEG photo through the platform still-photo output of the current camera.
   ///

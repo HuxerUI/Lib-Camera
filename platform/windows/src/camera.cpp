@@ -3,6 +3,8 @@
 #include <huxerui/windows/external_texture.h>
 
 #include <d3d11.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <mfapi.h>
 #include <mfcaptureengine.h>
 #include <mferror.h>
@@ -14,6 +16,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -47,6 +50,34 @@ CameraError Error(HRESULT result, CameraErrorCode fallback) {
   else if (result == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED || result == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED))
     code = CameraErrorCode::DeviceDisconnected;
   return {code, "Windows camera operation failed (HRESULT " + std::to_string(result) + ")."};
+}
+
+constexpr double zoom_scale = 65'536.0;
+
+std::optional<ZoomState> DriverZoom(IMFExtendedCameraControl& control, std::optional<float> target = {}) {
+  BYTE* payload = nullptr;
+  ULONG size = 0;
+  Require(control.LockPayload(&payload, &size));
+  KSCAMERA_EXTENDEDPROP_VIDEOPROCSETTING setting{};
+  const bool has_payload = payload && size == sizeof(setting);
+  if (has_payload) std::memcpy(&setting, payload, sizeof(setting));
+  const bool supported = has_payload && setting.Min > 0 && setting.Max > setting.Min &&
+      setting.VideoProc.Value.ul >= static_cast<ULONG>(setting.Min) &&
+      setting.VideoProc.Value.ul <= static_cast<ULONG>(setting.Max);
+  if (supported && target) {
+    const auto value = std::clamp(static_cast<double>(*target) * zoom_scale,
+        static_cast<double>(setting.Min), static_cast<double>(setting.Max));
+    const auto step = std::max(1L, setting.Step);
+    const auto index = std::min(std::llround((value - setting.Min) / step),
+        static_cast<long long>((setting.Max - setting.Min) / step));
+    setting.VideoProc.Value.ul = static_cast<ULONG>(setting.Min + index * step);
+    std::memcpy(payload, &setting, sizeof(setting));
+  }
+  Require(control.UnlockPayload());
+  if (!supported) return {};
+  return ZoomState{.ratio = static_cast<float>(setting.VideoProc.Value.ul / zoom_scale),
+                   .min_ratio = static_cast<float>(setting.Min / zoom_scale),
+                   .max_ratio = static_cast<float>(setting.Max / zoom_scale)};
 }
 
 class CaptureEvents final : public Callback<IMFCaptureEngineOnEventCallback> {
@@ -434,6 +465,34 @@ public:
       completed();
   }
 
+  std::optional<ZoomState> ReadZoom() {
+    try {
+      const auto control = OpenZoomControl();
+      return control ? DriverZoom(*control.Get()) : std::nullopt;
+    } catch (HRESULT) {
+      return {};
+    }
+  }
+
+  CameraResult<ZoomState> SetZoomRatio(float ratio) {
+    if (!running_) {
+      return CameraResult<ZoomState>::Failure({CameraErrorCode::NotReady, "The camera is not running."});
+    }
+    try {
+      const auto control = OpenZoomControl();
+      if (!control || !DriverZoom(*control.Get(), ratio)) {
+        return CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."});
+      }
+      Require(control->SetFlags((control->GetCapabilities() & KSCAMERA_EXTENDEDPROP_ZOOM_DIRECT)
+          ? KSCAMERA_EXTENDEDPROP_ZOOM_DIRECT : KSCAMERA_EXTENDEDPROP_ZOOM_DEFAULT));
+      Require(control->CommitSettings());
+      if (const auto applied = ReadZoom()) return CameraResult<ZoomState>::Success(*applied);
+      return CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, "Cannot read the applied camera zoom."});
+    } catch (HRESULT result) {
+      return CameraResult<ZoomState>::Failure(Error(result, CameraErrorCode::CaptureFailed));
+    }
+  }
+
   void Photo(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) {
     if (!running_) {
       completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
@@ -505,6 +564,16 @@ public:
   }
 
 private:
+  ComPtr<IMFExtendedCameraControl> OpenZoomControl() {
+    ComPtr<IMFExtendedCameraController> controller;
+    ComPtr<IMFExtendedCameraControl> control;
+    if (running_ && device_ && SUCCEEDED(MFGetService(device_.Get(), GUID_NULL, IID_PPV_ARGS(&controller)))) {
+      controller->GetExtendedCameraControl(MF_CAPTURE_ENGINE_MEDIASOURCE, KSPROPERTY_CAMERACONTROL_EXTENDED_ZOOM,
+                                           &control);
+    }
+    return control;
+  }
+
   void Drain(HRESULT initialized) noexcept {
     com_status_ = initialized;
     while (true) {
@@ -598,6 +667,16 @@ public:
 
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     capture_->Post([capture = capture_, options, completed = std::move(completed)] { capture->Photo(options, completed); });
+  }
+
+  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+    capture_->Post([capture = capture_, completed = std::move(completed)] { completed(capture->ReadZoom()); });
+  }
+
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+    capture_->Post([capture = capture_, ratio, completed = std::move(completed)] {
+      completed(capture->SetZoomRatio(ratio));
+    });
   }
 
 private:

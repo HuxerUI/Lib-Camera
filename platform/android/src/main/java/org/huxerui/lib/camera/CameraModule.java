@@ -10,12 +10,14 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.Surface;
 import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 import androidx.camera.camera2.interop.Camera2CameraInfo;
 import androidx.camera.core.Camera;
+import androidx.camera.core.CameraControl;
 import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.CameraState;
@@ -24,6 +26,7 @@ import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.SurfaceRequest;
+import androidx.camera.core.ZoomState;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
@@ -82,6 +85,9 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private boolean photoPending;
         private Camera camera;
         private Observer<CameraState> cameraObserver;
+        private HuxerUIPlatformChannel.Result pendingZoom;
+        private float requestedZoomRatio;
+        private final Choreographer.FrameCallback zoomFrame = time -> applyZoomRatio();
         private Output current;
         private CameraSurface.FrameThread frameThread;
         private boolean frameThreadStopping;
@@ -121,6 +127,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 result.complete(PlatformPayload.nullValue());
             } else if (method.equals("capturePhoto")) {
                 capturePhoto(arguments, result);
+            } else if (method.equals("readZoom")) {
+                ZoomState zoom = isCurrentCamera(arguments) ? zoomState() : null;
+                result.complete(zoom == null ? PlatformPayload.nullValue() : zoomPayload(zoom));
+            } else if (method.equals("setZoomRatio")) {
+                setZoomRatio(arguments, result);
             } else if (method.equals("stop")) {
                 stops.add(result);
                 stop();
@@ -219,6 +230,75 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME);
         }
 
+        private boolean isCurrentCamera(PlatformPayload arguments) {
+            return active && opened && camera != null && arguments.requireField("run").requireInt64() == run;
+        }
+
+        private ZoomState zoomState() {
+            ZoomState zoom = camera.getCameraInfo().getZoomState().getValue();
+            return zoom != null && zoom.getMaxZoomRatio() > zoom.getMinZoomRatio() ? zoom : null;
+        }
+
+        private static PlatformPayload zoomPayload(ZoomState zoom) {
+            Map<String, PlatformPayload> values = new HashMap<>();
+            values.put("ratio", PlatformPayload.doubleValue(zoom.getZoomRatio()));
+            values.put("min", PlatformPayload.doubleValue(zoom.getMinZoomRatio()));
+            values.put("max", PlatformPayload.doubleValue(zoom.getMaxZoomRatio()));
+            return PlatformPayload.object(values);
+        }
+
+        private void setZoomRatio(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
+            if (!isCurrentCamera(arguments)) {
+                result.fail("not-ready", "Start the camera before adjusting zoom.", PlatformPayload.nullValue());
+                return;
+            }
+            requestedZoomRatio = (float) arguments.requireField("ratio").requireDouble();
+            HuxerUIPlatformChannel.Result previous = pendingZoom;
+            pendingZoom = result;
+            if (previous == null) {
+                Choreographer.getInstance().postFrameCallback(zoomFrame);
+            } else {
+                previous.fail("interrupted", "A newer zoom request superseded this adjustment.", PlatformPayload.nullValue());
+            }
+        }
+
+        private void applyZoomRatio() {
+            HuxerUIPlatformChannel.Result result = pendingZoom;
+            pendingZoom = null;
+            if (result == null) return;
+            ZoomState zoom = zoomState();
+            if (zoom == null) {
+                result.fail("unavailable", "Camera zoom is unavailable.", PlatformPayload.nullValue());
+                return;
+            }
+            float target = Math.max(zoom.getMinZoomRatio(), Math.min(requestedZoomRatio, zoom.getMaxZoomRatio()));
+            long token = generation;
+            try {
+                ListenableFuture<Void> applied = camera.getCameraControl().setZoomRatio(target);
+                applied.addListener(() -> {
+                    if (!active || token != generation) {
+                        result.fail("interrupted", "Camera zoom was interrupted.", PlatformPayload.nullValue());
+                        return;
+                    }
+                    try {
+                        applied.get();
+                        ZoomState current = zoomState();
+                        if (current == null) {
+                            result.fail("unavailable", "Camera zoom is unavailable.", PlatformPayload.nullValue());
+                        } else {
+                            result.complete(zoomPayload(current));
+                        }
+                    } catch (Exception error) {
+                        String code = error.getCause() instanceof CameraControl.OperationCanceledException
+                                ? "interrupted" : "capture-failed";
+                        result.fail(code, error.toString(), PlatformPayload.nullValue());
+                    }
+                }, executor);
+            } catch (RuntimeException error) {
+                result.fail("capture-failed", error.toString(), PlatformPayload.nullValue());
+            }
+        }
+
         private void capturePhoto(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
             if (!active || !opened || arguments.requireField("run").requireInt64() != run) {
                 result.fail("not-ready", "Start the camera before taking a photo.", PlatformPayload.nullValue());
@@ -296,6 +376,12 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             active = false;
             opened = false;
             ++generation;
+            if (pendingZoom != null) {
+                Choreographer.getInstance().removeFrameCallback(zoomFrame);
+                HuxerUIPlatformChannel.Result pending = pendingZoom;
+                pendingZoom = null;
+                pending.fail("interrupted", "Camera zoom was interrupted.", PlatformPayload.nullValue());
+            }
             current = null;
             displays.unregisterDisplayListener(this);
             if (camera != null && cameraObserver != null) {

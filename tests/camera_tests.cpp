@@ -252,6 +252,104 @@ void TestSessionLifetime() {
   retained_session.reset();
 }
 
+void TestZoomRequests() {
+  class ZoomBackend final : public camera::detail::CameraBackend {
+  public:
+    void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+    void Stop(std::function<void()> completed) override {
+      ++stops;
+      if (completed) completed();
+    }
+    void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+      completed(ZoomState{.ratio = 1.0F, .min_ratio = 1.0F, .max_ratio = 4.0F});
+    }
+    bool CanReplaceZoomRequest() const noexcept override { return replace_active; }
+    void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+      if (completion) {
+        Check(replace_active && !replaced, "Only a replaceable zoom adjustment may be superseded.");
+        replaced = std::move(completion);
+      }
+      targets.push_back(ratio);
+      completion = std::move(completed);
+    }
+    void Complete(float ratio) {
+      auto complete = std::exchange(completion, {});
+      complete(CameraResult<ZoomState>::Success({.ratio = ratio, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+    }
+    int starts = 0;
+    int stops = 0;
+    bool replace_active = false;
+    std::vector<float> targets;
+    std::function<void(CameraResult<ZoomState>)> completion;
+    std::function<void(CameraResult<ZoomState>)> replaced;
+  };
+
+  PhotoTestFixture fixture;
+  const auto owner = fixture.context.owner;
+  auto backend = std::make_shared<ZoomBackend>();
+  owner->backend = backend;
+  owner->ReadZoom();
+  fixture.Drain();
+  const auto launch = [&](float ratio, std::optional<CameraResult<void>>& result) {
+    return fixture.context.callers->Launch([owner, ratio, &result]() -> Task<void> {
+      result = co_await camera::detail::SetZoomRatio(owner, ratio);
+    });
+  };
+
+  std::optional<CameraResult<void>> first;
+  std::optional<CameraResult<void>> superseded;
+  std::optional<CameraResult<void>> last;
+  launch(0.5F, first);
+  fixture.Drain();
+  launch(2.0F, superseded);
+  launch(8.0F, last);
+  fixture.Drain();
+  Check(backend->targets == std::vector{1.0F}, "Zoom must clamp the lower bound and keep the newest pending request.");
+  Check(superseded && superseded->Error().code == CameraErrorCode::Interrupted,
+        "A superseded zoom request must complete with Interrupted.");
+
+  backend->Complete(1.0F);
+  fixture.Drain();
+  Check(first && first->Succeeded() && backend->targets == std::vector{1.0F, 4.0F},
+        "The latest pending zoom must be clamped and applied next.");
+  backend->Complete(3.75F);
+  fixture.Drain();
+  Check(last && last->Succeeded() && owner->status->zoom && owner->status->zoom->ratio == 3.75F,
+        "Zoom status must report the ratio confirmed by the device.");
+  Check(backend->starts == 0 && backend->stops == 0, "Zoom must keep the current capture running.");
+
+  backend->replace_active = true;
+  std::optional<CameraResult<void>> replaced;
+  std::optional<CameraResult<void>> latest;
+  launch(2.0F, replaced);
+  fixture.Drain();
+  launch(3.0F, latest);
+  fixture.Drain();
+  Check(replaced && replaced->Error().code == CameraErrorCode::Interrupted && backend->targets.back() == 3.0F,
+        "A replaceable backend must receive the latest zoom before the previous result arrives.");
+  auto stale = std::exchange(backend->replaced, {});
+  stale(CameraResult<ZoomState>::Success({.ratio = 2.0F, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+  fixture.Drain();
+  Check(owner->status->zoom && owner->status->zoom->ratio == 3.75F && !latest,
+        "An obsolete result must not change the applied zoom or complete the latest request.");
+  backend->Complete(3.0F);
+  fixture.Drain();
+  Check(latest && latest->Succeeded() && owner->status->zoom && owner->status->zoom->ratio == 3.0F,
+        "The latest confirmed ratio must update the status.");
+
+  std::optional<CameraResult<void>> interrupted;
+  launch(2.0F, interrupted);
+  fixture.Drain();
+  owner->Close();
+  fixture.Drain();
+  Check(interrupted && interrupted->Error().code == CameraErrorCode::Interrupted,
+        "Closing capture must interrupt its active zoom request.");
+  backend->Complete(2.0F);
+  fixture.Drain();
+  Check(owner->status->state == SessionState::Closed && !owner->status->zoom,
+        "A late zoom response must not restore closed camera state.");
+}
+
 void TestPhotoRequests() {
   {
     PhotoTestFixture fixture;
@@ -381,6 +479,7 @@ int main() {
     TestOutputCrop();
     TestProducerSize();
     TestSessionLifetime();
+    TestZoomRequests();
     TestPhotoRequests();
     std::cout << "Camera tests passed.\n";
     return 0;

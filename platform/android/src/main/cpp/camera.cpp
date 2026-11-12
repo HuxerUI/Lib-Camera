@@ -38,6 +38,13 @@ CameraErrorCode DecodeError(std::string_view code) {
   return CameraErrorCode::Unavailable;
 }
 
+ZoomState DecodeZoom(const PlatformPayload& payload) {
+  const auto& fields = payload.AsObject();
+  return {.ratio = static_cast<float>(fields.at("ratio").AsDouble()),
+          .min_ratio = static_cast<float>(fields.at("min").AsDouble()),
+          .max_ratio = static_cast<float>(fields.at("max").AsDouble())};
+}
+
 class AndroidCamera final : public CameraBackend, public std::enable_shared_from_this<AndroidCamera> {
 public:
   explicit AndroidCamera(PlatformChannel channel) : channel_(std::move(channel)) {}
@@ -111,6 +118,39 @@ public:
     channel_.Invoke<std::monostate>("stop", [completed = std::move(completed)](PlatformResult<std::monostate>) {
       if (completed) completed();
     });
+  }
+
+  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+    channel_.Invoke("readZoom", PlatformPayload(PlatformPayload::Object{{"run", run_}}),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          std::optional<ZoomState> zoom;
+          try {
+            if (const auto* payload = std::get_if<PlatformPayload>(&result); payload && !payload->IsNull()) {
+              zoom = DecodeZoom(*payload);
+            }
+          } catch (const std::exception&) {
+            // A failed control query leaves the capability unavailable.
+          }
+          completed(zoom);
+        });
+  }
+
+  bool CanReplaceZoomRequest() const noexcept override { return true; }
+
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+    channel_.Invoke("setZoomRatio",
+        PlatformPayload(PlatformPayload::Object{{"run", run_}, {"ratio", static_cast<double>(ratio)}}),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          if (const auto* error = std::get_if<PlatformError>(&result)) {
+            completed(CameraResult<ZoomState>::Failure({DecodeError(error->code), error->message}));
+            return;
+          }
+          try {
+            completed(CameraResult<ZoomState>::Success(DecodeZoom(std::get<PlatformPayload>(result))));
+          } catch (const std::exception& error) {
+            completed(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+          }
+        });
   }
 
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {

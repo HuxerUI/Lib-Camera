@@ -5,6 +5,7 @@
 #include <vector>
 #import <UIKit/UIKit.h>
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -260,6 +261,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
       changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
+- (void)readZoom:(std::function<void(std::optional<ZoomState>)>)completed;
+- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<ZoomState>)>)completed;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 @end
 
@@ -501,6 +504,58 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   }
 }
 
+- (std::optional<ZoomState>)zoomState {
+  if (!changed_ || !session_.isRunning || interrupted_ || failed_) return {};
+  const auto minimum = device_.minAvailableVideoZoomFactor;
+  const auto maximum = device_.maxAvailableVideoZoomFactor;
+  if (minimum >= maximum) return {};
+  return ZoomState{.ratio = static_cast<float>(device_.videoZoomFactor),
+                   .min_ratio = static_cast<float>(minimum),
+                   .max_ratio = static_cast<float>(maximum)};
+}
+
+- (void)readZoom:(std::function<void(std::optional<ZoomState>)>)completed {
+  dispatch_async(queue_, ^{
+    completed([self zoomState]);
+  });
+}
+
+- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<ZoomState>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning || interrupted_ || failed_) {
+      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
+      return;
+    }
+    NSError* error = nil;
+    if (![device_ lockForConfiguration:&error]) {
+      completed(CameraResult<ZoomState>::Failure(
+          {CameraErrorCode::CaptureFailed, error.localizedDescription.UTF8String ?: "Cannot configure camera zoom."}));
+      return;
+    }
+    std::optional<ZoomState> applied;
+    NSString* failure = nil;
+    @try {
+      const auto minimum = device_.minAvailableVideoZoomFactor;
+      const auto maximum = device_.maxAvailableVideoZoomFactor;
+      if (minimum < maximum) {
+        device_.videoZoomFactor = std::clamp(static_cast<CGFloat>(ratio), minimum, maximum);
+        applied = [self zoomState];
+      }
+    } @catch (NSException* exception) {
+      failure = exception.reason ?: @"Cannot apply camera zoom.";
+    } @finally {
+      [device_ unlockForConfiguration];
+    }
+    if (applied) {
+      completed(CameraResult<ZoomState>::Success(*applied));
+    } else if (failure) {
+      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
+    } else {
+      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+    }
+  });
+}
+
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
   const auto orientation = [orientationObserver_ orientation];
   dispatch_async(queue_, ^{
@@ -630,6 +685,12 @@ public:
 
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];
+  }
+  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+    [capture_ readZoom:std::move(completed)];
+  }
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+    [capture_ setZoomRatio:ratio completed:std::move(completed)];
   }
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     [capture_ capturePhoto:options completed:std::move(completed)];

@@ -1,5 +1,7 @@
 #include "camera_session.h"
 
+#include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <utility>
@@ -13,6 +15,20 @@
 #include "camera_internal.h"
 
 namespace huxerui::camera::detail {
+
+namespace {
+
+bool ValidZoom(const ZoomState& zoom) {
+  return zoom.min_ratio > 0.0F && zoom.min_ratio < zoom.max_ratio && std::isfinite(zoom.max_ratio) &&
+      zoom.ratio >= zoom.min_ratio && zoom.ratio <= zoom.max_ratio;
+}
+
+} // namespace
+
+struct ZoomRequest {
+  float ratio;
+  CallbackCompletion<CameraResult<void>> completion;
+};
 
 struct PhotoRequest {
   std::mutex mutex;
@@ -38,6 +54,67 @@ struct PhotoRequest {
 
 CameraSessionData::CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app)
     : status(value), tasks(scope), application(app) {}
+
+void CameraSessionData::InterruptZoom() {
+  ++zoom_generation;
+  auto active = std::exchange(active_zoom, {});
+  auto pending = std::exchange(pending_zoom, {});
+  for (const auto& request : {active, pending}) {
+    if (request) request->completion.Complete(
+        CameraResult<void>::Failure({CameraErrorCode::Interrupted, "Camera zoom was interrupted."}));
+  }
+}
+
+void CameraSessionData::ReadZoom() {
+  const auto update = [weak = weak_from_this(), scope = tasks, token = zoom_generation](std::optional<ZoomState> zoom) {
+    if (!zoom || !ValidZoom(*zoom)) return;
+    scope.Post([weak, token, zoom] {
+      if (auto owner = weak.lock(); owner && token == owner->zoom_generation &&
+          owner->status->state == SessionState::Running) {
+        CameraStatus value = owner->status;
+        value.zoom = zoom;
+        owner->status = std::move(value);
+      }
+    });
+  };
+  try {
+    backend->ReadZoom(update);
+  } catch (const std::exception&) {
+    // A failed control query leaves the capability unavailable.
+  }
+}
+
+void CameraSessionData::ApplyZoom() {
+  if (active_zoom || !pending_zoom) return;
+  active_zoom = std::exchange(pending_zoom, {});
+  const auto request = active_zoom;
+  const auto& zoom = *status->zoom;
+  const auto ratio = std::clamp(request->ratio, zoom.min_ratio, zoom.max_ratio);
+  auto complete = [weak = weak_from_this(), request, scope = tasks](CameraResult<ZoomState> result) {
+    scope.Post([weak, request, result = std::move(result)]() mutable {
+      auto owner = weak.lock();
+      if (!owner || owner->active_zoom != request) return;
+      owner->active_zoom.reset();
+      if (!result.Succeeded()) {
+        request->completion.Complete(CameraResult<void>::Failure(result.Error()));
+      } else if (!ValidZoom(result.Value())) {
+        request->completion.Complete(CameraResult<void>::Failure(
+            {CameraErrorCode::CaptureFailed, "The camera returned an invalid zoom range or ratio."}));
+      } else {
+        CameraStatus value = owner->status;
+        value.zoom = result.Value();
+        owner->status = std::move(value);
+        request->completion.Complete(CameraResult<void>::Success());
+      }
+      owner->ApplyZoom();
+    });
+  };
+  try {
+    backend->SetZoomRatio(ratio, complete);
+  } catch (const std::exception& error) {
+    complete(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+  }
+}
 
 void CameraSessionData::InterruptPhoto() {
   if (photo) {
@@ -108,6 +185,7 @@ void CameraSessionData::Reconcile() {
     const auto stopping_generation = ++generation;
     permission_check.Cancel();
     InterruptPhoto();
+    InterruptZoom();
     StopRecording();
     if (engaged) {
       engaged = false;
@@ -167,14 +245,21 @@ void CameraSessionData::Reconcile() {
             owner->failure = std::move(value.error);
             owner->Reconcile();
           } else {
+            const auto previous = owner->status->state;
             if (value.state == SessionState::Suspended) {
               owner->InterruptPhoto();
+              owner->InterruptZoom();
               owner->StopRecording();
             }
             value.capturing_photo = static_cast<bool>(owner->photo);
             value.recording_video = static_cast<bool>(owner->recording);
             value.recording_paused = value.recording_video && owner->status->recording_paused;
+            if (value.state == SessionState::Running && previous == SessionState::Running) {
+              value.zoom = owner->status->zoom;
+            }
+            const bool read_zoom = value.state == SessionState::Running && previous != SessionState::Running;
             owner->status = std::move(value);
+            if (read_zoom) owner->ReadZoom();
           }
         });
       });
@@ -203,6 +288,7 @@ void CameraSessionData::Close() {
   ++generation;
   permission_check.Cancel();
   InterruptPhoto();
+  InterruptZoom();
   StopRecording();
   Publish(SessionState::Closed);
   if (backend) {
@@ -229,6 +315,33 @@ Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> o
   co_return co_await RunWorker([request] { return request->Wait(); });
 }
 
+Task<CameraResult<void>> SetZoomRatio(std::shared_ptr<CameraSessionData> owner, float ratio) {
+  return AwaitCallback<CameraResult<void>>(
+      [owner = std::move(owner), ratio](CallbackCompletion<CameraResult<void>> complete) -> std::function<void()> {
+        if (owner->closed || !owner->engaged || owner->status->state != SessionState::Running) {
+          complete.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::NotReady, "Start the camera before adjusting zoom."}));
+          return {};
+        }
+        if (!owner->status->zoom) {
+          complete.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+          return {};
+        }
+        auto request = std::make_shared<ZoomRequest>(ZoomRequest{ratio, complete});
+        auto pending = std::exchange(owner->pending_zoom, request);
+        auto active = owner->backend->CanReplaceZoomRequest() ? std::exchange(owner->active_zoom, {}) : nullptr;
+        for (const auto& superseded : {pending, active}) {
+          if (superseded) superseded->completion.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::Interrupted, "A newer zoom request superseded this adjustment."}));
+        }
+        owner->ApplyZoom();
+        return [weak = owner->weak_from_this(), request] {
+          if (auto owner = weak.lock(); owner && owner->pending_zoom == request) owner->pending_zoom.reset();
+        };
+      });
+}
+
 } // namespace huxerui::camera::detail
 
 namespace huxerui::camera {
@@ -244,6 +357,13 @@ void CameraSession::Retry() const {
     data_->failure.reset();
     data_->Reconcile();
   }
+}
+
+Task<CameraResult<void>> CameraSession::SetZoomRatioAsync(float ratio) const {
+  if (!std::isfinite(ratio) || ratio <= 0.0F) {
+    throw std::invalid_argument("Camera zoom requires a positive finite ratio.");
+  }
+  return detail::SetZoomRatio(data_, ratio);
 }
 
 Task<CameraResult<ImageAsset>> CameraSession::CapturePhotoAsync(PhotoOptions options) const {

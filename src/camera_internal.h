@@ -83,6 +83,14 @@ public:
   virtual void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) = 0;
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
+  /// Reads the active capture configuration's zoom range and applied ratio.
+  virtual void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) { completed({}); }
+  /// Indicates that a new zoom submission can supersede an unconfirmed device adjustment.
+  virtual bool CanReplaceZoomRequest() const noexcept { return false; }
+  /// Applies a ratio on the active device and returns its confirmed state.
+  virtual void SetZoomRatio(float, std::function<void(CameraResult<ZoomState>)> completed) {
+    completed(CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+  }
   /// Delivers one independent, upright JPEG. Stop must wait for accepted platform photo work to finish cleanup.
   virtual void CapturePhoto(PhotoOptions, std::function<void(CameraResult<ImageAsset>)> completed) {
     completed(CameraResult<ImageAsset>::Failure(
