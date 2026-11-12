@@ -183,7 +183,8 @@ struct PreviewOutput {
 ///
 /// Return a published texture and its matching crop, rotation, and mirror state. You can return the source
 /// texture for a geometry-only change. Reuse the same texture object for successive frames with stable geometry
-/// so updates can redraw without recomposing. Camera acquires each accepted recording snapshot before the
+/// so updates can redraw without recomposing. When an output size is configured, Camera sizes this result
+/// before sharing it with preview and recording. Camera acquires each accepted recording snapshot before the
 /// next callback. Serialize other publications to the returned texture with this work.
 ///
 /// Returning an error or throwing fails the capture session and exposes the diagnostic through CameraStatus::error.
@@ -222,6 +223,20 @@ struct CameraOptions {
   /// Reuse the same factory across recompositions to keep capture open. Replacing it reopens active capture.
   /// Update synchronized effect parameters in place to change an effect during capture.
   std::shared_ptr<const FrameProcessorFactory> frame_processor_factory;
+  /// Width in physical pixels of the texture shared by preview and recording, before rotation.
+  ///
+  /// Set both output dimensions to zero to use the frame at its original size. When both are positive,
+  /// Camera center-crops within the frame's crop rectangle and scales to the requested size after processing.
+  /// The published crop then covers the entire texture with the frame's rotation and mirroring metadata.
+  /// An incomplete pair reports CameraErrorCode::ConfigurationFailed.
+  /// Processors must return a published GlTexture on Android, PixelBufferTexture on Apple platforms, or
+  /// D3D11Texture on Windows when sizing is enabled. The recording encoder's size requirements still apply.
+  /// Changing the size while active reopens capture and finishes any current recording. Still photos use
+  /// their independent capture path.
+  /// @see output_pixel_height, FrameProcessor, PreviewOutput
+  std::uint32_t output_pixel_width = 0;
+  /// Height in physical pixels of the shared texture, before rotation. Specify it together with output_pixel_width.
+  std::uint32_t output_pixel_height = 0;
 
   bool operator==(const CameraOptions&) const = default;
 };

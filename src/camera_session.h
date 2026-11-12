@@ -22,8 +22,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   ApplicationHandle application;
   std::shared_ptr<CameraBackend> backend;
   CameraOptions desired;
-  std::optional<Facing> opened_facing;
-  std::shared_ptr<const FrameProcessorFactory> opened_processor_factory;
+  CameraOptions opened;
   std::shared_ptr<FramePipeline> frames;
   std::shared_ptr<VideoRecording> recording;
   std::chrono::microseconds completed_recording_duration{};

@@ -6,24 +6,67 @@
 
 #include <huxerui/camera.h>
 
+#if defined(_WIN32)
+struct ID3D11DeviceContext;
+#endif
+
 namespace huxerui::camera::detail {
 
 inline constexpr char camera_module_name[] = "camera/Session";
 
 class VideoRecording;
 
-/// Applies one processor per capture frame and forwards its output to the active recording.
+inline constexpr Rect full_texture_crop{0, 0, 1, 1};
+
+/// Finds the centered region with the requested pixel aspect ratio inside a normalized source crop.
+Rect CropForOutput(Rect crop, std::uint32_t source_width, std::uint32_t source_height,
+                   std::uint32_t output_width, std::uint32_t output_height);
+
+#if defined(__ANDROID__)
+bool SupportsGlOutputSize(std::uint32_t width, std::uint32_t height);
+#endif
+
+/// Sizes processed frames on the capture producer's queue and retains one output texture identity.
+class TextureResizer {
+public:
+  TextureResizer();
+  ~TextureResizer();
+  /// Replaces the texture and crop in place. Returns false if the frame is temporarily unavailable.
+  bool Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height);
+  void Reset();
+#if defined(_WIN32)
+  void SetContext(ID3D11DeviceContext& context) { context_ = &context; }
+#endif
+
+private:
+  struct State;
+  std::unique_ptr<State> state_;
+#if defined(_WIN32)
+  ID3D11DeviceContext* context_ = nullptr;
+#endif
+};
+
+struct FrameProducer {
+  FrameProcessor processor;
+  TextureResizer resizer;
+};
+
+/// Processes and sizes one shared output per frame for preview and recording.
 class FramePipeline {
 public:
-  explicit FramePipeline(std::shared_ptr<const FrameProcessorFactory> factory);
-  /// Initializes the producer-owned processor on its first frame. Acquires the recording snapshot before return.
-  CameraResult<PreviewOutput> Process(FrameProcessor& processor, PreviewOutput input,
+  explicit FramePipeline(const CameraOptions& options);
+  /// Selects the initial render size when uniform scaling can produce the configured output directly.
+  std::pair<std::uint32_t, std::uint32_t> ProducerSize(std::uint32_t width, std::uint32_t height) const noexcept;
+  /// Acquires the recording snapshot before return. A success without a texture skips the frame.
+  CameraResult<PreviewOutput> Process(FrameProducer& producer, PreviewOutput input,
       std::chrono::nanoseconds capture_time, std::uint32_t pixel_width, std::uint32_t pixel_height);
   /// Called on the UI thread. An empty pointer detaches the recorder from subsequent frames.
   void SetRecording(std::shared_ptr<VideoRecording> recording);
 
 private:
   std::shared_ptr<const FrameProcessorFactory> factory_;
+  std::uint32_t output_width_;
+  std::uint32_t output_height_;
   std::mutex mutex_;
   std::shared_ptr<VideoRecording> recording_;
 };

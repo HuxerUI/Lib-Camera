@@ -103,7 +103,7 @@ void TestFrameProcessorFactory() {
   std::array expected_dimensions{width, height};
   int factory_calls = 0;
   std::weak_ptr<int> last_instance;
-  camera::detail::FramePipeline pipeline(std::make_shared<const FrameProcessorFactory>(
+  camera::detail::FramePipeline pipeline({.frame_processor_factory = std::make_shared<const FrameProcessorFactory>(
       [&](std::uint32_t pixel_width, std::uint32_t pixel_height) -> FrameProcessor {
         Check(pixel_width == expected_dimensions[0] && pixel_height == expected_dimensions[1],
               "The factory must receive the source texture's pixel dimensions.");
@@ -115,8 +115,8 @@ void TestFrameProcessorFactory() {
           output.rotation = ++*count == 1 ? PreviewRotation::R90 : PreviewRotation::R180;
           return CameraResult<PreviewOutput>::Success(std::move(output));
         };
-      }));
-  FrameProcessor first;
+      })});
+  camera::detail::FrameProducer first;
   Check(factory_calls == 0, "The factory must wait for a source frame.");
   auto output = pipeline.Process(first, input, timestamp, width, height);
   Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 1,
@@ -125,27 +125,52 @@ void TestFrameProcessorFactory() {
   output = pipeline.Process(first, input, timestamp, width, height);
   Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R180 && factory_calls == 1,
         "Successive frames must retain the producer's processor state.");
-  FrameProcessor next;
+  camera::detail::FrameProducer next;
   expected_dimensions = {height, width};
   output = pipeline.Process(next, input, timestamp, height, width);
   Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 2,
         "A new producer must get independent processor state.");
-  first = {};
+  first.processor = {};
   Check(first_instance.expired() && !last_instance.expired(), "Retiring one producer must release its processor.");
 
-  camera::detail::FramePipeline empty(
-      std::make_shared<const FrameProcessorFactory>([](std::uint32_t, std::uint32_t) { return FrameProcessor{}; }));
-  FrameProcessor invalid;
+  camera::detail::FramePipeline empty({.frame_processor_factory =
+      std::make_shared<const FrameProcessorFactory>([](std::uint32_t, std::uint32_t) { return FrameProcessor{}; })});
+  camera::detail::FrameProducer invalid;
   const auto missing = empty.Process(invalid, input, timestamp, width, height);
   Check(!missing.Succeeded() && missing.Error().code == CameraErrorCode::CaptureFailed,
         "An empty processor returned by the factory must fail capture.");
-  camera::detail::FramePipeline throwing(std::make_shared<const FrameProcessorFactory>(
+  camera::detail::FramePipeline throwing({.frame_processor_factory = std::make_shared<const FrameProcessorFactory>(
       [](std::uint32_t, std::uint32_t) -> FrameProcessor {
         throw std::runtime_error("Injected factory failure.");
-      }));
+      })});
   const auto failed = throwing.Process(invalid, input, timestamp, width, height);
   Check(!failed.Succeeded() && failed.Error().message == "Injected factory failure.",
         "The factory failure must reach the capture error.");
+}
+
+void TestOutputCrop() {
+  using camera::detail::CropForOutput;
+  const auto square = CropForOutput({0.125F, 0.25F, 0.75F, 0.5F}, 640, 480, 320, 320);
+  Check(square == Rect{0.3125F, 0.25F, 0.375F, 0.5F}, "Square output must center-crop the source horizontally.");
+  const auto wide = CropForOutput({-0.25F, 0.0F, 1.0F, 1.0F}, 640, 480, 640, 180);
+  Check(wide == Rect{0.0F, 0.359375F, 0.75F, 0.28125F}, "Wide output must center-crop within the clipped source.");
+}
+
+void TestProducerSize() {
+  using camera::detail::FramePipeline;
+  CameraOptions options{.output_pixel_width = 360, .output_pixel_height = 480};
+  FramePipeline direct(options);
+  Check(direct.ProducerSize(720, 960) == std::pair{360u, 480u},
+        "Uniform scaling can use the configured producer size.");
+  Check(direct.ProducerSize(720, 1280) == std::pair{720u, 1280u},
+        "A change in aspect ratio needs the original producer size.");
+  options.frame_processor_factory = std::make_shared<const FrameProcessorFactory>();
+  FramePipeline processed(options);
+  Check(processed.ProducerSize(720, 960) == std::pair{720u, 960u},
+        "A custom processor must receive the original producer size.");
+  FramePipeline defaults(CameraOptions{});
+  Check(defaults.ProducerSize(720, 960) == std::pair{720u, 960u},
+        "The default output must use the original producer size.");
 }
 
 class TestPlatform final : public UiWindow, public huxerui::Runtime {
@@ -271,6 +296,12 @@ void TestSessionLifetime() {
       }
       Check(rejected, "Invalid JPEG quality must throw before a task is returned.");
     }
+    requested = CameraOptions{.output_pixel_width = 640};
+    runtime.BuildFrame();
+    platform.Drain(runtime);
+    Check(retained_session->Status().state == SessionState::Failed &&
+              retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
+          "An incomplete output size must fail before opening capture.");
     requested = CameraOptions{.active = true};
     runtime.BuildFrame();
     platform.Drain(runtime);
@@ -466,7 +497,7 @@ void TestPhotoRequests() {
     std::optional<CameraResult<ImageAsset>> result;
     fixture.Launch(result);
     fixture.Drain();
-    Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened_facing,
+    Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened.facing,
           "Interruption scenarios must start with a healthy, matching camera configuration.");
     auto options = CameraOptions{};
     if (!background)
@@ -509,17 +540,16 @@ template <class T, class E> T TakeRecordingResult(Result<T, E> result) {
   if constexpr (!std::is_void_v<T>) return std::move(result).Value();
 }
 
-std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t green) {
-  constexpr auto size = 64;
+std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t green, int width = 64, int height = 64) {
   CVPixelBufferRef pixels = nullptr;
-  Check(CVPixelBufferCreate(nullptr, size, size, kCVPixelFormatType_32BGRA, nullptr, &pixels) == kCVReturnSuccess,
+  Check(CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_32BGRA, nullptr, &pixels) == kCVReturnSuccess,
         "Cannot allocate a test camera frame.");
   const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
       owner(pixels, CVPixelBufferRelease);
   Check(CVPixelBufferLockBaseAddress(pixels, 0) == kCVReturnSuccess, "Cannot lock a test camera frame.");
-  for (int row = 0; row < size; ++row) {
+  for (int row = 0; row < height; ++row) {
     auto* pixel = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddress(pixels)) + row * CVPixelBufferGetBytesPerRow(pixels);
-    for (int column = 0; column < size; ++column) {
+    for (int column = 0; column < width; ++column) {
       *pixel++ = 0;
       *pixel++ = green;
       *pixel++ = red;
@@ -527,7 +557,7 @@ std::shared_ptr<ExternalTexture> SolidTexture(std::uint8_t red, std::uint8_t gre
     }
   }
   CVPixelBufferUnlockBaseAddress(pixels, 0);
-  auto texture = std::make_shared<macos::PixelBufferTexture>(Size{size, size});
+  auto texture = std::make_shared<macos::PixelBufferTexture>(Size{static_cast<float>(width), static_cast<float>(height)});
   texture->Publish(pixels);
   return texture;
 }
@@ -536,7 +566,7 @@ void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
   using namespace std::chrono_literals;
   using namespace huxerui::media;
   const auto owner = fixture.context.owner;
-  owner->frames = std::make_shared<camera::detail::FramePipeline>(nullptr);
+  owner->frames = std::make_shared<camera::detail::FramePipeline>(CameraOptions{});
   std::optional<CameraResult<void>> result;
   auto task = fixture.context.callers->Launch([owner, file, &result]() -> Task<void> {
     result = co_await camera::detail::RecordVideo(owner, file);
@@ -544,13 +574,13 @@ void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
   fixture.Drain();
   Check(owner->status->recording_video, "Recording did not start.");
 
-  FrameProcessor processor;
+  camera::detail::FrameProducer producer;
   owner->SetRecordingPaused(true);
   owner->SetRecordingPaused(true);
   Check(owner->status->recording_paused && owner->status->recording_video,
         "Pausing must keep the recording in progress.");
   const auto unpublished = std::make_shared<macos::PixelBufferTexture>(Size{64.0F, 64.0F});
-  const auto preview = TakeRecordingResult(owner->frames->Process(processor, {.texture = unpublished}, 1s, 64, 64));
+  const auto preview = TakeRecordingResult(owner->frames->Process(producer, {.texture = unpublished}, 1s, 64, 64));
   Check(preview.texture == unpublished, "Preview must continue while recording is paused.");
   owner->SetRecordingPaused(false);
   Check(!owner->status->recording_paused, "Resuming must clear the pause state.");
@@ -560,7 +590,7 @@ void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
   const auto capture_until = [&](std::chrono::microseconds duration, std::chrono::milliseconds step) {
     fixture.platform.Await(fixture.runtime, [&] {
       if (result || owner->RecordedDuration() > duration) return true;
-      TakeRecordingResult(owner->frames->Process(processor, {.texture = input}, timestamp, 64, 64));
+      TakeRecordingResult(owner->frames->Process(producer, {.texture = input}, timestamp, 64, 64));
       timestamp += step;
       return false;
     });
@@ -590,9 +620,12 @@ void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
         "Reported duration must match the MP4 after resuming.");
 }
 
+constexpr std::uint32_t recording_width = 96;
+constexpr std::uint32_t recording_height = 64;
+
 template <class Destination>
-void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, const File& file, Destination destination,
-                       media::ContainerLayout layout, bool unmount = false) {
+std::shared_ptr<ExternalTexture> TestRecordedFrame(PhotoTestFixture& fixture, camera::detail::FrameProducer& producer,
+    const File& file, Destination destination, media::ContainerLayout layout, bool unmount = false) {
   using namespace huxerui::media;
   std::optional<CameraResult<void>> result;
   const auto owner = fixture.context.owner;
@@ -606,8 +639,15 @@ void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, con
 
   const auto input = SolidTexture(255, 0);
   const auto preview = TakeRecordingResult(
-      owner->frames->Process(processor, {.texture = input}, std::chrono::seconds(17), 64, 64));
-  Check(preview.texture != input && preview.rotation == PreviewRotation::R90, "Preview bypassed the frame processor.");
+      owner->frames->Process(producer, {.texture = input}, std::chrono::seconds(17), 64, 64));
+  Check(preview.rotation == PreviewRotation::R90 && preview.mirrored && preview.crop == Rect{0, 0, 1, 1},
+        "Sizing must consume the processed crop and preserve rotation and mirroring.");
+  const auto* texture = dynamic_cast<const macos::PixelBufferTexture*>(preview.texture.get());
+  const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
+      pixels(texture ? texture->AcquireFrame() : nullptr, CVPixelBufferRelease);
+  Check(pixels && CVPixelBufferGetWidth(pixels.get()) == recording_width &&
+            CVPixelBufferGetHeight(pixels.get()) == recording_height,
+        "Preview texture must have the requested physical dimensions.");
   if (unmount) {
     fixture.context.visible = false;
     fixture.Drain();
@@ -625,6 +665,9 @@ void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, con
   const auto& format = track.descriptions.front();
   Check(track.kind == TrackKind::Video && track.rotation == VideoRotation::Clockwise90 && format.codec == CodecId::H264,
         "Recording lost the processed frame geometry.");
+  const auto visible = format.visible.value_or(VideoRectangle{0, 0, *format.coded_width, *format.coded_height});
+  Check(visible.width == recording_width && visible.height == recording_height,
+        "The visible video frame must have the requested preview texture dimensions.");
   auto decoder = TakeRecordingResult(VideoDecoder::Create({.initialization_data = format.initialization_data,
       .width = *format.coded_width, .height = *format.coded_height}));
   Check(TakeRecordingResult(demuxer.Read()).has_value(), "Missing video track configuration.");
@@ -654,6 +697,7 @@ void TestRecordedFrame(PhotoTestFixture& fixture, FrameProcessor& processor, con
     }
     return false;
   });
+  return preview.texture;
 }
 
 void TestRecording() {
@@ -669,22 +713,26 @@ void TestRecording() {
   auto factory = std::make_shared<const FrameProcessorFactory>([&](std::uint32_t width, std::uint32_t height) -> FrameProcessor {
     Check(width == 64 && height == 64, "The recording factory must receive the source frame size.");
     ++factory_calls;
-    return [green = SolidTexture(0, 255)](const PreviewOutput&, std::chrono::nanoseconds timestamp) {
+    return [green = SolidTexture(0, 255, 128, 96)](const PreviewOutput&, std::chrono::nanoseconds timestamp) {
       Check(timestamp == std::chrono::seconds(17), "The frame processor received the wrong capture timestamp.");
-      return CameraResult<PreviewOutput>::Success({.texture = green, .rotation = PreviewRotation::R90});
+      return CameraResult<PreviewOutput>::Success({.texture = green, .crop = {0.125F, 0.125F, 0.75F, 0.75F},
+                                                  .rotation = PreviewRotation::R90, .mirrored = true});
     };
   });
-  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(std::move(factory));
-  FrameProcessor processor;
+  fixture.context.owner->frames = std::make_shared<camera::detail::FramePipeline>(
+      CameraOptions{.frame_processor_factory = std::move(factory), .output_pixel_width = recording_width,
+                    .output_pixel_height = recording_height});
+  camera::detail::FrameProducer producer;
   const File file((directory.path / "file.mp4").u8string());
   const File seekable((directory.path / "seekable.mp4").u8string());
   const File sequential((directory.path / "sequential.mp4").u8string());
-  TestRecordedFrame(fixture, processor, file, file, media::ContainerLayout::Default);
-  TestRecordedFrame(fixture, processor, seekable,
+  const auto first = TestRecordedFrame(fixture, producer, file, file, media::ContainerLayout::Default);
+  const auto second = TestRecordedFrame(fixture, producer, seekable,
       TakeRecordingResult(seekable.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew)),
       media::ContainerLayout::Default);
-  TestRecordedFrame(fixture, processor, sequential, TakeRecordingResult(sequential.OpenWrite()),
-                    media::ContainerLayout::Fragmented, true);
+  const auto third = TestRecordedFrame(fixture, producer, sequential, TakeRecordingResult(sequential.OpenWrite()),
+                                       media::ContainerLayout::Fragmented, true);
+  Check(first == second && first == third, "Sized frames must reuse the preview texture identity.");
   Check(factory_calls == 1, "Recording starts and stops must share the producer's processor.");
 }
 #endif
@@ -695,6 +743,8 @@ int main() {
   try {
     TestGeometry();
     TestFrameProcessorFactory();
+    TestOutputCrop();
+    TestProducerSize();
     TestSessionLifetime();
     TestPhotoRequests();
 #if defined(HUXERUI_CAMERA_TEST_RECORDING)

@@ -98,8 +98,11 @@ void CameraSessionData::Reconcile() {
   if (closed || !backend || status->state == SessionState::Stopping) {
     return;
   }
-  const bool configuration_changed = desired.facing != opened_facing ||
-      desired.frame_processor_factory != opened_processor_factory;
+  if (desired.active && !background && !failure &&
+      ((desired.output_pixel_width == 0) != (desired.output_pixel_height == 0))) {
+    failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both camera output dimensions."};
+  }
+  const bool configuration_changed = desired != opened;
   if (!desired.active || background || failure ||
       ((engaged || status->state == SessionState::Starting) && configuration_changed)) {
     const auto stopping_generation = ++generation;
@@ -129,8 +132,7 @@ void CameraSessionData::Reconcile() {
   if (engaged || status->state == SessionState::Starting) {
     return;
   }
-  opened_facing = desired.facing;
-  opened_processor_factory = desired.frame_processor_factory;
+  opened = desired;
   Publish(SessionState::Starting);
   const auto opening_generation = ++generation;
   const auto weak = weak_from_this();
@@ -152,10 +154,10 @@ void CameraSessionData::Reconcile() {
         self->Settle();
         co_return;
       }
-      self->frames = std::make_shared<FramePipeline>(self->opened_processor_factory);
+      self->frames = std::make_shared<FramePipeline>(self->opened);
       self->backend->SetFramePipeline(self->frames);
       self->engaged = true;
-      self->backend->Start(self->opened_facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
+      self->backend->Start(self->opened.facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
         scope.Post([weak, opening_generation, value = std::move(value)]() mutable {
           auto owner = weak.lock();
           if (!owner || owner->closed || owner->generation != opening_generation) {
@@ -188,7 +190,7 @@ void CameraSessionData::Reconcile() {
 void CameraSessionData::Settle() {
   if (backend) backend->SetFramePipeline({});
   frames.reset();
-  opened_processor_factory.reset();
+  opened = {};
   Publish(failure ? SessionState::Failed
                   : (desired.active && background ? SessionState::Suspended : SessionState::Stopped));
 }
@@ -208,7 +210,7 @@ void CameraSessionData::Close() {
     backend.reset();
   }
   frames.reset();
-  opened_processor_factory.reset();
+  opened = {};
   desired.frame_processor_factory.reset();
 }
 

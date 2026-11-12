@@ -143,6 +143,7 @@ public:
       throw E_INVALIDARG;
     Require(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                nullptr, 0, D3D11_SDK_VERSION, &device_, nullptr, &context_));
+    producer_.resizer.SetContext(*context_.Get());
     D3D11_TEXTURE2D_DESC description{};
     description.Width = width;
     description.Height = height;
@@ -212,12 +213,12 @@ public:
         Require(sample->GetSampleTime(&time));
         const auto capture_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>(time));
-        auto processed = pipeline_->Process(processor_, {.texture = texture, .rotation = rotation_},
+        auto processed = pipeline_->Process(producer_, {.texture = texture, .rotation = rotation_},
             capture_time, width_, height_);
         if (!processed.Succeeded()) {
           finished_ = true;
           events->Fail(E_FAIL, processed.Error());
-        } else if (processed.Value() != preview_) {
+        } else if (processed.Value().texture && processed.Value() != preview_) {
           preview_ = std::move(processed).Value();
           if (running_) Publish();
         }
@@ -240,7 +241,8 @@ public:
     // Publication and Finish share this lock, including the source device's immediate context.
     std::lock_guard lock(mutex_);
     finished_ = true;
-    processor_ = {};
+    producer_.processor = {};
+    producer_.resizer.Reset();
     if (texture)
       texture->Finish();
     preview_.reset();
@@ -277,7 +279,7 @@ private:
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<ID3D11Texture2D> upload_;
-  FrameProcessor processor_;
+  FrameProducer producer_;
 };
 
 std::optional<Facing> DeviceFacing(IMFActivate* device) {

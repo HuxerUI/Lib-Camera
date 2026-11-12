@@ -18,6 +18,7 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 using huxerui::camera::detail::FramePipeline;
+using huxerui::camera::detail::FrameProducer;
 
 namespace {
 
@@ -239,7 +240,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   NSMutableArray* observers_;
   std::shared_ptr<ios::PixelBufferTexture> texture_;
   std::shared_ptr<FramePipeline> frames_;
-  FrameProcessor processor_;
+  FrameProducer producer_;
   std::optional<PreviewOutput> preview_;
   std::optional<Facing> facing_;
   PreviewRotation rotation_;
@@ -456,7 +457,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     const auto height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(buffer));
     const huxerui::Size size{static_cast<float>(width), static_cast<float>(height)};
     if (!texture_ || texture_->IntrinsicSize() != size) {
-      processor_ = {};
+      producer_.processor = {};
       if (texture_) {
         texture_->Finish();
       }
@@ -468,7 +469,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
                                           kCMTimeRoundingMethod_Default);
       if (!CMTIME_IS_NUMERIC(time)) return;
-      auto processed = frames_->Process(processor_, std::move(frame), std::chrono::nanoseconds(time.value), width, height);
+      auto processed = frames_->Process(producer_, std::move(frame), std::chrono::nanoseconds(time.value), width, height);
       if (!processed.Succeeded()) {
         failed_ = true;
         changed_({.state = SessionState::Failed, .error = processed.Error()});
@@ -476,7 +477,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       }
       frame = std::move(processed).Value();
     }
-    if (frame != preview_) {
+    if (frame.texture && frame != preview_) {
       preview_ = std::move(frame);
       [self publish];
     }
@@ -575,7 +576,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     [observers_ removeAllObjects];
     [output_ setSampleBufferDelegate:nil queue:nullptr];
     [session_ stopRunning];
-    processor_ = {};
+    producer_.processor = {};
+    producer_.resizer.Reset();
     output_ = nil;
     device_ = nil;
     if (texture_) {

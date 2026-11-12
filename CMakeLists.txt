@@ -60,6 +60,7 @@ endif ()
 if (IOS)
     list(APPEND LIBRARY_SOURCE_FILES
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/camera.mm"
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/output_texture.mm"
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/src/recording_frame.mm"
     )
 endif ()
@@ -117,7 +118,11 @@ endif ()
 
 if (WIN32)
     target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 windowscodecs runtimeobject ole32 oleaut32)
+    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 d2d1 windowscodecs runtimeobject ole32 oleaut32)
+endif ()
+
+if (ANDROID)
+    target_link_libraries(huxerui_camera PRIVATE EGL GLESv2)
 endif ()
 
 if (APPLE)

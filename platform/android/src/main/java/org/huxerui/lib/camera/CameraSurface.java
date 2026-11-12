@@ -91,8 +91,8 @@ final class CameraSurface {
     private final FrameThread worker;
     private final int sourceWidth;
     private final int sourceHeight;
-    private final int width;
-    private final int height;
+    // Native setup may replace these dimensions before the first draw.
+    private final int[] renderSize;
     private final int rotation;
     private final boolean mirrored;
     private final long frames;
@@ -116,8 +116,7 @@ final class CameraSurface {
         this.frames = frames;
         sourceWidth = width;
         sourceHeight = height;
-        this.width = swapped ? height : width;
-        this.height = swapped ? width : height;
+        renderSize = swapped ? new int[]{height, width} : new int[]{width, height};
         this.rotation = rotation;
         this.mirrored = mirrored;
         vertices.put(new float[]{-1, -1, 1, -1, -1, 1, 1, 1}).position(0);
@@ -191,7 +190,7 @@ final class CameraSurface {
         source = new SurfaceTexture(textures[0]);
         source.setDefaultBufferSize(sourceWidth, sourceHeight);
         surface = new Surface(source);
-        output = createOutput(frames, width, height, rotation, mirrored);
+        output = createOutput(frames, renderSize, rotation, mirrored);
     }
 
     private PlatformPayload render() {
@@ -202,6 +201,8 @@ final class CameraSurface {
         if (timestamp == lastTimestamp) return null;
         lastTimestamp = timestamp;
         source.getTransformMatrix(transform);
+        int width = renderSize[0];
+        int height = renderSize[1];
         // Redefine the image storage to detach it from the previous frame's EGLImage.
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[1]);
@@ -277,7 +278,7 @@ final class CameraSurface {
         }
     }
 
-    private static native long createOutput(long frames, int width, int height, int rotation, boolean mirrored);
+    private static native long createOutput(long frames, int[] renderSize, int rotation, boolean mirrored);
     private static native PlatformPayload processFrame(long output, int texture, long timestamp);
     private static native void finishOutput(long output);
 }

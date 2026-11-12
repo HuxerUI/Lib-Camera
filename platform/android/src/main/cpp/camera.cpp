@@ -177,7 +177,7 @@ struct CameraOutput {
   PreviewRotation rotation;
   bool mirrored;
   std::optional<PreviewOutput> published;
-  FrameProcessor processor;
+  camera::detail::FrameProducer producer;
 };
 
 void ThrowJava(JNIEnv* env, const std::exception& error) {
@@ -189,16 +189,35 @@ void ThrowJava(JNIEnv* env, const std::exception& error) {
 } // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_org_huxerui_lib_camera_CameraSurface_createOutput(JNIEnv* env, jclass, jlong pipeline, jint width, jint height,
+Java_org_huxerui_lib_camera_CameraSurface_createOutput(JNIEnv* env, jclass, jlong pipeline, jintArray render_size,
                                                        jint rotation, jboolean mirrored) {
   try {
+    jint dimensions[2]{};
+    env->GetIntArrayRegion(render_size, 0, 2, dimensions);
+    if (env->ExceptionCheck()) return 0;
+    auto& [width, height] = dimensions;
     if (width <= 0 || height <= 0 || rotation < 0 || rotation > 270 || rotation % 90 != 0) {
       throw std::invalid_argument("Invalid camera output geometry.");
     }
-    auto output = std::make_unique<CameraOutput>(CameraOutput{
+    auto frames = camera::detail::FindPipeline(pipeline);
+    if (frames) {
+      const auto source_width = static_cast<std::uint32_t>(width);
+      const auto source_height = static_cast<std::uint32_t>(height);
+      const auto [target_width, target_height] = frames->ProducerSize(source_width, source_height);
+      if (target_width != source_width || target_height != source_height) {
+        if (!camera::detail::SupportsGlOutputSize(target_width, target_height)) {
+          throw std::invalid_argument("The requested camera output exceeds OpenGL ES limits.");
+        }
+        width = static_cast<jint>(target_width);
+        height = static_cast<jint>(target_height);
+        env->SetIntArrayRegion(render_size, 0, 2, dimensions);
+        if (env->ExceptionCheck()) return 0;
+      }
+    }
+    auto output = std::make_unique<CameraOutput>(
         std::make_shared<android::GlTexture>(Size{static_cast<float>(width), static_cast<float>(height)}),
-        camera::detail::FindPipeline(pipeline), width, height, static_cast<PreviewRotation>(rotation / 90),
-        mirrored == JNI_TRUE});
+        std::move(frames), width, height, static_cast<PreviewRotation>(rotation / 90),
+        mirrored == JNI_TRUE);
     return reinterpret_cast<jlong>(output.release());
   } catch (const std::exception& error) {
     ThrowJava(env, error);
@@ -214,12 +233,12 @@ Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlon
         .pixel_width = output.width, .pixel_height = output.height, .alpha = android::GlTexture::Alpha::Opaque});
     PreviewOutput preview{.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored};
     if (output.frames) {
-      auto processed = output.frames->Process(output.processor, std::move(preview), std::chrono::nanoseconds(time),
+      auto processed = output.frames->Process(output.producer, std::move(preview), std::chrono::nanoseconds(time),
           static_cast<std::uint32_t>(output.width), static_cast<std::uint32_t>(output.height));
       if (!processed.Succeeded()) throw std::runtime_error(processed.Error().message);
       preview = std::move(processed).Value();
     }
-    if (preview == output.published) return nullptr;
+    if (!preview.texture || preview == output.published) return nullptr;
     output.published = preview;
     return android::PlatformPayloadToJava(env, PlatformPayload(PlatformPayload::Object{
         {"texture", preview.texture}, {"x", double(preview.crop.x)}, {"y", double(preview.crop.y)},
@@ -235,7 +254,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_org_huxerui_lib_camera_CameraSurface_finishOutput(JNIEnv*, jclass, jlong handle) {
   const std::unique_ptr<CameraOutput> output(reinterpret_cast<CameraOutput*>(handle));
   if (output) {
-    output->processor = {};
+    output->producer.processor = {};
+    output->producer.resizer.Reset();
     output->texture->Finish();
   }
 }

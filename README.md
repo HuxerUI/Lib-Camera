@@ -65,6 +65,7 @@ Configure capture through `CameraOptions`:
 | --- | --- | --- |
 | `active` | `true` | Starts or stops capture asynchronously. Capture suspends in the background. |
 | `facing` | Empty | Selects the default camera. `Facing::Front` or `Facing::Back` requires that facing, without falling back to the opposite one. |
+| `output_pixel_width`, `output_pixel_height` | Both `0` | Set both to positive pixel counts to size the shared preview and recording texture before rotation. Changing the pair reopens active capture and finishes any current recording. |
 
 Configure each preview through `PreviewOptions`:
 
@@ -165,8 +166,15 @@ static const auto factory = std::make_shared<const camera::FrameProcessorFactory
       };
     });
 
-auto session = camera::UseCamera({.active = active, .frame_processor_factory = factory});
+auto session = camera::UseCamera({
+    .active = active,
+    .frame_processor_factory = factory,
+    .output_pixel_width = 1280,
+    .output_pixel_height = 720,
+});
 ```
+
+With an output size configured, Camera center-crops within the processed frame's crop and scales to the requested physical pixel dimensions. The resulting texture has a full-frame crop and retains the frame's rotation and mirroring metadata. Both zero values use the processed frame at its original size. Still photos use their independent output, and video sizes must satisfy the recording encoder's requirements.
 
 Run `session.RecordVideoAsync(destination)` in a task and call `session.StopRecording()` from the stop action. The task returns after the encoder drains and the muxer closes the output. `CameraStatus::recording_video` stays true during recording, pauses, and finalization. Stopping capture, switching cameras, or backgrounding finalizes a recording with captured frames. The file contains one H.264 video track. The recording uses the initial frame's dimensions and stores its crop and rotation as MP4 presentation metadata. Preview fitting and mirroring remain per-view settings.
 
