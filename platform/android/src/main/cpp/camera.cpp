@@ -89,6 +89,8 @@ public:
           }
           const auto& facing = fields.at("facing");
           if (!facing.IsNull()) status.actual_facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
+          const auto& device_id = fields.at("deviceId");
+          if (!device_id.IsNull()) status.actual_device_id = std::string(device_id.AsString());
           status.can_focus_and_meter = fields.at("canFocusAndMeter").AsBoolean();
           const auto& capture = fields.at("captureFormat");
           if (!capture.IsNull()) {
@@ -127,7 +129,35 @@ public:
     });
   }
 
-  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    return AwaitCallback<CameraDevicesResult>([channel = channel_](CallbackCompletion<CameraDevicesResult> completion)
+        -> std::function<void()> {
+      const auto request = channel.Invoke("enumerateDevices", PlatformPayload{}, [completion](PlatformResult<PlatformPayload> result) {
+        if (const auto* error = std::get_if<PlatformError>(&result)) {
+          completion.Complete(CameraDevicesResult::Failure({DecodeError(error->code), error->message}));
+          return;
+        }
+        try {
+          std::vector<CameraDevice> devices;
+          for (const auto& entry : std::get<PlatformPayload>(result).AsList()) {
+            const auto& fields = entry.AsObject();
+            CameraDevice device{.id = std::string(fields.at("id").AsString()),
+                                .name = std::string(fields.at("name").AsString())};
+            const auto& facing = fields.at("facing");
+            if (!facing.IsNull()) device.facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
+            devices.push_back(std::move(device));
+          }
+          completion.Complete(CameraDevicesResult::Success(std::move(devices)));
+        } catch (const std::exception& error) {
+          completion.Complete(CameraDevicesResult::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+        }
+      });
+      return [channel, request] { channel.Cancel(request); };
+    });
+  }
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
     changed_ = std::move(changed);
     const auto run = ++run_;
     if (frame_pipeline_) {
@@ -137,6 +167,7 @@ public:
     }
     auto weak = weak_from_this();
     PlatformPayload::Object arguments{{"run", run}, {"frames", pipeline_},
+        {"deviceId", device_id ? PlatformPayload(*device_id) : PlatformPayload{}},
         {"captureWidth", static_cast<std::int64_t>(preferred.pixel_width)},
         {"captureHeight", static_cast<std::int64_t>(preferred.pixel_height)},
         {"captureFps", preferred.fps ? PlatformPayload(*preferred.fps) : PlatformPayload{}},

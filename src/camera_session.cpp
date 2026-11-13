@@ -279,7 +279,9 @@ void CameraSessionData::Reconcile() {
     return;
   }
   if (desired.active && !background && !failure) {
-    if ((desired.output_pixel_width == 0) != (desired.output_pixel_height == 0)) {
+    if (desired.device_id && (desired.device_id->empty() || desired.facing)) {
+      failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify a nonempty camera ID or a camera facing."};
+    } else if ((desired.output_pixel_width == 0) != (desired.output_pixel_height == 0)) {
       failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both camera output dimensions."};
     } else if ((desired.preferred_capture_pixel_width == 0) != (desired.preferred_capture_pixel_height == 0)) {
       failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both preferred camera capture dimensions."};
@@ -330,13 +332,7 @@ void CameraSessionData::Reconcile() {
         co_return;
       }
       if (permission != PermissionStatus::Granted) {
-        CameraErrorCode code = CameraErrorCode::PermissionDenied;
-        if (permission == PermissionStatus::NotDetermined) {
-          code = CameraErrorCode::PermissionRequired;
-        } else if (permission == PermissionStatus::Unavailable) {
-          code = CameraErrorCode::Unavailable;
-        }
-        self->failure = CameraError{code, "Camera access is not authorized or available."};
+        self->failure = CameraPermissionError(permission);
         self->Settle();
         co_return;
       }
@@ -383,7 +379,7 @@ void CameraSessionData::Reconcile() {
           }
         });
       };
-      self->backend->Start(self->opened.facing, {self->opened.preferred_capture_pixel_width,
+      self->backend->Start(self->opened.facing, self->opened.device_id, {self->opened.preferred_capture_pixel_width,
           self->opened.preferred_capture_pixel_height, self->opened.preferred_capture_fps}, std::move(changed));
     } catch (const std::exception& error) {
       if (auto self = weak.lock(); self && !self->closed && self->generation == opening_generation) {

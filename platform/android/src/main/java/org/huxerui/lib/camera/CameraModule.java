@@ -6,7 +6,10 @@ import android.graphics.Rect;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
+import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,6 +22,7 @@ import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 import androidx.camera.camera2.interop.Camera2CameraInfo;
+import androidx.camera.camera2.interop.Camera2Interop;
 import androidx.camera.core.Camera;
 import androidx.camera.core.CameraControl;
 import androidx.camera.core.CameraInfo;
@@ -67,6 +71,17 @@ import java.util.concurrent.Executors;
 
 public final class CameraModule implements HuxerUIPlatformModule.Factory {
     @androidx.camera.camera2.interop.ExperimentalCamera2Interop
+    private static String cameraId(CameraInfo info) {
+        return Camera2CameraInfo.from(info).getCameraId();
+    }
+
+    private static String cameraFacing(CameraInfo info) {
+        int lens = info.getLensFacing();
+        return lens == CameraSelector.LENS_FACING_FRONT ? "front"
+                : lens == CameraSelector.LENS_FACING_BACK ? "back" : null;
+    }
+
+    @androidx.camera.camera2.interop.ExperimentalCamera2Interop
     private static boolean usesRealtimeTimestamps(CameraInfo info) {
         try {
             Integer source = Camera2CameraInfo.from(info)
@@ -91,6 +106,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private final Executor executor = command -> main.post(command);
         private final LifecycleRegistry lifecycle = new LifecycleRegistry(this);
         private final DisplayManager displays;
+        private final CameraManager cameraManager;
         private final Set<Output> outputs = new HashSet<>();
         private final ArrayList<HuxerUIPlatformChannel.Result> stops = new ArrayList<>();
         private ProcessCameraProvider provider;
@@ -116,11 +132,13 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private boolean supportsPointControl;
         private boolean disposed;
         private String facing;
+        private String deviceId;
 
         Session(Context context, HuxerUIPlatformChannel.Events events) {
             this.context = context;
             this.events = events;
             displays = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+            cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE);
         }
 
@@ -141,12 +159,15 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 run = arguments.requireField("run").requireInt64();
                 frames = arguments.requireField("frames").requireInt64();
                 PlatformPayload requested = arguments.requireField("facing");
+                PlatformPayload id = arguments.requireField("deviceId");
                 long width = arguments.requireField("captureWidth").requireInt64();
                 long height = arguments.requireField("captureHeight").requireInt64();
                 PlatformPayload rate = arguments.requireField("captureFps");
-                start(requested.isNull() ? null : requested.requireString(), width, height,
+                start(requested.isNull() ? null : requested.requireString(), id.isNull() ? null : id.requireString(), width, height,
                         rate.isNull() ? null : rate.requireDouble());
                 result.complete(PlatformPayload.nullValue());
+            } else if (method.equals("enumerateDevices")) {
+                enumerateDevices(result);
             } else if (method.equals("capturePhoto")) {
                 capturePhoto(arguments, result);
             } else if (method.equals("readZoom")) {
@@ -176,10 +197,44 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             return null;
         }
 
-        private void start(String requested, long width, long height, Double fps) {
+        private void enumerateDevices(HuxerUIPlatformChannel.Result result) {
+            try {
+                ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(context);
+                future.addListener(() -> {
+                    if (disposed) return;
+                    try {
+                        ArrayList<PlatformPayload> devices = new ArrayList<>();
+                        for (CameraInfo info : future.get().getAvailableCameraInfos()) {
+                            String id = cameraId(info);
+                            String side = cameraFacing(info);
+                            String name = "Camera " + id;
+                            if ("front".equals(side)) name = "Front camera " + id;
+                            else if ("back".equals(side)) name = "Rear camera " + id;
+                            else if (info.getLensFacing() == CameraSelector.LENS_FACING_EXTERNAL)
+                                name = "External camera " + id;
+                            Map<String, PlatformPayload> entry = new HashMap<>();
+                            entry.put("id", PlatformPayload.string(id));
+                            entry.put("name", PlatformPayload.string(name));
+                            entry.put("facing", side == null ? PlatformPayload.nullValue() : PlatformPayload.string(side));
+                            devices.add(PlatformPayload.object(entry));
+                        }
+                        result.complete(PlatformPayload.list(devices));
+                    } catch (Exception error) {
+                        result.fail(error instanceof SecurityException ? "permission-denied" : "capture-failed",
+                                error.toString(), PlatformPayload.nullValue());
+                    }
+                }, executor);
+            } catch (RuntimeException error) {
+                result.fail(error instanceof SecurityException ? "permission-denied" : "unavailable",
+                        error.toString(), PlatformPayload.nullValue());
+            }
+        }
+
+        private void start(String requested, String requestedId, long width, long height, Double fps) {
             active = true;
             opened = false;
             facing = null;
+            deviceId = null;
             long token = ++generation;
             try {
                 ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(context);
@@ -187,11 +242,12 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                     if (!active || token != generation) return;
                     try {
                         provider = future.get();
-                        bind(requested, width, height, fps, token);
+                        bind(requested, requestedId, width, height, fps, token);
                     } catch (SecurityException error) {
                         fail("permission-denied", error.toString());
                     } catch (Exception error) {
-                        fail("configuration-failed", error.toString());
+                        if (deviceIsGone()) reportDeviceLoss();
+                        else fail("configuration-failed", error.toString());
                     }
                 }, executor);
             } catch (Exception error) {
@@ -199,9 +255,16 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             }
         }
 
-        private void bind(String requested, long width, long height, Double fps, long token) {
+        private void bind(String requested, String requestedId, long width, long height, Double fps, long token) {
             CameraInfo selected = null;
             for (CameraInfo candidate : provider.getAvailableCameraInfos()) {
+                if (requestedId != null) {
+                    if (requestedId.equals(cameraId(candidate))) {
+                        selected = candidate;
+                        break;
+                    }
+                    continue;
+                }
                 int lens = candidate.getLensFacing();
                 if (requested == null) {
                     if (selected == null || lens == CameraSelector.LENS_FACING_BACK) selected = candidate;
@@ -213,12 +276,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 }
             }
             if (selected == null) {
-                fail("device-not-found", "No camera matches the requested facing.");
+                fail("device-not-found", "No camera matches the requested selection.");
                 return;
             }
-            int lens = selected.getLensFacing();
-            facing = lens == CameraSelector.LENS_FACING_FRONT ? "front"
-                    : lens == CameraSelector.LENS_FACING_BACK ? "back" : null;
+            facing = cameraFacing(selected);
+            deviceId = cameraId(selected);
             photoOutput = new ImageCapture.Builder().setJpegQuality(100)
                     .setTargetRotation(displayRotation()).build();
             bindOutputs(selected, width, height);
@@ -239,6 +301,10 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 if (!active || token != generation) return;
                 CameraState.StateError error = state.getError();
                 if (error != null) {
+                    if (deviceIsGone()) {
+                        reportDeviceLoss();
+                        return;
+                    }
                     String code;
                     switch (error.getCode()) {
                         case CameraState.ERROR_CAMERA_IN_USE:
@@ -256,12 +322,41 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 }
             };
             camera.getCameraInfo().getCameraState().observeForever(cameraObserver);
+            if (!active || token != generation) return;
             displays.registerDisplayListener(this, main);
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME);
         }
 
+        private boolean deviceIsGone() {
+            if (cameraManager == null || deviceId == null) return false;
+            try {
+                for (String id : cameraManager.getCameraIdList()) {
+                    if (deviceId.equals(id)) return false;
+                }
+                return true;
+            } catch (CameraAccessException | SecurityException unavailable) {
+                return false;
+            }
+        }
+
+        private void reportDeviceLoss() {
+            fail(opened ? "device-disconnected" : "device-not-found", "The selected camera is no longer connected.");
+        }
+
+        @androidx.camera.camera2.interop.ExperimentalCamera2Interop
         private Preview makePreview(long width, long height, Size exactSize) {
             Preview.Builder builder = new Preview.Builder().setTargetRotation(displayRotation());
+            long token = generation;
+            new Camera2Interop.Extender<>(builder).setDeviceStateCallback(new CameraDevice.StateCallback() {
+                @Override public void onOpened(@NonNull CameraDevice device) {}
+                @Override public void onError(@NonNull CameraDevice device, int error) {}
+                @Override public void onDisconnected(@NonNull CameraDevice device) {
+                    main.post(() -> {
+                        // A camera can also disconnect when a higher-priority client takes over.
+                        if (active && token == generation && deviceIsGone()) reportDeviceLoss();
+                    });
+                }
+            });
             if (exactSize != null || width != 0) {
                 builder.setResolutionSelector(new ResolutionSelector.Builder()
                         .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
@@ -756,6 +851,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             Map<String, PlatformPayload> snapshot = new HashMap<>();
             snapshot.put("run", PlatformPayload.int64(run));
             snapshot.put("facing", facing == null ? PlatformPayload.nullValue() : PlatformPayload.string(facing));
+            snapshot.put("deviceId", deviceId == null ? PlatformPayload.nullValue() : PlatformPayload.string(deviceId));
             snapshot.put("error", error == null ? PlatformPayload.nullValue() : error);
             snapshot.put("preview", current == null || current.output == null ? PlatformPayload.nullValue() : current.output);
             snapshot.put("captureFormat", current == null || current.output == null

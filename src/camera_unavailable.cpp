@@ -17,7 +17,7 @@ namespace {
 
 class UnavailableCamera final : public CameraBackend {
 public:
-  void Start(std::optional<Facing>, CapturePreferences, StatusCallback changed) override {
+  void Start(std::optional<Facing>, std::optional<std::string>, CapturePreferences, StatusCallback changed) override {
     changed({.state = SessionState::Failed,
              .error = CameraError{CameraErrorCode::Unavailable, "Camera capture is not implemented on this platform."}},
             full_texture_crop);

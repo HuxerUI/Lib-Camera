@@ -20,6 +20,7 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 using huxerui::camera::detail::CameraBackend;
+using huxerui::camera::detail::CameraDevicesResult;
 using huxerui::camera::detail::CaptureFormatRank;
 using huxerui::camera::detail::CapturePreferences;
 using huxerui::camera::detail::FramePipeline;
@@ -30,6 +31,57 @@ using huxerui::camera::detail::full_texture_crop;
 namespace {
 
 char lighting_observation;
+
+NSArray<AVCaptureDevice*>* DiscoverCameras() {
+  NSMutableArray<AVCaptureDeviceType>* types = [@[
+      AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeBuiltInUltraWideCamera,
+      AVCaptureDeviceTypeBuiltInTelephotoCamera, AVCaptureDeviceTypeBuiltInTrueDepthCamera,
+      AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInDualWideCamera,
+      AVCaptureDeviceTypeBuiltInTripleCamera] mutableCopy];
+  if (@available(iOS 17.0, *)) {
+    [types addObjectsFromArray:@[AVCaptureDeviceTypeExternal, AVCaptureDeviceTypeContinuityCamera]];
+  }
+  return [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:types mediaType:AVMediaTypeVideo
+                                                                  position:AVCaptureDevicePositionUnspecified].devices;
+}
+
+std::optional<Facing> CameraFacing(AVCaptureDevice* device) {
+  if (device.position == AVCaptureDevicePositionFront) return Facing::Front;
+  if (device.position == AVCaptureDevicePositionBack) return Facing::Back;
+  return {};
+}
+
+std::optional<std::string> CameraId(AVCaptureDevice* device) {
+  if (const char* id = device.uniqueID.UTF8String; id && *id) return std::string(id);
+  return {};
+}
+
+CameraDevicesResult EnumerateCameras() {
+  @autoreleasepool {
+    std::vector<CameraDevice> devices;
+    for (AVCaptureDevice* device in DiscoverCameras()) {
+      if (auto id = CameraId(device); id && device.isConnected) {
+        devices.push_back({std::move(*id), device.localizedName.UTF8String ?: "Camera", CameraFacing(device)});
+      }
+    }
+    return CameraDevicesResult::Success(std::move(devices));
+  }
+}
+
+AVCaptureDevice* CameraWithId(const std::string& id) {
+  for (AVCaptureDevice* device in DiscoverCameras()) {
+    if (device.isConnected && CameraId(device) == id) return device;
+  }
+  return nil;
+}
+
+bool IsExternalCamera(AVCaptureDevice* device) {
+  if (@available(iOS 17.0, *)) {
+    return [device.deviceType isEqualToString:AVCaptureDeviceTypeExternal] ||
+           [device.deviceType isEqualToString:AVCaptureDeviceTypeContinuityCamera];
+  }
+  return false;
+}
 
 std::optional<FrameRateRange> ReadFrameRate(AVCaptureDevice* device) {
   const double shortest = CMTimeGetSeconds(device.activeVideoMinFrameDuration);
@@ -120,11 +172,16 @@ PreviewRotation RotationForOrientation(UIInterfaceOrientation orientation) {
 // The orientation API remains available on the iOS 15 deployment target.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-bool ConfigurePortraitOutput(AVCaptureConnection* connection) {
-  if (!connection.isVideoOrientationSupported) {
-    return false;
+bool ConfigurePreviewOutput(AVCaptureConnection* connection, bool external) {
+  if (!connection) return false;
+  if (external) {
+    if (@available(iOS 17.0, *)) {
+      if ([connection isVideoRotationAngleSupported:0.0]) connection.videoRotationAngle = 0.0;
+    }
+  } else {
+    if (!connection.isVideoOrientationSupported) return false;
+    connection.videoOrientation = AVCaptureVideoOrientationPortrait;
   }
-  connection.videoOrientation = AVCaptureVideoOrientationPortrait;
   if (connection.isVideoMirroringSupported) {
     connection.automaticallyAdjustsVideoMirroring = NO;
     connection.videoMirrored = NO;
@@ -329,6 +386,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::optional<ProcessedFrame> preview_;
   std::optional<CaptureFormat> captureFormat_;
   std::optional<Facing> facing_;
+  std::optional<std::string> deviceId_;
+  bool externalCamera_;
   PreviewRotation rotation_;
   bool interrupted_;
   bool failed_;
@@ -336,7 +395,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
 - (instancetype)initWithOwner:(UIViewController*)owner;
-- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
        frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
@@ -374,7 +434,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
                       .actual_facing = facing_,
                       .preview = preview_ ? std::optional{preview_->output} : std::nullopt,
                       .can_focus_and_meter = !interrupted_ && [self supportsPointControl],
-                      .capture_format = captureFormat_};
+                      .capture_format = captureFormat_, .actual_device_id = deviceId_};
   changed_(std::move(status), preview_ ? preview_->source_crop : full_texture_crop);
 }
 
@@ -403,7 +463,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   [observers_ addObject:token];
 }
 
-- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
        frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed {
   UIViewController* owner = owner_;
@@ -438,25 +499,29 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     facing_.reset();
     const AVCaptureDevicePosition position = !facing ? AVCaptureDevicePositionUnspecified :
         (*facing == Facing::Front ? AVCaptureDevicePositionFront : AVCaptureDevicePositionBack);
-    if (!facing) {
+    if (deviceId) {
+      device_ = CameraWithId(*deviceId);
+    } else if (!facing) {
       device_ = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     } else {
       device_ = [AVCaptureDeviceDiscoverySession
           discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
                                 mediaType:AVMediaTypeVideo position:position].devices.firstObject;
     }
-    if (!device_) {
-      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested facing."];
+    if (!device_.isConnected) {
+      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested selection."];
       return;
     }
-    if (device_.position == AVCaptureDevicePositionFront) {
-      facing_ = Facing::Front;
-    } else if (device_.position == AVCaptureDevicePositionBack) {
-      facing_ = Facing::Back;
-    }
+    facing_ = CameraFacing(device_);
+    deviceId_ = CameraId(device_);
+    externalCamera_ = IsExternalCamera(device_);
     NSError* error = nil;
     AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
     if (!input) {
+      if (!device_.isConnected) {
+        [self fail:CameraErrorCode::DeviceNotFound message:@"The selected camera is no longer connected."];
+        return;
+      }
       const auto code = error.code == AVErrorDeviceInUseByAnotherApplication ? CameraErrorCode::DeviceBusy :
           (error.code == AVErrorApplicationIsNotAuthorizedToUseDevice ? CameraErrorCode::PermissionDenied :
                                                                      CameraErrorCode::ConfigurationFailed);
@@ -488,7 +553,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       return;
     }
     output_.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
-    if (!ConfigurePortraitOutput([output_ connectionWithMediaType:AVMediaTypeVideo])) {
+    if (!ConfigurePreviewOutput([output_ connectionWithMediaType:AVMediaTypeVideo], externalCamera_)) {
       [session_ commitConfiguration];
       [self fail:CameraErrorCode::ConfigurationFailed message:@"The camera cannot provide portrait preview frames."];
       return;
@@ -515,7 +580,12 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 
     [self observe:AVCaptureSessionRuntimeErrorNotification object:session_ handler:^(NSNotification* notification) {
       NSError* runtimeError = notification.userInfo[AVCaptureSessionErrorKey];
-      [weak fail:CameraErrorCode::CaptureFailed message:runtimeError.localizedDescription];
+      HUXIOSCameraCapture* capture = weak;
+      if (capture) {
+        const auto code = runtimeError.code == AVErrorDeviceWasDisconnected || !capture->device_.isConnected
+            ? CameraErrorCode::DeviceDisconnected : CameraErrorCode::CaptureFailed;
+        [capture fail:code message:runtimeError.localizedDescription];
+      }
     }];
     [self observe:AVCaptureDeviceWasDisconnectedNotification object:device_ handler:^(NSNotification*) {
       [weak fail:CameraErrorCode::DeviceDisconnected message:@"The camera was disconnected."];
@@ -576,7 +646,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_ = std::make_shared<ios::PixelBufferTexture>(size);
     }
     texture_->Publish(buffer);
-    ProcessedFrame frame{.output = {.texture = texture_, .rotation = rotation_}};
+    ProcessedFrame frame{.output = {.texture = texture_,
+                                   .rotation = externalCamera_ ? PreviewRotation::R0 : rotation_}};
     if (frames_) {
       const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
                                           kCMTimeRoundingMethod_Default);
@@ -747,8 +818,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     }
     NSString* failure = nil;
     @try {
-      // The output buffer is portrait and unmirrored. Device points use the landscape orientation.
-      const CGPoint target = CGPointMake(point.y, 1.0F - point.x);
+      // Built-in cameras deliver portrait buffers. Device points use the source orientation.
+      const CGPoint target = externalCamera_ ? CGPointMake(point.x, point.y) : CGPointMake(point.y, 1.0F - point.x);
       if (device_.isFocusPointOfInterestSupported &&
           [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
         device_.focusPointOfInterest = target;
@@ -904,9 +975,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       connection.automaticallyAdjustsVideoMirroring = NO;
       connection.videoMirrored = NO;
     }
+    if (externalCamera_) {
+      if (@available(iOS 17.0, *)) {
+        if ([connection isVideoRotationAngleSupported:0.0]) connection.videoRotationAngle = 0.0;
+      }
+    }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (connection.isVideoOrientationSupported) {
+    if (!externalCamera_ && connection.isVideoOrientationSupported) {
       switch (orientation) {
       case UIInterfaceOrientationLandscapeLeft:
         connection.videoOrientation = AVCaptureVideoOrientationLandscapeLeft;
@@ -988,6 +1064,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     }
     preview_.reset();
     captureFormat_.reset();
+    deviceId_.reset();
     frames_.reset();
     [self completeStops];
   });
@@ -1012,8 +1089,14 @@ class IOSCamera final : public CameraBackend {
 public:
   explicit IOSCamera(UIViewController* owner) : capture_([[HUXIOSCameraCapture alloc] initWithOwner:owner]) {}
 
-  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
-    [capture_ start:facing preferred:preferred frames:frame_pipeline_ changed:std::move(changed)];
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    co_return co_await RunWorker(&EnumerateCameras);
+  }
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
+    [capture_ start:facing deviceId:std::move(device_id) preferred:preferred
+              frames:frame_pipeline_ changed:std::move(changed)];
   }
 
   void Stop(std::function<void()> completed) override {

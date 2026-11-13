@@ -69,7 +69,8 @@ Configure capture through `CameraOptions`:
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `active` | `true` | Starts or stops capture asynchronously. Capture suspends in the background. |
-| `facing` | Empty | Selects the default camera. `Facing::Front` or `Facing::Back` requires that facing, without falling back to the opposite one. |
+| `facing` | Empty | Requires a front or rear camera when set. With both source options empty, Camera selects the platform default. |
+| `device_id` | Empty | Selects a specific camera by its enumerated ID. Leave `facing` empty when supplying an ID. |
 | `output_pixel_width`, `output_pixel_height` | Both `0` | Set both to positive pixel counts to size the shared preview and recording texture before rotation. Changing the pair reopens active capture and finishes any current recording. |
 | `preferred_capture_pixel_width`, `preferred_capture_pixel_height` | Both `0` | Request the pixel dimensions of the source video stream. Matching ignores orientation. Set both to zero for the platform default. |
 | `preferred_capture_fps` | Empty | Request a positive, finite capture frame rate. The platform can choose a different rate or leave it under automatic control. |
@@ -89,6 +90,18 @@ Configure each preview through `PreviewOptions`:
 `session.Status()` observes lifecycle state, failure details, and photo activity. When a session fails, inspect `status.error->code` for recovery decisions and `status.error->message` for diagnostics. After resolving the cause, call `session.Retry()`; it does not request permission or change `active`.
 
 The component calling `UseCamera` owns the session lifetime. Removing that component closes capture, even if another object retains a session handle. Removing an individual `CameraPreview` does not stop its shared session.
+
+## Select a Camera
+
+After obtaining camera permission, await `camera::EnumerateDevicesAsync()` in a UI task to get a device
+snapshot. This query works before opening a camera and while previewing or recording. Pass an entry's
+`id` to `CameraOptions::device_id` and read `CameraStatus::actual_device_id` to see the opened device.
+Use the display name in the UI and the ID to distinguish devices with the same name. Validate saved IDs
+against a fresh list because the platform can assign a new ID after reconnecting.
+
+If the requested device is absent, the session reports `DeviceNotFound`. If the active device disconnects,
+the session reports `DeviceDisconnected` and finalizes any current recording. Select another device or call
+`Retry()` after reconnecting the original device. The example refreshes its camera list in Preview settings.
 
 ## Adjust Zoom
 

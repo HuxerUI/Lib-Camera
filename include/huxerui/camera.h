@@ -14,6 +14,7 @@
 #include <optional>
 #include <source_location>
 #include <string>
+#include <vector>
 
 #include <huxerui/external_texture.h>
 #include <huxerui/data.h>
@@ -34,6 +35,19 @@ enum class Facing {
   Front,
   /// Camera facing away from the user on the rear of the device.
   Back,
+};
+
+/// @brief A video capture device currently selectable by the application.
+/// @see EnumerateDevicesAsync(), CameraOptions::device_id
+struct CameraDevice {
+  /// Opaque UTF-8 identifier scoped to the platform and system. Revalidate saved IDs through discovery.
+  std::string id;
+  /// Display name supplied by the platform or backend. Names may repeat.
+  std::string name;
+  /// Camera position when known.
+  std::optional<Facing> facing;
+
+  bool operator==(const CameraDevice&) const = default;
 };
 
 /// @brief Selects the final horizontal mirror appearance of an upright preview or photo.
@@ -91,7 +105,7 @@ enum class CameraErrorCode {
   PermissionDenied,
   /// A capture backend or required platform capability is unavailable.
   Unavailable,
-  /// No camera matches the requested facing, or no default camera can be found.
+  /// No camera matches the requested ID or facing, or no default camera can be found.
   DeviceNotFound,
   /// The platform reports that another client or operation is using the camera.
   DeviceBusy,
@@ -268,7 +282,7 @@ struct CaptureFormat {
 
 /// @brief Declarative capture intent applied by UseCamera on recomposition.
 struct CameraOptions {
-  /// Required camera facing, or an empty value to select the platform's default video device.
+  /// Required camera facing. When both facing and device_id are omitted, select the platform default.
   /// An explicit facing requires a matching device. Changing it while active reopens capture.
   std::optional<Facing> facing;
   /// Whether capture is requested. Defaults to true.
@@ -304,6 +318,10 @@ struct CameraOptions {
   /// then frame rate. Changing this preference reopens active capture and finalizes any current recording.
   /// An invalid value reports CameraErrorCode::ConfigurationFailed.
   std::optional<double> preferred_capture_fps;
+  /// Required ID from EnumerateDevicesAsync(). An empty string or a combination with facing is invalid.
+  /// Changing the ID reopens active capture and finalizes any current recording.
+  /// An unavailable ID reports DeviceNotFound. Retry can reopen the device after it reconnects.
+  std::optional<std::string> device_id;
 
   bool operator==(const CameraOptions&) const = default;
 };
@@ -372,6 +390,8 @@ struct CameraStatus {
   std::optional<Torch> torch;
   /// Current video capture format. Empty until the platform reports the source geometry and while capture is inactive.
   std::optional<CaptureFormat> capture_format;
+  /// ID of the opened capture device when available, including automatic and facing-based selection.
+  std::optional<std::string> actual_device_id;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -603,6 +623,14 @@ private:
 /// };
 /// @endcode
 void Install(ApplicationContext& context);
+
+/// @brief Queries a snapshot of the video devices selectable by the application.
+///
+/// Launch from a UI task after registering Install and obtaining Permission::Camera.
+/// Discovery checks authorization and leaves the permission prompt to the application.
+/// It can run with or without an active CameraSession. Devices can disappear between discovery and selection.
+/// @return The current device list, an empty list when none are exposed, or a CameraError.
+Task<CameraResult<std::vector<CameraDevice>>> EnumerateDevicesAsync();
 
 /// @brief Retains a camera session in the current composition and applies the requested capture intent.
 ///

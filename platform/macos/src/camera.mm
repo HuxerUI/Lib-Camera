@@ -16,6 +16,7 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 using huxerui::camera::detail::CameraBackend;
+using huxerui::camera::detail::CameraDevicesResult;
 using huxerui::camera::detail::CaptureFormatRank;
 using huxerui::camera::detail::CapturePreferences;
 using huxerui::camera::detail::FramePipeline;
@@ -26,6 +27,51 @@ using huxerui::camera::detail::full_texture_crop;
 namespace {
 
 char lighting_observation;
+
+NSArray<AVCaptureDevice*>* DiscoverCameras() {
+  NSArray<AVCaptureDeviceType>* types;
+  if (@available(macOS 14.0, *)) {
+    types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal,
+              AVCaptureDeviceTypeContinuityCamera];
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown];
+#pragma clang diagnostic pop
+  }
+  return [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:types mediaType:AVMediaTypeVideo
+                                                                  position:AVCaptureDevicePositionUnspecified].devices;
+}
+
+std::optional<Facing> CameraFacing(AVCaptureDevice* device) {
+  if (device.position == AVCaptureDevicePositionFront) return Facing::Front;
+  if (device.position == AVCaptureDevicePositionBack) return Facing::Back;
+  return {};
+}
+
+std::optional<std::string> CameraId(AVCaptureDevice* device) {
+  if (const char* id = device.uniqueID.UTF8String; id && *id) return std::string(id);
+  return {};
+}
+
+CameraDevicesResult EnumerateCameras() {
+  @autoreleasepool {
+    std::vector<CameraDevice> devices;
+    for (AVCaptureDevice* device in DiscoverCameras()) {
+      if (auto id = CameraId(device); id && device.isConnected) {
+        devices.push_back({std::move(*id), device.localizedName.UTF8String ?: "Camera", CameraFacing(device)});
+      }
+    }
+    return CameraDevicesResult::Success(std::move(devices));
+  }
+}
+
+AVCaptureDevice* CameraWithId(const std::string& id) {
+  for (AVCaptureDevice* device in DiscoverCameras()) {
+    if (device.isConnected && CameraId(device) == id) return device;
+  }
+  return nil;
+}
 
 std::optional<FrameRateRange> ReadFrameRate(AVCaptureDevice* device) {
   const double shortest = CMTimeGetSeconds(device.activeVideoMinFrameDuration);
@@ -225,11 +271,13 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::optional<ProcessedFrame> preview_;
   std::optional<CaptureFormat> captureFormat_;
   std::optional<Facing> facing_;
+  std::optional<std::string> deviceId_;
   bool failed_;
   CameraBackend::StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
-- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
        frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
@@ -261,14 +309,17 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   }
 }
 
-- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
        frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed {
   dispatch_async(queue_, ^{
     changed_ = changed;
     frames_ = frames;
     failed_ = false;
-    if (!facing) {
+    if (deviceId) {
+      device_ = CameraWithId(*deviceId);
+    } else if (!facing) {
       device_ = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     } else {
       const AVCaptureDevicePosition position = *facing == Facing::Front ? AVCaptureDevicePositionFront :
@@ -283,19 +334,19 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
         }
       }
     }
-    if (!device_) {
-      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested facing."];
+    if (!device_.isConnected) {
+      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested selection."];
       return;
     }
-    facing_.reset();
-    if (device_.position == AVCaptureDevicePositionFront) {
-      facing_ = Facing::Front;
-    } else if (device_.position == AVCaptureDevicePositionBack) {
-      facing_ = Facing::Back;
-    }
+    facing_ = CameraFacing(device_);
+    deviceId_ = CameraId(device_);
     NSError* error = nil;
     AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
     if (!input) {
+      if (!device_.isConnected) {
+        [self fail:CameraErrorCode::DeviceNotFound message:@"The selected camera is no longer connected."];
+        return;
+      }
       const auto code = error.code == AVErrorDeviceInUseByAnotherApplication ? CameraErrorCode::DeviceBusy :
                                                                              CameraErrorCode::ConfigurationFailed;
       [self fail:code message:error.localizedDescription];
@@ -350,7 +401,9 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       NSError* runtimeError = notification.userInfo[AVCaptureSessionErrorKey];
       dispatch_async(capture->queue_, ^{
         if (notification.object == capture->session_) {
-          [capture fail:CameraErrorCode::CaptureFailed message:runtimeError.localizedDescription];
+          const auto code = runtimeError.code == AVErrorDeviceWasDisconnected || !capture->device_.isConnected
+              ? CameraErrorCode::DeviceDisconnected : CameraErrorCode::CaptureFailed;
+          [capture fail:code message:runtimeError.localizedDescription];
         }
       });
     }]];
@@ -370,7 +423,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       [self fail:CameraErrorCode::CaptureFailed message:@"The camera did not start."];
       return;
     }
-    changed_({.state = SessionState::Running, .actual_facing = facing_}, full_texture_crop);
+    changed_({.state = SessionState::Running, .actual_facing = facing_, .actual_device_id = deviceId_}, full_texture_crop);
   });
 }
 
@@ -420,7 +473,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       preview_ = std::move(frame);
       captureFormat_ = capture_format;
       changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_->output,
-                .can_focus_and_meter = [self supportsPointControl], .capture_format = captureFormat_}, preview_->source_crop);
+                .can_focus_and_meter = [self supportsPointControl], .capture_format = captureFormat_,
+                .actual_device_id = deviceId_}, preview_->source_crop);
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
@@ -668,6 +722,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     }
     preview_.reset();
     captureFormat_.reset();
+    deviceId_.reset();
     frames_.reset();
     [self completeStops];
   });
@@ -691,8 +746,14 @@ namespace {
 class AppleCamera final : public CameraBackend {
 public:
   AppleCamera() : capture_([HUXCameraCapture new]) {}
-  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
-    [capture_ start:facing preferred:preferred frames:frame_pipeline_ changed:std::move(changed)];
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    co_return co_await RunWorker(&EnumerateCameras);
+  }
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
+    [capture_ start:facing deviceId:std::move(device_id) preferred:preferred
+              frames:frame_pipeline_ changed:std::move(changed)];
   }
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];

@@ -2,6 +2,8 @@
 
 #include <huxerui/windows/external_texture.h>
 
+#include <windows.h>
+#include <cfgmgr32.h>
 #include <d3d11.h>
 #include <ks.h>
 #include <ksmedia.h>
@@ -200,7 +202,41 @@ public:
     silent_ = true;
   }
 
+  void ObserveDeviceRemoval(std::wstring link) {
+    if (link.empty()) return;
+    device_link_ = std::move(link);
+    CM_NOTIFY_FILTER filter{};
+    filter.cbSize = sizeof(filter);
+    filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+    filter.Flags = CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES;
+    if (CM_Register_Notification(&filter, this, DeviceNotification, &device_notification_) != CR_SUCCESS) {
+      device_notification_ = nullptr;
+    }
+  }
+
+  void StopObservingDeviceRemoval() {
+    if (const auto notification = std::exchange(device_notification_, nullptr)) {
+      CM_Unregister_Notification(notification);
+    }
+  }
+
 private:
+  static DWORD CALLBACK DeviceNotification(HCMNOTIFICATION, PVOID context, CM_NOTIFY_ACTION action,
+                                           PCM_NOTIFY_EVENT_DATA data, DWORD) noexcept {
+    auto& events = *static_cast<CaptureEvents*>(context);
+    if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL && data->FilterType == CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE &&
+        _wcsicmp(events.device_link_.c_str(), data->u.DeviceInterface.SymbolicLink) == 0) {
+      try {
+        events.Fail(HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED));
+      } catch (...) {
+        // Platform notification callbacks cannot propagate exceptions.
+      }
+    }
+    return ERROR_SUCCESS;
+  }
+
+  std::wstring device_link_;
+  HCMNOTIFICATION device_notification_ = nullptr;
   std::mutex mutex_;
   std::condition_variable ready_;
   std::deque<std::pair<GUID, HRESULT>> events_;
@@ -215,7 +251,7 @@ public:
   ComPtr<CaptureEvents> events;
 
   void Configure(CaptureFormat capture_format, LONG stride, PreviewRotation rotation, std::optional<Facing> facing,
-                 std::shared_ptr<FramePipeline> pipeline) {
+                 std::optional<std::string> device_id, std::shared_ptr<FramePipeline> pipeline) {
     const auto width = capture_format.pixel_width;
     const auto height = capture_format.pixel_height;
     width_ = width;
@@ -223,6 +259,7 @@ public:
     stride_ = stride;
     rotation_ = rotation;
     facing_ = facing;
+    device_id_ = std::move(device_id);
     capture_format_ = capture_format;
     pipeline_ = std::move(pipeline);
     if (!width || !height || width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
@@ -345,7 +382,7 @@ public:
 private:
   void Publish() {
     events->Publish({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_,
-                     .capture_format = capture_format_});
+                     .capture_format = capture_format_, .actual_device_id = device_id_});
   }
   void Upload(const BYTE* first, LONG stride) {
     if (stride < 0) {
@@ -366,6 +403,7 @@ private:
   std::optional<PreviewOutput> preview_;
   std::optional<CaptureFormat> capture_format_;
   std::optional<Facing> facing_;
+  std::optional<std::string> device_id_;
   PreviewRotation rotation_ = PreviewRotation::R0;
   UINT width_ = 0;
   UINT height_ = 0;
@@ -377,14 +415,17 @@ private:
   FrameProducer producer_;
 };
 
-std::optional<Facing> DeviceFacing(IMFActivate* device) {
+std::wstring DeviceAttribute(IMFActivate& device, REFGUID attribute) {
   UINT32 length = 0;
-  if (FAILED(device->GetStringLength(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &length)))
-    return {};
-  std::wstring link(static_cast<std::size_t>(length) + 1, L'\0');
-  if (FAILED(device->GetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, link.data(), length + 1, nullptr)))
-    return {};
-  link.resize(length);
+  if (FAILED(device.GetStringLength(attribute, &length))) return {};
+  std::wstring value(static_cast<std::size_t>(length) + 1, L'\0');
+  if (FAILED(device.GetString(attribute, value.data(), length + 1, nullptr))) return {};
+  value.resize(length);
+  return value;
+}
+
+std::optional<Facing> DeviceFacing(const std::wstring& link) {
+  if (link.empty()) return {};
   try {
     using namespace winrt::Windows::Devices::Enumeration;
     const auto info = DeviceInformation::CreateFromIdAsync(link).get();
@@ -399,26 +440,69 @@ std::optional<Facing> DeviceFacing(IMFActivate* device) {
   return {};
 }
 
-ComPtr<IMFActivate> SelectDevice(std::optional<Facing> requested, std::optional<Facing>& actual) {
-  ComPtr<IMFAttributes> attributes;
-  Require(MFCreateAttributes(&attributes, 1));
-  Require(attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID));
-  IMFActivate** devices = nullptr;
+struct CaptureDevices {
+  IMFActivate** items = nullptr;
   UINT32 count = 0;
-  Require(MFEnumDeviceSources(attributes.Get(), &devices, &count));
-  ComPtr<IMFActivate> selected;
-  for (UINT32 index = 0; index < count; ++index) {
-    if (!selected) {
-      const auto facing = DeviceFacing(devices[index]);
-      if (!requested || requested == facing) {
-        selected = devices[index];
-        actual = facing;
-      }
-    }
-    devices[index]->Release();
+
+  CaptureDevices() {
+    ComPtr<IMFAttributes> attributes;
+    Require(MFCreateAttributes(&attributes, 1));
+    Require(attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID));
+    const auto result = MFEnumDeviceSources(attributes.Get(), &items, &count);
+    if (result != MF_E_NO_CAPTURE_DEVICES_AVAILABLE) Require(result);
   }
-  CoTaskMemFree(devices);
-  return selected;
+
+  CaptureDevices(const CaptureDevices&) = delete;
+  CaptureDevices& operator=(const CaptureDevices&) = delete;
+
+  ~CaptureDevices() {
+    for (UINT32 index = 0; index < count; ++index) items[index]->Release();
+    CoTaskMemFree(items);
+  }
+};
+
+ComPtr<IMFActivate> SelectDevice(std::optional<Facing> facing, const std::optional<std::string>& requested_id,
+                                std::optional<Facing>& actual_facing, std::wstring& link) {
+  const CaptureDevices devices;
+  for (UINT32 index = 0; index < devices.count; ++index) {
+    auto* device = devices.items[index];
+    auto candidate_link = DeviceAttribute(*device, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+    if (requested_id && (candidate_link.empty() || winrt::to_string(candidate_link) != *requested_id)) continue;
+    const auto candidate_facing = DeviceFacing(candidate_link);
+    if (facing && facing != candidate_facing) continue;
+    actual_facing = candidate_facing;
+    link = std::move(candidate_link);
+    return ComPtr<IMFActivate>(device);
+  }
+  return {};
+}
+
+CameraDevicesResult EnumerateCameras() {
+  const auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(initialized)) return CameraDevicesResult::Failure(Error(initialized, CameraErrorCode::CaptureFailed));
+  struct Apartment {
+    ~Apartment() { CoUninitialize(); }
+  } apartment;
+  const auto started = MFStartup(MF_VERSION);
+  if (FAILED(started)) return CameraDevicesResult::Failure(Error(started, CameraErrorCode::CaptureFailed));
+  struct MediaFoundation {
+    ~MediaFoundation() { MFShutdown(); }
+  } media_foundation;
+  try {
+    const CaptureDevices devices;
+    std::vector<CameraDevice> result;
+    result.reserve(devices.count);
+    for (UINT32 index = 0; index < devices.count; ++index) {
+      auto& device = *devices.items[index];
+      auto link = DeviceAttribute(device, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+      if (link.empty()) continue;
+      const auto name = DeviceAttribute(device, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+      result.push_back({winrt::to_string(link), name.empty() ? "Camera" : winrt::to_string(name), DeviceFacing(link)});
+    }
+    return CameraDevicesResult::Success(std::move(result));
+  } catch (HRESULT result) {
+    return CameraDevicesResult::Failure(Error(result, CameraErrorCode::CaptureFailed));
+  }
 }
 
 PreviewRotation Rotation(IMFMediaType* type) {
@@ -453,26 +537,29 @@ public:
     scheduled_ = true;
   }
 
-  void Start(std::optional<Facing> facing, CapturePreferences preferred, CameraBackend::StatusCallback changed,
-             std::shared_ptr<FramePipeline> pipeline) {
+  void Start(std::optional<Facing> facing, const std::optional<std::string>& requested_id, CapturePreferences preferred,
+             CameraBackend::StatusCallback changed, std::shared_ptr<FramePipeline> pipeline) {
     changed_ = std::move(changed);
     try {
       Require(com_status_);
       Require(MFStartup(MF_VERSION));
       started_ = true;
-      auto device = SelectDevice(facing, facing_);
+      std::wstring link;
+      auto device = SelectDevice(facing, requested_id, facing_, link);
       if (!device) {
         changed_({.state = SessionState::Failed,
-                  .error = CameraError{CameraErrorCode::DeviceNotFound, "No camera matches the requested facing."}},
+                  .error = CameraError{CameraErrorCode::DeviceNotFound, "No camera matches the requested selection."}},
                  full_texture_crop);
         return;
       }
-      Require(device->ActivateObject(IID_PPV_ARGS(&device_)));
+      if (!link.empty()) device_id_ = winrt::to_string(link);
       ComPtr<IMFCaptureEngineClassFactory> factory;
       Require(CoCreateInstance(CLSID_MFCaptureEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)));
       Require(factory->CreateInstance(CLSID_MFCaptureEngine, IID_PPV_ARGS(&engine_)));
       events_ = Make<CaptureEvents>();
       events_->changed = changed_;
+      events_->ObserveDeviceRemoval(std::move(link));
+      Require(device->ActivateObject(IID_PPV_ARGS(&device_)));
       ComPtr<IMFAttributes> attributes;
       Require(MFCreateAttributes(&attributes, 1));
       Require(attributes->SetUINT32(MF_CAPTURE_ENGINE_USE_VIDEO_DEVICE_ONLY, TRUE));
@@ -508,8 +595,10 @@ public:
     lighting_changed_ = {};
     running_ = false;
     changed_ = {};
-    if (events_)
+    if (events_) {
       events_->Silence();
+      events_->StopObservingDeviceRemoval();
+    }
     if (engine_ && preview_started_ && SUCCEEDED(engine_->StopPreview()))
       events_->Wait(MF_CAPTURE_ENGINE_PREVIEW_STOPPED);
     // Shutdown also covers failed initialization and a device that no longer sends stop events.
@@ -525,6 +614,7 @@ public:
     events_.Reset();
     preview_started_ = false;
     facing_.reset();
+    device_id_.reset();
     if (started_) {
       MFShutdown();
       started_ = false;
@@ -838,7 +928,8 @@ private:
       Require(MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.Data1, width, &stride));
     frames_ = Make<PreviewFrames>();
     frames_->events = events_;
-    frames_->Configure({width, height, FixedFrameRate(*negotiated.Get())}, stride, rotation, facing_, std::move(pipeline));
+    frames_->Configure({width, height, FixedFrameRate(*negotiated.Get())}, stride, rotation, facing_, device_id_,
+                       std::move(pipeline));
     Require(preview_->SetSampleCallback(output, frames_.Get()));
   }
 
@@ -850,6 +941,7 @@ private:
   bool preview_started_ = false;
   HRESULT com_status_ = S_OK;
   std::optional<Facing> facing_;
+  std::optional<std::string> device_id_;
   CameraBackend::StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lighting_changed_;
   ComPtr<IMFMediaSource> device_;
@@ -868,9 +960,15 @@ public:
       capture_->Post([capture = capture_] { capture->Stop({}); });
   }
 
-  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
-    capture_->Post([capture = capture_, facing, preferred, changed = std::move(changed), pipeline = frame_pipeline_] {
-      capture->Start(facing, preferred, changed, pipeline);
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    co_return co_await RunWorker(&EnumerateCameras);
+  }
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
+    capture_->Post([capture = capture_, facing, device_id = std::move(device_id), preferred,
+                    changed = std::move(changed), pipeline = frame_pipeline_] {
+      capture->Start(facing, device_id, preferred, changed, pipeline);
     });
     needs_stop_ = true;
   }

@@ -507,24 +507,87 @@ std::string CaptureFormatLabel(const camera::CaptureFormat& format) {
 }
 
 [[huxerui::composable]]
-View CameraSettings(camera::CameraSession session, State<std::optional<camera::Facing>> facing, State<ImageFit> fit,
+View CameraSourceSettings(const camera::CameraStatus& status, State<std::optional<camera::Facing>> facing,
+                          State<std::optional<std::string>> device_id) {
+  auto devices = UseState(std::vector<camera::CameraDevice>{});
+  auto discovery_error = UseState(std::string{});
+  auto tasks = UseTaskScope();
+  const bool device_unavailable = status.error && (status.error->code == camera::CameraErrorCode::DeviceDisconnected ||
+                                                   status.error->code == camera::CameraErrorCode::DeviceNotFound);
+  Lifecycle([tasks, devices, discovery_error] {
+    auto discovery = tasks.Launch([devices, discovery_error]() -> Task<void> {
+      discovery_error = std::string{};
+      auto result = co_await camera::EnumerateDevicesAsync();
+      if (result.Succeeded()) {
+        devices = std::move(result).Value();
+      } else {
+        devices = std::vector<camera::CameraDevice>{};
+        discovery_error = result.Error().message;
+      }
+    });
+    return [discovery] { discovery.Cancel(); };
+  }, device_unavailable);
+
+  const auto selected_id = device_id.Get();
+  std::vector<camera::CameraDevice> choices{{.name = "Auto"}};
+  const auto& available = devices.Get();
+  choices.insert(choices.end(), available.begin(), available.end());
+  const auto displayed_id = selected_id ? selected_id : facing.Get() ? status.actual_device_id : std::nullopt;
+  std::size_t selected = 0;
+  std::optional<std::string> missing_id;
+  if (displayed_id) {
+    const auto match = std::find_if(choices.begin() + 1, choices.end(),
+        [&](const auto& device) { return device.id == *displayed_id; });
+    if (match != choices.end()) {
+      selected = static_cast<std::size_t>(match - choices.begin());
+    } else if (selected_id) {
+      selected = choices.size();
+      missing_id = selected_id;
+      choices.push_back({.id = *selected_id, .name = "Selected camera unavailable"});
+    }
+  }
+  if (selected == 0) {
+    if (const auto selected_facing = facing.Get()) {
+      selected = choices.size();
+      choices.push_back({.name = *selected_facing == camera::Facing::Front ? "Front camera" : "Rear camera",
+                         .facing = selected_facing});
+    }
+  }
+  for (std::size_t index = 0; index < available.size(); ++index) {
+    const auto& name = available[index].name;
+    const auto same_name = [&](const auto& device) { return device.name == name; };
+    if (std::count_if(available.begin(), available.end(), same_name) > 1) {
+      const auto ordinal = std::count_if(available.begin(), available.begin() + index + 1, same_name);
+      choices[index + 1].name += " (" + std::to_string(ordinal) + ")";
+    }
+  }
+  return Column {
+    Label("Camera source", 13.0F, foreground, FontWeight::Medium),
+    Select(choices, selected, [missing_id](const camera::CameraDevice& device) {
+      return View(Label(device.name, 13.0F, foreground))
+          .With(Enabled(!missing_id || device.id != *missing_id))
+          .Key(device.id.empty() ? device.name : "device:" + device.id);
+    }).Label("Camera source").OnChanged([choices, facing, device_id](std::size_t index) {
+      const auto& device = choices[index];
+      facing = device.id.empty() ? device.facing : std::nullopt;
+      device_id = device.id.empty() ? std::nullopt : std::optional{device.id};
+    }).With(Enabled(!status.recording_video && !status.capturing_photo && status.state != camera::SessionState::Stopping)),
+    discovery_error->empty() ? View{} : View(Label(discovery_error.Get(), 12.0F)),
+  }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]]
+View CameraSettings(camera::CameraSession session, State<std::optional<camera::Facing>> facing,
+                    State<std::optional<std::string>> device_id, State<ImageFit> fit,
                     State<camera::MirrorMode> mirror, State<bool> grid, State<bool> comparison,
                     State<std::size_t> resolution, State<std::size_t> frame_rate) {
   const auto status = session.Status();
-  const std::optional<camera::Facing> selected_facing = facing;
   const ImageFit selected_fit = fit;
   const camera::MirrorMode selected_mirror = mirror;
-  const std::size_t facing_index = !selected_facing ? 0 : *selected_facing == camera::Facing::Front ? 1 : 2;
   const std::size_t mirror_index = selected_mirror == camera::MirrorMode::Auto ? 0
       : selected_mirror == camera::MirrorMode::Off ? 1 : 2;
   return Column {
-    Column {
-      Label("Camera source", 13.0F, foreground, FontWeight::Medium),
-      SegmentedButton({"Auto", "Front", "Rear"}, facing_index).OnChanged([facing](std::size_t index) {
-        facing = index == 0 ? std::nullopt
-            : std::optional(index == 1 ? camera::Facing::Front : camera::Facing::Back);
-      }),
-    }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+    CameraSourceSettings(status, facing, device_id),
     Column {
       Label("Capture resolution", 13.0F, foreground, FontWeight::Medium),
       SegmentedButton({"Auto", "720p", "1080p"}, resolution)
@@ -727,6 +790,7 @@ View CameraWorkspace() {
   auto changing_torch = UseState(false);
   auto torch_error = UseState(std::string{});
   auto facing = UseState(std::optional<camera::Facing>{});
+  auto device_id = UseState(std::optional<std::string>{});
   auto capture_resolution = UseState(std::size_t{0});
   auto capture_frame_rate = UseState(std::size_t{0});
   auto fit = UseState(ImageFit::Cover);
@@ -754,7 +818,8 @@ View CameraWorkspace() {
   constexpr std::uint32_t heights[]{0, 720, 1080};
   auto session = camera::UseCamera({.facing = facing, .active = active,
       .preferred_capture_pixel_width = widths[resolution], .preferred_capture_pixel_height = heights[resolution],
-      .preferred_capture_fps = frame_rate == 0 ? std::nullopt : std::optional{frame_rate == 1 ? 30.0 : 60.0}});
+      .preferred_capture_fps = frame_rate == 0 ? std::nullopt : std::optional{frame_rate == 1 ? 30.0 : 60.0},
+      .device_id = device_id});
   const VideoPhase phase = video_phase;
   const auto microphone = audio::UseAudioCapture({
       .active = phase == VideoPhase::Starting || phase == VideoPhase::Recording || phase == VideoPhase::Finishing,
@@ -816,15 +881,17 @@ View CameraWorkspace() {
     if (!video && torch_enabled && !changing_torch && torch_error->empty()) set_torch(false);
   }, video, torch_enabled, changing_torch.Get());
 
-  auto show_settings = [sheets, session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate] {
-    sheets.Show([session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate](BottomSheetContext sheet) {
+  auto show_settings = [sheets, session, facing, device_id, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate] {
+    sheets.Show([session, facing, device_id, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate](
+                    BottomSheetContext sheet) {
       return Column {
         Row {
           Label("Preview settings", 20.0F, foreground, FontWeight::SemiBold),
           Spacer(),
           IconButton(app::images::close, "Close settings").OnClick([sheet] { sheet.Dismiss(); }),
         }.With(CrossAlign(CrossAxisAlignment::Center)),
-        ScrollView(CameraSettings(session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate)).With(Grow()),
+        ScrollView(CameraSettings(session, facing, device_id, fit, mirror, grid, comparison,
+                                  capture_resolution, capture_frame_rate)).With(Grow()),
       }.With(Padding(20.0F), Spacing(16.0F), Frame{.max_height = 580.0F}, CrossAlign(CrossAxisAlignment::Stretch));
     });
   };
@@ -1118,8 +1185,9 @@ View CameraWorkspace() {
         Spacer(),
         primary,
         Spacer(),
-        IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
+        IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, device_id, status] {
           const auto current = status.actual_facing ? status.actual_facing : facing.Get();
+          device_id = std::nullopt;
           facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
         }).With(Enabled(!authorizing && !stopping), Background(control_background), CornerRadius(14.0F)),
       }.With(Frame{.width = 288.0F}, CrossAlign(CrossAxisAlignment::Center)),

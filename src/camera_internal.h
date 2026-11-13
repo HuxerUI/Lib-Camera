@@ -17,6 +17,9 @@ inline constexpr char camera_module_name[] = "camera/Session";
 
 class VideoRecording;
 
+using CameraDevicesResult = CameraResult<std::vector<CameraDevice>>;
+CameraError CameraPermissionError(PermissionStatus permission);
+
 struct CapturePreferences {
   std::uint32_t pixel_width = 0;
   std::uint32_t pixel_height = 0;
@@ -102,7 +105,11 @@ public:
 
   virtual ~CameraBackend() = default;
   void SetFramePipeline(std::shared_ptr<FramePipeline> frames) { frame_pipeline_ = std::move(frames); }
-  virtual void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) = 0;
+  virtual Task<CameraDevicesResult> EnumerateDevices() {
+    co_return CameraDevicesResult::Failure({CameraErrorCode::Unavailable, "Camera discovery is unavailable."});
+  }
+  virtual void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+                     CapturePreferences preferred, StatusCallback changed) = 0;
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
   /// Reads the active capture configuration's zoom range and applied ratio.

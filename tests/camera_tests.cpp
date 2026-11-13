@@ -191,7 +191,8 @@ class TestBackend final : public camera::detail::CameraBackend {
 public:
   int starts = 0;
   int stops = 0;
-  void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
+  void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+             StatusCallback) override { ++starts; }
   void Stop(std::function<void()> completed) override {
     ++stops;
     if (completed) {
@@ -257,7 +258,9 @@ void TestSessionLifetime() {
     Check(retained_session->Status().state == SessionState::Failed &&
               retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
           "An incomplete output size must fail before opening capture.");
-    for (const auto& invalid : {CameraOptions{.preferred_capture_pixel_height = 720},
+    for (const auto& invalid : {CameraOptions{.device_id = ""},
+                                CameraOptions{.facing = Facing::Front, .device_id = "camera"},
+                                CameraOptions{.preferred_capture_pixel_height = 720},
                                 CameraOptions{.preferred_capture_fps = 0},
                                 CameraOptions{.preferred_capture_fps = std::numeric_limits<double>::infinity()}}) {
       requested = invalid;
@@ -265,7 +268,7 @@ void TestSessionLifetime() {
       platform.Drain(runtime);
       Check(retained_session->Status().state == SessionState::Failed &&
                 retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
-            "Invalid capture preferences must fail before opening capture.");
+            "Invalid camera options must fail before opening capture.");
     }
     requested = CameraOptions{.active = true};
     runtime.BuildFrame();
@@ -295,7 +298,8 @@ void TestSessionLifetime() {
 void TestZoomRequests() {
   class ZoomBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
+    void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+               StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();
@@ -393,7 +397,8 @@ void TestZoomRequests() {
 void TestExposureCompensationRequests() {
   class ExposureBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
+    void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+               StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();

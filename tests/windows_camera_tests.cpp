@@ -163,9 +163,9 @@ void TestDevice() {
   const auto permission = winrt::Windows::Security::Authorization::AppCapabilityAccess::AppCapability::Create(L"webcam");
   std::cout << "Windows webcam CheckAccess status: " << static_cast<int>(permission.CheckAccess()) << '\n';
   auto camera = camera::detail::CreateWindowsCamera();
-  const auto begin = [&](std::optional<Facing> facing) {
+  const auto begin = [&](std::optional<Facing> facing, std::optional<std::string> device_id = {}) {
     auto probe = std::make_shared<DeviceProbe>();
-    camera->Start(facing, {}, [probe](CameraStatus value, Rect) {
+    camera->Start(facing, std::move(device_id), {}, [probe](CameraStatus value, Rect) {
       std::lock_guard lock(probe->mutex);
       probe->status = std::move(value);
       probe->ready.notify_all();
@@ -184,8 +184,9 @@ void TestDevice() {
     probe->Await([&] { return probe->stopped; }, "Windows camera did not stop.");
   };
   std::optional<Facing> actual_facing;
+  std::optional<std::string> device_id;
   for (int run = 0; run < 2; ++run) {
-    auto probe = begin(actual_facing);
+    auto probe = begin(run == 0 ? actual_facing : std::nullopt, device_id);
     probe->Await([&] { return probe->status.state == SessionState::Running || probe->status.error.has_value(); },
                  "Windows camera did not start.");
     std::shared_ptr<ExternalTexture> texture;
@@ -196,6 +197,9 @@ void TestDevice() {
       Check(probe->status.preview && probe->status.preview->texture, "Running camera must expose its preview.");
       texture = probe->status.preview->texture;
       actual_facing = probe->status.actual_facing;
+      Check(probe->status.actual_device_id.has_value(), "Running camera must report its device ID.");
+      if (device_id) Check(probe->status.actual_device_id == device_id, "Explicit ID must reopen the same camera.");
+      device_id = probe->status.actual_device_id;
       std::cout << "Windows preview: " << texture->IntrinsicSize().width << 'x' << texture->IntrinsicSize().height
                 << ", facing=" << (probe->status.actual_facing ? (*probe->status.actual_facing == Facing::Front ? "front" : "back") : "unknown") << '\n';
     }
@@ -233,6 +237,13 @@ void TestDevice() {
   }
   auto starting = begin({});
   stop(starting);
+  auto missing = begin({}, "huxerui-camera-test:missing");
+  missing->Await([&] { return missing->status.error.has_value(); }, "Missing camera did not report an error.");
+  {
+    std::lock_guard lock(missing->mutex);
+    Check(missing->status.error->code == CameraErrorCode::DeviceNotFound, "Missing ID must report DeviceNotFound.");
+  }
+  stop(missing);
   for (const auto facing : {Facing::Front, Facing::Back}) {
     auto probe = begin(facing);
     probe->Await([&] { return probe->status.state == SessionState::Running || probe->status.error.has_value(); },

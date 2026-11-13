@@ -121,7 +121,7 @@ target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/s
 
 if (WIN32)
     target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 d2d1 windowscodecs runtimeobject ole32 oleaut32)
+    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 d2d1 windowscodecs runtimeobject ole32 oleaut32 cfgmgr32)
 endif ()
 
 if (ANDROID)
