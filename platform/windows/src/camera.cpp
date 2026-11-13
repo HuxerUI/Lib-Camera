@@ -54,7 +54,7 @@ CameraError Error(HRESULT result, CameraErrorCode fallback) {
 
 constexpr double zoom_scale = 65'536.0;
 
-std::optional<ZoomState> DriverZoom(IMFExtendedCameraControl& control, std::optional<float> target = {}) {
+std::optional<Zoom> DriverZoom(IMFExtendedCameraControl& control, std::optional<float> target = {}) {
   BYTE* payload = nullptr;
   ULONG size = 0;
   Require(control.LockPayload(&payload, &size));
@@ -75,9 +75,49 @@ std::optional<ZoomState> DriverZoom(IMFExtendedCameraControl& control, std::opti
   }
   Require(control.UnlockPayload());
   if (!supported) return {};
-  return ZoomState{.ratio = static_cast<float>(setting.VideoProc.Value.ul / zoom_scale),
-                   .min_ratio = static_cast<float>(setting.Min / zoom_scale),
-                   .max_ratio = static_cast<float>(setting.Max / zoom_scale)};
+  return Zoom{.ratio = static_cast<float>(setting.VideoProc.Value.ul / zoom_scale),
+              .min_ratio = static_cast<float>(setting.Min / zoom_scale),
+              .max_ratio = static_cast<float>(setting.Max / zoom_scale)};
+}
+
+int ExposureStepsPerEV(ULONGLONG flags) {
+  switch (flags) {
+    case KSCAMERA_EXTENDEDPROP_EVCOMP_SIXTHSTEP: return 6;
+    case KSCAMERA_EXTENDEDPROP_EVCOMP_QUARTERSTEP: return 4;
+    case KSCAMERA_EXTENDEDPROP_EVCOMP_THIRDSTEP: return 3;
+    case KSCAMERA_EXTENDEDPROP_EVCOMP_HALFSTEP: return 2;
+    case KSCAMERA_EXTENDEDPROP_EVCOMP_FULLSTEP: return 1;
+    default: return 0;
+  }
+}
+
+std::optional<ExposureCompensation> DriverExposureCompensation(IMFExtendedCameraControl& control,
+                                                                std::optional<float> target = {}) {
+  const auto steps_per_ev = ExposureStepsPerEV(control.GetFlags());
+  if (!steps_per_ev) return {};
+  BYTE* payload = nullptr;
+  ULONG size = 0;
+  Require(control.LockPayload(&payload, &size));
+  KSCAMERA_EXTENDEDPROP_EVCOMPENSATION setting{};
+  const bool has_payload = payload && size == sizeof(setting);
+  if (has_payload) std::memcpy(&setting, payload, sizeof(setting));
+  const auto min_index = static_cast<long long>(setting.Min) * steps_per_ev;
+  const auto max_index = static_cast<long long>(setting.Max) * steps_per_ev;
+  const bool supported = has_payload && max_index > min_index && min_index >= std::numeric_limits<LONG>::min() &&
+      max_index <= std::numeric_limits<LONG>::max() && setting.Value >= min_index && setting.Value <= max_index;
+  if (supported && target) {
+    const auto index = std::clamp(std::llround(static_cast<double>(*target) * steps_per_ev), min_index, max_index);
+    setting.Mode = 0;
+    setting.Value = static_cast<LONG>(index);
+    setting.Reserved = 0;
+    std::memcpy(payload, &setting, sizeof(setting));
+  }
+  Require(control.UnlockPayload());
+  if (!supported) return {};
+  return ExposureCompensation{.ev = static_cast<float>(setting.Value) / steps_per_ev,
+                             .min_ev = static_cast<float>(setting.Min),
+                             .max_ev = static_cast<float>(setting.Max),
+                             .step_ev = 1.0F / steps_per_ev};
 }
 
 class CaptureEvents final : public Callback<IMFCaptureEngineOnEventCallback> {
@@ -465,31 +505,59 @@ public:
       completed();
   }
 
-  std::optional<ZoomState> ReadZoom() {
+  std::optional<Zoom> ReadZoom() {
     try {
-      const auto control = OpenZoomControl();
+      const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_ZOOM);
       return control ? DriverZoom(*control.Get()) : std::nullopt;
     } catch (HRESULT) {
       return {};
     }
   }
 
-  CameraResult<ZoomState> SetZoomRatio(float ratio) {
+  CameraResult<Zoom> SetZoomRatio(float ratio) {
     if (!running_) {
-      return CameraResult<ZoomState>::Failure({CameraErrorCode::NotReady, "The camera is not running."});
+      return CameraResult<Zoom>::Failure({CameraErrorCode::NotReady, "The camera is not running."});
     }
     try {
-      const auto control = OpenZoomControl();
+      const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_ZOOM);
       if (!control || !DriverZoom(*control.Get(), ratio)) {
-        return CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."});
+        return CameraResult<Zoom>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."});
       }
       Require(control->SetFlags((control->GetCapabilities() & KSCAMERA_EXTENDEDPROP_ZOOM_DIRECT)
           ? KSCAMERA_EXTENDEDPROP_ZOOM_DIRECT : KSCAMERA_EXTENDEDPROP_ZOOM_DEFAULT));
       Require(control->CommitSettings());
-      if (const auto applied = ReadZoom()) return CameraResult<ZoomState>::Success(*applied);
-      return CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, "Cannot read the applied camera zoom."});
+      if (const auto applied = ReadZoom()) return CameraResult<Zoom>::Success(*applied);
+      return CameraResult<Zoom>::Failure({CameraErrorCode::CaptureFailed, "Cannot read the applied camera zoom."});
     } catch (HRESULT result) {
-      return CameraResult<ZoomState>::Failure(Error(result, CameraErrorCode::CaptureFailed));
+      return CameraResult<Zoom>::Failure(Error(result, CameraErrorCode::CaptureFailed));
+    }
+  }
+
+  std::optional<ExposureCompensation> ReadExposureCompensation() {
+    try {
+      const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_EVCOMPENSATION);
+      return control ? DriverExposureCompensation(*control.Get()) : std::nullopt;
+    } catch (HRESULT) {
+      return {};
+    }
+  }
+
+  CameraResult<ExposureCompensation> SetExposureCompensation(float ev) {
+    if (!running_) {
+      return CameraResult<ExposureCompensation>::Failure({CameraErrorCode::NotReady, "The camera is not running."});
+    }
+    try {
+      const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_EVCOMPENSATION);
+      if (!control || !DriverExposureCompensation(*control.Get(), ev)) {
+        return CameraResult<ExposureCompensation>::Failure(
+            {CameraErrorCode::Unavailable, "Camera exposure compensation is unavailable."});
+      }
+      Require(control->CommitSettings());
+      if (const auto applied = ReadExposureCompensation()) return CameraResult<ExposureCompensation>::Success(*applied);
+      return CameraResult<ExposureCompensation>::Failure(
+          {CameraErrorCode::CaptureFailed, "Cannot read the applied camera exposure compensation."});
+    } catch (HRESULT result) {
+      return CameraResult<ExposureCompensation>::Failure(Error(result, CameraErrorCode::CaptureFailed));
     }
   }
 
@@ -564,12 +632,11 @@ public:
   }
 
 private:
-  ComPtr<IMFExtendedCameraControl> OpenZoomControl() {
+  ComPtr<IMFExtendedCameraControl> OpenCameraControl(ULONG property) {
     ComPtr<IMFExtendedCameraController> controller;
     ComPtr<IMFExtendedCameraControl> control;
     if (running_ && device_ && SUCCEEDED(MFGetService(device_.Get(), GUID_NULL, IID_PPV_ARGS(&controller)))) {
-      controller->GetExtendedCameraControl(MF_CAPTURE_ENGINE_MEDIASOURCE, KSPROPERTY_CAMERACONTROL_EXTENDED_ZOOM,
-                                           &control);
+      controller->GetExtendedCameraControl(MF_CAPTURE_ENGINE_MEDIASOURCE, property, &control);
     }
     return control;
   }
@@ -669,13 +736,25 @@ public:
     capture_->Post([capture = capture_, options, completed = std::move(completed)] { capture->Photo(options, completed); });
   }
 
-  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+  void ReadZoom(std::function<void(std::optional<Zoom>)> completed) override {
     capture_->Post([capture = capture_, completed = std::move(completed)] { completed(capture->ReadZoom()); });
   }
 
-  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<Zoom>)> completed) override {
     capture_->Post([capture = capture_, ratio, completed = std::move(completed)] {
       completed(capture->SetZoomRatio(ratio));
+    });
+  }
+
+  void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) override {
+    capture_->Post([capture = capture_, completed = std::move(completed)] {
+      completed(capture->ReadExposureCompensation());
+    });
+  }
+
+  void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
+    capture_->Post([capture = capture_, ev, completed = std::move(completed)] {
+      completed(capture->SetExposureCompensation(ev));
     });
   }
 

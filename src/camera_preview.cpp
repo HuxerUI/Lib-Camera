@@ -67,6 +67,18 @@ std::optional<PreviewPlacement> PlacePreview(
   return PreviewPlacement{source, {0.0F, 0.0F, source.width, source.height}, rotation};
 }
 
+std::optional<Point> PreviewTexturePoint(const PreviewOutput& output, PreviewOptions options,
+                                        std::optional<Facing> facing, Size bounds, Point position) {
+  if (!output.texture || !Rect{0.0F, 0.0F, bounds.width, bounds.height}.Contains(position)) return {};
+  const auto intrinsic = output.texture->IntrinsicSize();
+  const auto placement = PlacePreview(intrinsic, output, options, facing, bounds);
+  if (!placement) return {};
+  const auto local = placement->transform.Inverse(position);
+  if (!local || !placement->destination.Contains(*local)) return {};
+  return Point{(placement->source.x + local->x) / intrinsic.width,
+               (placement->source.y + local->y) / intrinsic.height};
+}
+
 } // namespace huxerui::camera::detail
 
 namespace huxerui::camera {

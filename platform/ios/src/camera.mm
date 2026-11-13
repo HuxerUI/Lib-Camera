@@ -261,9 +261,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
       changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
-- (void)readZoom:(std::function<void(std::optional<ZoomState>)>)completed;
-- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<ZoomState>)>)completed;
+- (void)readZoom:(std::function<void(std::optional<Zoom>)>)completed;
+- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<Zoom>)>)completed;
+- (void)readExposureCompensation:(std::function<void(std::optional<ExposureCompensation>)>)completed;
+- (void)setExposureCompensation:(float)ev
+                      completed:(std::function<void(CameraResult<ExposureCompensation>)>)completed;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
+- (bool)supportsPointControl;
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed;
 @end
 
 @implementation HUXIOSCameraCapture
@@ -284,7 +289,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     return;
   }
   CameraStatus status{.state = interrupted_ ? SessionState::Suspended : SessionState::Running,
-                      .actual_facing = facing_, .preview = preview_};
+.actual_facing = facing_, .preview = preview_,
+                      .can_focus_and_meter = !interrupted_ && [self supportsPointControl]};
   changed_(std::move(status));
 }
 
@@ -504,35 +510,35 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   }
 }
 
-- (std::optional<ZoomState>)zoomState {
+- (std::optional<Zoom>)zoomState {
   if (!changed_ || !session_.isRunning || interrupted_ || failed_) return {};
   const auto minimum = device_.minAvailableVideoZoomFactor;
   const auto maximum = device_.maxAvailableVideoZoomFactor;
   if (minimum >= maximum) return {};
-  return ZoomState{.ratio = static_cast<float>(device_.videoZoomFactor),
-                   .min_ratio = static_cast<float>(minimum),
-                   .max_ratio = static_cast<float>(maximum)};
+  return Zoom{.ratio = static_cast<float>(device_.videoZoomFactor),
+              .min_ratio = static_cast<float>(minimum),
+              .max_ratio = static_cast<float>(maximum)};
 }
 
-- (void)readZoom:(std::function<void(std::optional<ZoomState>)>)completed {
+- (void)readZoom:(std::function<void(std::optional<Zoom>)>)completed {
   dispatch_async(queue_, ^{
     completed([self zoomState]);
   });
 }
 
-- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<ZoomState>)>)completed {
+- (void)setZoomRatio:(float)ratio completed:(std::function<void(CameraResult<Zoom>)>)completed {
   dispatch_async(queue_, ^{
     if (!changed_ || !session_.isRunning || interrupted_ || failed_) {
-      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
+      completed(CameraResult<Zoom>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
       return;
     }
     NSError* error = nil;
     if (![device_ lockForConfiguration:&error]) {
-      completed(CameraResult<ZoomState>::Failure(
+      completed(CameraResult<Zoom>::Failure(
           {CameraErrorCode::CaptureFailed, error.localizedDescription.UTF8String ?: "Cannot configure camera zoom."}));
       return;
     }
-    std::optional<ZoomState> applied;
+    std::optional<Zoom> applied;
     NSString* failure = nil;
     @try {
       const auto minimum = device_.minAvailableVideoZoomFactor;
@@ -547,11 +553,124 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       [device_ unlockForConfiguration];
     }
     if (applied) {
-      completed(CameraResult<ZoomState>::Success(*applied));
+      completed(CameraResult<Zoom>::Success(*applied));
     } else if (failure) {
-      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
+      completed(CameraResult<Zoom>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
     } else {
-      completed(CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+      completed(CameraResult<Zoom>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+    }
+  });
+}
+
+- (std::optional<ExposureCompensation>)exposureCompensation {
+  if (!device_ || !changed_ || !session_.isRunning || interrupted_ || failed_) return {};
+  const auto minimum = device_.minExposureTargetBias;
+  const auto maximum = device_.maxExposureTargetBias;
+  if (minimum >= maximum) return {};
+  return ExposureCompensation{.ev = device_.exposureTargetBias, .min_ev = minimum, .max_ev = maximum};
+}
+
+- (void)readExposureCompensation:(std::function<void(std::optional<ExposureCompensation>)>)completed {
+  dispatch_async(queue_, ^{
+    completed([self exposureCompensation]);
+  });
+}
+
+- (void)setExposureCompensation:(float)ev
+                      completed:(std::function<void(CameraResult<ExposureCompensation>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!device_ || !changed_ || !session_.isRunning || interrupted_ || failed_) {
+      completed(CameraResult<ExposureCompensation>::Failure(
+          {CameraErrorCode::NotReady, "The camera is not running."}));
+      return;
+    }
+    NSError* error = nil;
+    if (![device_ lockForConfiguration:&error]) {
+      completed(CameraResult<ExposureCompensation>::Failure({CameraErrorCode::CaptureFailed,
+          error.localizedDescription.UTF8String ?: "Cannot configure camera exposure compensation."}));
+      return;
+    }
+    @try {
+      const auto exposure = [self exposureCompensation];
+      if (!exposure) {
+        completed(CameraResult<ExposureCompensation>::Failure(
+            {CameraErrorCode::Unavailable, "Camera exposure compensation is unavailable."}));
+        return;
+      }
+      const auto target = std::clamp(ev, exposure->min_ev, exposure->max_ev);
+      const auto queue = queue_;
+      __weak HUXIOSCameraCapture* weakSelf = self;
+      __weak AVCaptureDevice* weakDevice = device_;
+      [device_ setExposureTargetBias:target completionHandler:^(CMTime) {
+        dispatch_async(queue, ^{
+          HUXIOSCameraCapture* capture = weakSelf;
+          AVCaptureDevice* device = weakDevice;
+          if (capture && device && capture->device_ == device) {
+            if (const auto applied = [capture exposureCompensation]) {
+              completed(CameraResult<ExposureCompensation>::Success(*applied));
+              return;
+            }
+          }
+          completed(CameraResult<ExposureCompensation>::Failure(
+              {CameraErrorCode::Interrupted, "Camera exposure compensation was interrupted."}));
+        });
+      }];
+    } @catch (NSException* exception) {
+      completed(CameraResult<ExposureCompensation>::Failure({CameraErrorCode::CaptureFailed,
+          exception.reason.UTF8String ?: "Cannot apply camera exposure compensation."}));
+    } @finally {
+      [device_ unlockForConfiguration];
+    }
+  });
+}
+
+- (bool)supportsPointControl {
+  return (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) ||
+         (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]);
+}
+
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!device_ || !changed_ || !session_.isRunning || interrupted_ || failed_ || !preview_) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera preview is not ready."}));
+      return;
+    }
+    if (![self supportsPointControl]) {
+      completed(CameraResult<void>::Failure(
+          {CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
+      return;
+    }
+    NSError* error = nil;
+    if (![device_ lockForConfiguration:&error]) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+          error.localizedDescription.UTF8String ?: "Cannot configure camera focus."}));
+      return;
+    }
+    NSString* failure = nil;
+    @try {
+      // The output buffer is portrait and unmirrored. Device points use the landscape orientation.
+      const CGPoint target = CGPointMake(point.y, 1.0F - point.x);
+      if (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+        device_.focusPointOfInterest = target;
+        device_.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+      }
+      if (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+        device_.exposurePointOfInterest = target;
+        device_.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+      }
+    } @catch (NSException* exception) {
+      failure = exception.reason ?: @"Cannot apply camera focus and metering.";
+    } @finally {
+      [device_ unlockForConfiguration];
+    }
+    if (failure) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
+    } else {
+      completed(CameraResult<void>::Success());
     }
   });
 }
@@ -686,12 +805,22 @@ public:
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];
   }
-  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+  void ReadZoom(std::function<void(std::optional<Zoom>)> completed) override {
     [capture_ readZoom:std::move(completed)];
   }
-  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<Zoom>)> completed) override {
     [capture_ setZoomRatio:ratio completed:std::move(completed)];
   }
+  void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) override {
+    [capture_ readExposureCompensation:std::move(completed)];
+  }
+  void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
+    [capture_ setExposureCompensation:ev completed:std::move(completed)];
+  }
+  void FocusAndMeter(Point point, std::function<void(CameraResult<void>)> completed) override {
+    [capture_ focusAndMeter:point completed:std::move(completed)];
+  }
+
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     [capture_ capturePhoto:options completed:std::move(completed)];
   }

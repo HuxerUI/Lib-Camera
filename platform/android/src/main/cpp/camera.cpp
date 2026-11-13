@@ -38,11 +38,19 @@ CameraErrorCode DecodeError(std::string_view code) {
   return CameraErrorCode::Unavailable;
 }
 
-ZoomState DecodeZoom(const PlatformPayload& payload) {
+Zoom DecodeZoom(const PlatformPayload& payload) {
   const auto& fields = payload.AsObject();
   return {.ratio = static_cast<float>(fields.at("ratio").AsDouble()),
           .min_ratio = static_cast<float>(fields.at("min").AsDouble()),
           .max_ratio = static_cast<float>(fields.at("max").AsDouble())};
+}
+
+ExposureCompensation DecodeExposureCompensation(const PlatformPayload& payload) {
+  const auto& fields = payload.AsObject();
+  return {.ev = static_cast<float>(fields.at("ev").AsDouble()),
+          .min_ev = static_cast<float>(fields.at("min").AsDouble()),
+          .max_ev = static_cast<float>(fields.at("max").AsDouble()),
+          .step_ev = static_cast<float>(fields.at("step").AsDouble())};
 }
 
 class AndroidCamera final : public CameraBackend, public std::enable_shared_from_this<AndroidCamera> {
@@ -69,6 +77,7 @@ public:
           }
           const auto& facing = fields.at("facing");
           if (!facing.IsNull()) status.actual_facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
+          status.can_focus_and_meter = fields.at("canFocusAndMeter").AsBoolean();
           const auto& output = fields.at("preview");
           if (!output.IsNull()) {
             const auto& preview = output.AsObject();
@@ -120,10 +129,10 @@ public:
     });
   }
 
-  void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
+  void ReadZoom(std::function<void(std::optional<Zoom>)> completed) override {
     channel_.Invoke("readZoom", PlatformPayload(PlatformPayload::Object{{"run", run_}}),
         [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
-          std::optional<ZoomState> zoom;
+          std::optional<Zoom> zoom;
           try {
             if (const auto* payload = std::get_if<PlatformPayload>(&result); payload && !payload->IsNull()) {
               zoom = DecodeZoom(*payload);
@@ -137,18 +146,64 @@ public:
 
   bool CanReplaceZoomRequest() const noexcept override { return true; }
 
-  void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+  void SetZoomRatio(float ratio, std::function<void(CameraResult<Zoom>)> completed) override {
     channel_.Invoke("setZoomRatio",
         PlatformPayload(PlatformPayload::Object{{"run", run_}, {"ratio", static_cast<double>(ratio)}}),
         [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
           if (const auto* error = std::get_if<PlatformError>(&result)) {
-            completed(CameraResult<ZoomState>::Failure({DecodeError(error->code), error->message}));
+            completed(CameraResult<Zoom>::Failure({DecodeError(error->code), error->message}));
             return;
           }
           try {
-            completed(CameraResult<ZoomState>::Success(DecodeZoom(std::get<PlatformPayload>(result))));
+            completed(CameraResult<Zoom>::Success(DecodeZoom(std::get<PlatformPayload>(result))));
           } catch (const std::exception& error) {
-            completed(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+            completed(CameraResult<Zoom>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+          }
+        });
+  }
+
+  void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) override {
+    channel_.Invoke("readExposureCompensation", PlatformPayload(PlatformPayload::Object{{"run", run_}}),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          std::optional<ExposureCompensation> exposure;
+          try {
+            if (const auto* payload = std::get_if<PlatformPayload>(&result); payload && !payload->IsNull()) {
+              exposure = DecodeExposureCompensation(*payload);
+            }
+          } catch (const std::exception&) {
+            // A failed control query leaves the capability unavailable.
+          }
+          completed(exposure);
+        });
+  }
+
+  bool CanReplaceExposureCompensationRequest() const noexcept override { return true; }
+
+  void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
+    channel_.Invoke("setExposureCompensation",
+        PlatformPayload(PlatformPayload::Object{{"run", run_}, {"ev", static_cast<double>(ev)}}),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          if (const auto* error = std::get_if<PlatformError>(&result)) {
+            completed(CameraResult<ExposureCompensation>::Failure({DecodeError(error->code), error->message}));
+            return;
+          }
+          try {
+            completed(CameraResult<ExposureCompensation>::Success(
+                DecodeExposureCompensation(std::get<PlatformPayload>(result))));
+          } catch (const std::exception& error) {
+            completed(CameraResult<ExposureCompensation>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+          }
+        });
+  }
+
+  void FocusAndMeter(Point point, std::function<void(CameraResult<void>)> completed) override {
+    channel_.Invoke("focusAndMeter", PlatformPayload(PlatformPayload::Object{
+        {"run", run_}, {"x", double(point.x)}, {"y", double(point.y)}}),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          if (const auto* error = std::get_if<PlatformError>(&result)) {
+            completed(CameraResult<void>::Failure({DecodeError(error->code), error->message}));
+          } else {
+            completed(CameraResult<void>::Success());
           }
         });
   }

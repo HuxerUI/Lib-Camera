@@ -90,8 +90,25 @@ available, call `session.SetZoomRatioAsync(ratio)` from a UI task to adjust prev
 together. Adjusting zoom keeps the camera open and continues any active recording. Zoom is available on
 supported Android and iOS cameras and on Windows cameras exposing extended zoom control.
 
-The example shows a multiplier button when zoom is available. Tap it to open the slider and any supported
-`1×` and `2×` shortcuts. Pinch the viewfinder to change the same camera zoom during preview or recording.
+The example shows supported zoom shortcuts in the viewfinder. Drag the multiplier strip horizontally or pinch
+the viewfinder to change zoom continuously during preview or recording.
+
+## Adjust Exposure Compensation
+
+Read `session.Status().exposure_compensation` for the active camera's applied EV, supported range, and optional
+step. When it is available, call `session.SetExposureCompensationAsync(ev)` from a UI task to adjust the
+automatic exposure target for preview, photos, and recording. The device constrains the request to its supported
+values. Read the status again for the applied EV. Pass `0.0F` to remove compensation. Exposure compensation
+is available on supported Android and iOS cameras and on Windows cameras exposing extended EV control.
+
+Tap the viewfinder to reveal the exposure slider on supported cameras. Tap the sun below the slider to reset to zero.
+
+## Focus and Meter at a Point
+
+When `session.Status().can_focus_and_meter` is true, call `session.FocusAndMeterAsync(point, size, options)` with
+the point and size in preview-local logical coordinates and the same presentation options as `CameraPreview`.
+The call accounts for fitting, rotation, and mirroring. It controls autofocus or metering as supported by the
+active camera on Android, iOS, and macOS. Point control is available for the default camera output geometry.
 
 ## Capture a Photo
 

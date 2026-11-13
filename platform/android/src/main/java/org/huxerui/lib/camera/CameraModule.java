@@ -1,6 +1,7 @@
 package org.huxerui.lib.camera;
 
 import android.content.Context;
+import android.graphics.PointF;
 import android.graphics.Rect;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -10,6 +11,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.Range;
 import android.view.Choreographer;
 import android.view.Surface;
 import android.view.WindowManager;
@@ -21,11 +23,15 @@ import androidx.camera.core.CameraControl;
 import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.CameraState;
+import androidx.camera.core.ExposureState;
+import androidx.camera.core.FocusMeteringAction;
+import androidx.camera.core.FocusMeteringResult;
 import androidx.camera.core.Preview;
 import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.SurfaceRequest;
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory;
 import androidx.camera.core.ZoomState;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.Lifecycle;
@@ -96,6 +102,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private long frames;
         private boolean active;
         private boolean opened;
+        private boolean supportsPointControl;
         private boolean disposed;
         private String facing;
 
@@ -132,6 +139,14 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 result.complete(zoom == null ? PlatformPayload.nullValue() : zoomPayload(zoom));
             } else if (method.equals("setZoomRatio")) {
                 setZoomRatio(arguments, result);
+            } else if (method.equals("readExposureCompensation")) {
+                ExposureState exposure = isCurrentCamera(arguments) ? exposureState() : null;
+                result.complete(exposure == null ? PlatformPayload.nullValue()
+                        : exposurePayload(exposure, exposure.getExposureCompensationIndex()));
+            } else if (method.equals("setExposureCompensation")) {
+                setExposureCompensation(arguments, result);
+            } else if (method.equals("focusAndMeter")) {
+                focusAndMeter(arguments, result);
             } else if (method.equals("stop")) {
                 stops.add(result);
                 stop();
@@ -221,6 +236,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                     fail(code, "CameraX error " + error.getCode()
                             + (error.getCause() == null ? "" : ": " + error.getCause()));
                 } else if (state.getType() == CameraState.Type.OPEN && !opened) {
+                    supportsPointControl = camera.getCameraInfo().isFocusMeteringSupported(meteringAction(0.5f, 0.5f));
                     opened = true;
                     emit(null);
                 }
@@ -288,6 +304,105 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                         } else {
                             result.complete(zoomPayload(current));
                         }
+                    } catch (Exception error) {
+                        String code = error.getCause() instanceof CameraControl.OperationCanceledException
+                                ? "interrupted" : "capture-failed";
+                        result.fail(code, error.toString(), PlatformPayload.nullValue());
+                    }
+                }, executor);
+            } catch (RuntimeException error) {
+                result.fail("capture-failed", error.toString(), PlatformPayload.nullValue());
+            }
+        }
+
+        private ExposureState exposureState() {
+            ExposureState exposure = camera.getCameraInfo().getExposureState();
+            return exposure.isExposureCompensationSupported()
+                    && exposure.getExposureCompensationStep().doubleValue() > 0.0 ? exposure : null;
+        }
+
+        private static PlatformPayload exposurePayload(ExposureState exposure, int index) {
+            double step = exposure.getExposureCompensationStep().doubleValue();
+            Range<Integer> range = exposure.getExposureCompensationRange();
+            Map<String, PlatformPayload> values = new HashMap<>();
+            values.put("ev", PlatformPayload.doubleValue(index * step));
+            values.put("min", PlatformPayload.doubleValue(range.getLower() * step));
+            values.put("max", PlatformPayload.doubleValue(range.getUpper() * step));
+            values.put("step", PlatformPayload.doubleValue(step));
+            return PlatformPayload.object(values);
+        }
+
+        private void setExposureCompensation(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
+            if (!isCurrentCamera(arguments)) {
+                result.fail("not-ready", "Start the camera before adjusting exposure compensation.",
+                        PlatformPayload.nullValue());
+                return;
+            }
+            ExposureState exposure = exposureState();
+            if (exposure == null) {
+                result.fail("unavailable", "Camera exposure compensation is unavailable.", PlatformPayload.nullValue());
+                return;
+            }
+            Range<Integer> range = exposure.getExposureCompensationRange();
+            double ev = arguments.requireField("ev").requireDouble();
+            long index = Math.round(ev / exposure.getExposureCompensationStep().doubleValue());
+            int target = (int) Math.max(range.getLower(), Math.min(index, range.getUpper()));
+            long token = generation;
+            try {
+                ListenableFuture<Integer> applied = camera.getCameraControl().setExposureCompensationIndex(target);
+                applied.addListener(() -> {
+                    if (!active || token != generation) {
+                        result.fail("interrupted", "Camera exposure compensation was interrupted.",
+                                PlatformPayload.nullValue());
+                        return;
+                    }
+                    try {
+                        result.complete(exposurePayload(exposure, applied.get()));
+                    } catch (Exception error) {
+                        String code = error.getCause() instanceof CameraControl.OperationCanceledException
+                                ? "interrupted" : "capture-failed";
+                        result.fail(code, error.toString(), PlatformPayload.nullValue());
+                    }
+                }, executor);
+            } catch (RuntimeException error) {
+                result.fail("capture-failed", error.toString(), PlatformPayload.nullValue());
+            }
+        }
+
+        private FocusMeteringAction meteringAction(float x, float y) {
+            return new FocusMeteringAction.Builder(new SurfaceOrientedMeteringPointFactory(1, 1)
+                    .createPoint(x, y), FocusMeteringAction.FLAG_AF | FocusMeteringAction.FLAG_AE).build();
+        }
+
+        private void focusAndMeter(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
+            if (!isCurrentCamera(arguments) || current == null || current.invalidated || current.output == null) {
+                result.fail("not-ready", "The camera preview is not ready.", PlatformPayload.nullValue());
+                return;
+            }
+            float x = (float) arguments.requireField("x").requireDouble();
+            float y = (float) arguments.requireField("y").requireDouble();
+            PointF point = current.gpu.bufferPoint(x, y);
+            if (point == null) {
+                result.fail("not-ready", "The camera preview is not ready.", PlatformPayload.nullValue());
+                return;
+            }
+            FocusMeteringAction action = meteringAction(point.x, point.y);
+            CameraControl control = camera.getCameraControl();
+            if (!supportsPointControl || !camera.getCameraInfo().isFocusMeteringSupported(action)) {
+                result.fail("unavailable", "Point focus and metering are unavailable.", PlatformPayload.nullValue());
+                return;
+            }
+            long token = generation;
+            try {
+                ListenableFuture<FocusMeteringResult> applied = control.startFocusAndMetering(action);
+                applied.addListener(() -> {
+                    if (!active || token != generation) {
+                        result.fail("interrupted", "Camera focus was interrupted.", PlatformPayload.nullValue());
+                        return;
+                    }
+                    try {
+                        applied.get();
+                        result.complete(PlatformPayload.nullValue());
                     } catch (Exception error) {
                         String code = error.getCause() instanceof CameraControl.OperationCanceledException
                                 ? "interrupted" : "capture-failed";
@@ -375,6 +490,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private void stop() {
             active = false;
             opened = false;
+            supportsPointControl = false;
             ++generation;
             if (pendingZoom != null) {
                 Choreographer.getInstance().removeFrameCallback(zoomFrame);
@@ -453,6 +569,8 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             snapshot.put("facing", facing == null ? PlatformPayload.nullValue() : PlatformPayload.string(facing));
             snapshot.put("error", error == null ? PlatformPayload.nullValue() : error);
             snapshot.put("preview", current == null || current.output == null ? PlatformPayload.nullValue() : current.output);
+            snapshot.put("canFocusAndMeter", PlatformPayload.booleanValue(supportsPointControl && current != null
+                    && !current.invalidated && current.output != null));
             events.emit("snapshot", PlatformPayload.object(snapshot));
         }
 

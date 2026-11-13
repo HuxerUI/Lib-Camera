@@ -18,17 +18,38 @@ namespace huxerui::camera::detail {
 
 namespace {
 
-bool ValidZoom(const ZoomState& zoom) {
+bool ValidZoom(const Zoom& zoom) {
   return zoom.min_ratio > 0.0F && zoom.min_ratio < zoom.max_ratio && std::isfinite(zoom.max_ratio) &&
       zoom.ratio >= zoom.min_ratio && zoom.ratio <= zoom.max_ratio;
 }
 
+bool ValidExposureCompensation(const ExposureCompensation& exposure) {
+  return std::isfinite(exposure.min_ev) && std::isfinite(exposure.max_ev) && exposure.min_ev < exposure.max_ev &&
+      exposure.ev >= exposure.min_ev && exposure.ev <= exposure.max_ev &&
+      (!exposure.step_ev || (std::isfinite(*exposure.step_ev) && *exposure.step_ev > 0.0F));
+}
+
 } // namespace
 
-struct ZoomRequest {
-  float ratio;
+struct CameraControlRequest {
+  float target;
   CallbackCompletion<CameraResult<void>> completion;
 };
+
+struct FocusRequest {
+  CallbackCompletion<CameraResult<void>> completion;
+};
+
+namespace {
+
+void InterruptRequests(const std::shared_ptr<CameraControlRequest>& first,
+                       const std::shared_ptr<CameraControlRequest>& second, const char* message) {
+  for (const auto& request : {first, second}) {
+    if (request) request->completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Interrupted, message}));
+  }
+}
+
+} // namespace
 
 struct PhotoRequest {
   std::mutex mutex;
@@ -55,21 +76,21 @@ struct PhotoRequest {
 CameraSessionData::CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app)
     : status(value), tasks(scope), application(app) {}
 
-void CameraSessionData::InterruptZoom() {
-  ++zoom_generation;
-  auto active = std::exchange(active_zoom, {});
-  auto pending = std::exchange(pending_zoom, {});
-  for (const auto& request : {active, pending}) {
-    if (request) request->completion.Complete(
-        CameraResult<void>::Failure({CameraErrorCode::Interrupted, "Camera zoom was interrupted."}));
+void CameraSessionData::InterruptControls() {
+  ++control_generation;
+  InterruptRequests(std::exchange(active_zoom, {}), std::exchange(pending_zoom, {}), "Camera zoom was interrupted.");
+  InterruptRequests(std::exchange(active_exposure_compensation, {}), std::exchange(pending_exposure_compensation, {}),
+                    "Camera exposure compensation was interrupted.");
+  if (auto focus = std::exchange(focus_request, {})) {
+    focus->completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Interrupted, "Camera focus was interrupted."}));
   }
 }
 
 void CameraSessionData::ReadZoom() {
-  const auto update = [weak = weak_from_this(), scope = tasks, token = zoom_generation](std::optional<ZoomState> zoom) {
+  const auto update = [weak = weak_from_this(), scope = tasks, token = control_generation](std::optional<Zoom> zoom) {
     if (!zoom || !ValidZoom(*zoom)) return;
     scope.Post([weak, token, zoom] {
-      if (auto owner = weak.lock(); owner && token == owner->zoom_generation &&
+      if (auto owner = weak.lock(); owner && token == owner->control_generation &&
           owner->status->state == SessionState::Running) {
         CameraStatus value = owner->status;
         value.zoom = zoom;
@@ -89,8 +110,8 @@ void CameraSessionData::ApplyZoom() {
   active_zoom = std::exchange(pending_zoom, {});
   const auto request = active_zoom;
   const auto& zoom = *status->zoom;
-  const auto ratio = std::clamp(request->ratio, zoom.min_ratio, zoom.max_ratio);
-  auto complete = [weak = weak_from_this(), request, scope = tasks](CameraResult<ZoomState> result) {
+  const auto ratio = std::clamp(request->target, zoom.min_ratio, zoom.max_ratio);
+  auto complete = [weak = weak_from_this(), request, scope = tasks](CameraResult<Zoom> result) {
     scope.Post([weak, request, result = std::move(result)]() mutable {
       auto owner = weak.lock();
       if (!owner || owner->active_zoom != request) return;
@@ -112,7 +133,59 @@ void CameraSessionData::ApplyZoom() {
   try {
     backend->SetZoomRatio(ratio, complete);
   } catch (const std::exception& error) {
-    complete(CameraResult<ZoomState>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+    complete(CameraResult<Zoom>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+  }
+}
+
+void CameraSessionData::ReadExposureCompensation() {
+  const auto update = [weak = weak_from_this(), scope = tasks, token = control_generation](
+                          std::optional<ExposureCompensation> exposure) {
+    if (!exposure || !ValidExposureCompensation(*exposure)) return;
+    scope.Post([weak, token, exposure] {
+      if (auto owner = weak.lock(); owner && token == owner->control_generation &&
+          owner->status->state == SessionState::Running) {
+        CameraStatus value = owner->status;
+        value.exposure_compensation = exposure;
+        owner->status = std::move(value);
+      }
+    });
+  };
+  try {
+    backend->ReadExposureCompensation(update);
+  } catch (const std::exception&) {
+    // A failed control query leaves the capability unavailable.
+  }
+}
+
+void CameraSessionData::ApplyExposureCompensation() {
+  if (active_exposure_compensation || !pending_exposure_compensation) return;
+  active_exposure_compensation = std::exchange(pending_exposure_compensation, {});
+  const auto request = active_exposure_compensation;
+  const auto& exposure = *status->exposure_compensation;
+  const auto ev = std::clamp(request->target, exposure.min_ev, exposure.max_ev);
+  auto complete = [weak = weak_from_this(), request, scope = tasks](CameraResult<ExposureCompensation> result) {
+    scope.Post([weak, request, result = std::move(result)]() mutable {
+      auto owner = weak.lock();
+      if (!owner || owner->active_exposure_compensation != request) return;
+      owner->active_exposure_compensation.reset();
+      if (!result.Succeeded()) {
+        request->completion.Complete(CameraResult<void>::Failure(result.Error()));
+      } else if (!ValidExposureCompensation(result.Value())) {
+        request->completion.Complete(CameraResult<void>::Failure(
+            {CameraErrorCode::CaptureFailed, "The camera returned invalid exposure compensation."}));
+      } else {
+        CameraStatus value = owner->status;
+        value.exposure_compensation = result.Value();
+        owner->status = std::move(value);
+        request->completion.Complete(CameraResult<void>::Success());
+      }
+      owner->ApplyExposureCompensation();
+    });
+  };
+  try {
+    backend->SetExposureCompensation(ev, complete);
+  } catch (const std::exception& error) {
+    complete(CameraResult<ExposureCompensation>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
   }
 }
 
@@ -185,7 +258,7 @@ void CameraSessionData::Reconcile() {
     const auto stopping_generation = ++generation;
     permission_check.Cancel();
     InterruptPhoto();
-    InterruptZoom();
+    InterruptControls();
     StopRecording();
     if (engaged) {
       engaged = false;
@@ -248,18 +321,25 @@ void CameraSessionData::Reconcile() {
             const auto previous = owner->status->state;
             if (value.state == SessionState::Suspended) {
               owner->InterruptPhoto();
-              owner->InterruptZoom();
+              owner->InterruptControls();
               owner->StopRecording();
             }
             value.capturing_photo = static_cast<bool>(owner->photo);
             value.recording_video = static_cast<bool>(owner->recording);
             value.recording_paused = value.recording_video && owner->status->recording_paused;
+            // Processed textures can have a different field of view from the platform source.
+            value.can_focus_and_meter = value.state == SessionState::Running && value.preview &&
+                value.can_focus_and_meter && !owner->opened.frame_processor_factory && !owner->opened.output_pixel_width;
             if (value.state == SessionState::Running && previous == SessionState::Running) {
               value.zoom = owner->status->zoom;
+              value.exposure_compensation = owner->status->exposure_compensation;
             }
-            const bool read_zoom = value.state == SessionState::Running && previous != SessionState::Running;
+            const bool read_controls = value.state == SessionState::Running && previous != SessionState::Running;
             owner->status = std::move(value);
-            if (read_zoom) owner->ReadZoom();
+            if (read_controls) {
+              owner->ReadZoom();
+              owner->ReadExposureCompensation();
+            }
           }
         });
       });
@@ -288,7 +368,7 @@ void CameraSessionData::Close() {
   ++generation;
   permission_check.Cancel();
   InterruptPhoto();
-  InterruptZoom();
+  InterruptControls();
   StopRecording();
   Publish(SessionState::Closed);
   if (backend) {
@@ -328,17 +408,79 @@ Task<CameraResult<void>> SetZoomRatio(std::shared_ptr<CameraSessionData> owner, 
               {CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
           return {};
         }
-        auto request = std::make_shared<ZoomRequest>(ZoomRequest{ratio, complete});
+        auto request = std::make_shared<CameraControlRequest>(CameraControlRequest{ratio, complete});
         auto pending = std::exchange(owner->pending_zoom, request);
         auto active = owner->backend->CanReplaceZoomRequest() ? std::exchange(owner->active_zoom, {}) : nullptr;
-        for (const auto& superseded : {pending, active}) {
-          if (superseded) superseded->completion.Complete(CameraResult<void>::Failure(
-              {CameraErrorCode::Interrupted, "A newer zoom request superseded this adjustment."}));
-        }
+        InterruptRequests(pending, active, "A newer zoom request superseded this adjustment.");
         owner->ApplyZoom();
         return [weak = owner->weak_from_this(), request] {
           if (auto owner = weak.lock(); owner && owner->pending_zoom == request) owner->pending_zoom.reset();
         };
+      });
+}
+
+Task<CameraResult<void>> SetExposureCompensation(std::shared_ptr<CameraSessionData> owner, float ev) {
+  return AwaitCallback<CameraResult<void>>(
+      [owner = std::move(owner), ev](CallbackCompletion<CameraResult<void>> complete) -> std::function<void()> {
+        if (owner->closed || !owner->engaged || owner->status->state != SessionState::Running) {
+          complete.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::NotReady, "Start the camera before adjusting exposure compensation."}));
+          return {};
+        }
+        if (!owner->status->exposure_compensation) {
+          complete.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::Unavailable, "Camera exposure compensation is unavailable."}));
+          return {};
+        }
+        auto request = std::make_shared<CameraControlRequest>(CameraControlRequest{ev, complete});
+        auto pending = std::exchange(owner->pending_exposure_compensation, request);
+        auto active = owner->backend->CanReplaceExposureCompensationRequest()
+            ? std::exchange(owner->active_exposure_compensation, {}) : nullptr;
+        InterruptRequests(pending, active, "A newer exposure compensation request superseded this adjustment.");
+        owner->ApplyExposureCompensation();
+        return [weak = owner->weak_from_this(), request] {
+          if (auto owner = weak.lock(); owner && owner->pending_exposure_compensation == request) {
+            owner->pending_exposure_compensation.reset();
+          }
+        };
+      });
+}
+
+Task<CameraResult<void>> FocusAndMeter(std::shared_ptr<CameraSessionData> owner, Point position, Size size,
+                                      PreviewOptions options) {
+  return AwaitCallback<CameraResult<void>>(
+      [owner = std::move(owner), position, size, options](CallbackCompletion<CameraResult<void>> completion)
+          -> std::function<void()> {
+        const CameraStatus status = owner->status;
+        if (owner->closed || !owner->engaged || status.state != SessionState::Running || !status.preview) {
+          completion.Complete(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera preview is not ready."}));
+          return {};
+        }
+        const auto point = PreviewTexturePoint(*status.preview, options, status.actual_facing, size, position);
+        if (!status.can_focus_and_meter || !point) {
+          completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Unavailable,
+              "The camera cannot focus or meter at this preview point."}));
+          return {};
+        }
+        const auto request = std::make_shared<FocusRequest>(FocusRequest{completion});
+        if (auto previous = std::exchange(owner->focus_request, request)) {
+          previous->completion.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::Interrupted, "A newer focus request superseded this adjustment."}));
+        }
+        const auto finish = [weak = owner->weak_from_this(), scope = owner->tasks, request](CameraResult<void> result) {
+          scope.Post([weak, request, result = std::move(result)]() mutable {
+            if (auto owner = weak.lock(); owner && owner->focus_request == request) {
+              owner->focus_request.reset();
+              request->completion.Complete(std::move(result));
+            }
+          });
+        };
+        try {
+          owner->backend->FocusAndMeter(*point, finish);
+        } catch (const std::exception& error) {
+          finish(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+        }
+        return {};
       });
 }
 
@@ -364,6 +506,17 @@ Task<CameraResult<void>> CameraSession::SetZoomRatioAsync(float ratio) const {
     throw std::invalid_argument("Camera zoom requires a positive finite ratio.");
   }
   return detail::SetZoomRatio(data_, ratio);
+}
+
+Task<CameraResult<void>> CameraSession::SetExposureCompensationAsync(float ev) const {
+  if (!std::isfinite(ev)) {
+    throw std::invalid_argument("Camera exposure compensation requires a finite EV.");
+  }
+  return detail::SetExposureCompensation(data_, ev);
+}
+
+Task<CameraResult<void>> CameraSession::FocusAndMeterAsync(Point position, Size preview_size, PreviewOptions options) const {
+  return detail::FocusAndMeter(data_, position, preview_size, options);
 }
 
 Task<CameraResult<ImageAsset>> CameraSession::CapturePhotoAsync(PhotoOptions options) const {

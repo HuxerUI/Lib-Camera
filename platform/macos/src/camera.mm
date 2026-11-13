@@ -157,6 +157,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
+- (bool)supportsPointControl;
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed;
 @end
 
 @implementation HUXCameraCapture
@@ -333,11 +335,62 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     }
     if (frame.texture && frame != preview_) {
       preview_ = std::move(frame);
-      changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_});
+changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_,
+                .can_focus_and_meter = [self supportsPointControl]});
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
   }
+}
+
+- (bool)supportsPointControl {
+  return (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) ||
+         (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]);
+}
+
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!device_ || !changed_ || !session_.isRunning || failed_ || !preview_) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera preview is not ready."}));
+      return;
+    }
+    if (![self supportsPointControl]) {
+      completed(CameraResult<void>::Failure(
+          {CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
+      return;
+    }
+    NSError* error = nil;
+    if (![device_ lockForConfiguration:&error]) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+          error.localizedDescription.UTF8String ?: "Cannot configure camera focus."}));
+      return;
+    }
+    NSString* failure = nil;
+    @try {
+      const CGPoint target = CGPointMake(preview_->mirrored ? 1.0F - point.x : point.x, point.y);
+      if (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+        device_.focusPointOfInterest = target;
+        device_.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+      }
+      if (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+        device_.exposurePointOfInterest = target;
+        device_.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+      }
+    } @catch (NSException* exception) {
+      failure = exception.reason ?: @"Cannot apply camera focus and metering.";
+    } @finally {
+      [device_ unlockForConfiguration];
+    }
+    if (failure) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
+    } else {
+      completed(CameraResult<void>::Success());
+    }
+  });
 }
 
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
@@ -443,6 +496,10 @@ public:
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];
   }
+  void FocusAndMeter(Point point, std::function<void(CameraResult<void>)> completed) override {
+    [capture_ focusAndMeter:point completed:std::move(completed)];
+  }
+
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     [capture_ capturePhoto:options completed:std::move(completed)];
   }

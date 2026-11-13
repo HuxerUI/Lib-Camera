@@ -243,7 +243,7 @@ struct CameraOptions {
 };
 
 /// @brief The active camera's applied zoom ratio and supported range.
-struct ZoomState {
+struct Zoom {
   /// Latest ratio confirmed by the camera.
   float ratio = 1.0F;
   /// Smallest zoom ratio for the active capture configuration.
@@ -251,7 +251,21 @@ struct ZoomState {
   /// Largest zoom ratio for the active capture configuration.
   float max_ratio = 1.0F;
 
-  bool operator==(const ZoomState&) const = default;
+  bool operator==(const Zoom&) const = default;
+};
+
+/// @brief The active camera's applied exposure compensation and supported range in EV.
+struct ExposureCompensation {
+  /// Latest exposure compensation confirmed by the camera.
+  float ev = 0.0F;
+  /// Smallest exposure compensation for the active capture configuration.
+  float min_ev = 0.0F;
+  /// Largest exposure compensation for the active capture configuration.
+  float max_ev = 0.0F;
+  /// Fixed increment reported by the device. Empty when the platform reports no fixed increment.
+  std::optional<float> step_ev;
+
+  bool operator==(const ExposureCompensation&) const = default;
 };
 
 /// @brief Current observed session state and optional preview metadata.
@@ -279,7 +293,12 @@ struct CameraStatus {
   /// Preview and frame processing continue. Resuming or ending the recording clears this flag.
   bool recording_paused = false;
   /// Zoom control for the current camera. Empty while unavailable or before the range has been read.
-  std::optional<ZoomState> zoom;
+  std::optional<Zoom> zoom;
+  /// Exposure compensation for the current camera. Empty while unavailable or before the range has been read.
+  std::optional<ExposureCompensation> exposure_compensation;
+  /// Whether the current preview supports setting a focus or metering point.
+  /// Empty previews, frame processors, and explicitly sized outputs do not provide point control.
+  bool can_focus_and_meter = false;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -327,6 +346,33 @@ public:
   /// NotReady means the camera is not running. Unavailable means it has no zoom control.
   /// @throws std::invalid_argument Before returning a task if the ratio is nonpositive or nonfinite.
   Task<CameraResult<void>> SetZoomRatioAsync(float ratio) const;
+
+  /// @brief Adjusts the running camera's automatic exposure target for preview, still capture, and recording.
+  ///
+  /// Start the lazy task on the owning UI thread. The camera stays open and the recording continues.
+  /// The value is constrained to the device's range and rounded to the nearest supported increment when needed.
+  /// A newer request can supersede an earlier adjustment. A superseded request, camera switch, or capture shutdown
+  /// returns Interrupted. Canceling a task withdraws a pending request and suppresses delivery. An adjustment
+  /// already submitted to the camera can still update CameraStatus::exposure_compensation.
+  /// @param ev Finite exposure compensation in EV. Zero applies no compensation, positive values raise the
+  /// exposure target, and negative values lower it.
+  /// @return Success when the device accepts the adjustment. Read CameraStatus::exposure_compensation for the
+  /// applied value. NotReady means the camera is not running. Unavailable means exposure compensation is unsupported
+  /// or has not been read yet.
+  /// @throws std::invalid_argument Before returning a task if ev is nonfinite.
+  Task<CameraResult<void>> SetExposureCompensationAsync(float ev) const;
+
+  /// @brief Sets a focus and metering point on the active camera.
+  ///
+  /// Pass the point and size in the same local logical coordinates as CameraPreview, with its presentation options.
+  /// Points outside the displayed image return Unavailable. The camera applies the supported operations at the point.
+  /// A successful result confirms the request, without implying that the lens acquired focus.
+  /// Starting another request supersedes an earlier one. The camera stays open and any recording continues.
+  /// @param position Point relative to the top left of the preview.
+  /// @param preview_size Size of the preview in logical units.
+  /// @param options The fit and mirroring used to display the preview.
+  /// @return NotReady when there is no live preview, or Unavailable when point control is unsupported.
+  Task<CameraResult<void>> FocusAndMeterAsync(Point position, Size preview_size, PreviewOptions options = {}) const;
 
   /// @brief Captures a JPEG photo through the platform still-photo output of the current camera.
   ///

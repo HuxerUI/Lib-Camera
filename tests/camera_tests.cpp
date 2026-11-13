@@ -27,8 +27,11 @@ void Near(float actual, float expected) {
 }
 
 void TestGeometry() {
-  PreviewOutput output;
+  struct TestTexture final : ExternalTexture {
+    explicit TestTexture(Size size) : ExternalTexture(size) {}
+  };
   const Size source{400.0F, 200.0F};
+  PreviewOutput output{.texture = std::make_shared<TestTexture>(source)};
   const std::array<camera::PreviewRotation, 4> rotations{camera::PreviewRotation::R0, camera::PreviewRotation::R90, camera::PreviewRotation::R180, camera::PreviewRotation::R270};
   const std::array<Point, 4> origin{{{0.0F, 0.0F}, {200.0F, 0.0F}, {400.0F, 200.0F}, {0.0F, 400.0F}}};
   const std::array<Point, 4> top_right{{{400.0F, 0.0F}, {200.0F, 400.0F}, {0.0F, 200.0F}, {0.0F, 0.0F}}};
@@ -53,6 +56,11 @@ void TestGeometry() {
       const auto point = front->transform.Apply({0.0F, 0.0F});
       Near(point.x, already_mirrored ? origin[index].x : bounds.width - origin[index].x);
       Near(point.y, origin[index].y);
+      const auto metering = camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Contain}, Facing::Front,
+          bounds, front->transform.Apply({100.0F, 120.0F}));
+      Check(metering.has_value(), "A visible point must map to the preview texture.");
+      Near(metering->x, 0.25F);
+      Near(metering->y, 0.6F);
     }
     output.mirrored = false;
   }
@@ -61,6 +69,12 @@ void TestGeometry() {
   Near(contain->transform.Apply({0.0F, 0.0F}).y, 50.0F);
   const auto cover = camera::detail::PlacePreview(source, output, {.fit = ImageFit::Cover}, {}, {200.0F, 200.0F});
   Near(cover->transform.Apply({0.0F, 0.0F}).x, -100.0F);
+  Check(!camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Contain}, {}, {200.0F, 200.0F}, {40.0F, 20.0F}),
+        "The letterbox must not produce a metering point.");
+  const auto covered_point = camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Cover}, {},
+      {200.0F, 200.0F}, {20.0F, 100.0F});
+  Check(covered_point.has_value(), "A visible point in a cropped preview must map to the source.");
+  Near(covered_point->x, 0.3F);
   const auto fill = camera::detail::PlacePreview(source, output, {.fit = ImageFit::Fill}, {}, {200.0F, 200.0F});
   Near(fill->transform.Apply({400.0F, 200.0F}).x, 200.0F);
   Near(fill->transform.Apply({400.0F, 200.0F}).y, 200.0F);
@@ -260,11 +274,11 @@ void TestZoomRequests() {
       ++stops;
       if (completed) completed();
     }
-    void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) override {
-      completed(ZoomState{.ratio = 1.0F, .min_ratio = 1.0F, .max_ratio = 4.0F});
+    void ReadZoom(std::function<void(std::optional<Zoom>)> completed) override {
+      completed(Zoom{.ratio = 1.0F, .min_ratio = 1.0F, .max_ratio = 4.0F});
     }
     bool CanReplaceZoomRequest() const noexcept override { return replace_active; }
-    void SetZoomRatio(float ratio, std::function<void(CameraResult<ZoomState>)> completed) override {
+    void SetZoomRatio(float ratio, std::function<void(CameraResult<Zoom>)> completed) override {
       if (completion) {
         Check(replace_active && !replaced, "Only a replaceable zoom adjustment may be superseded.");
         replaced = std::move(completion);
@@ -274,14 +288,14 @@ void TestZoomRequests() {
     }
     void Complete(float ratio) {
       auto complete = std::exchange(completion, {});
-      complete(CameraResult<ZoomState>::Success({.ratio = ratio, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+      complete(CameraResult<Zoom>::Success({.ratio = ratio, .min_ratio = 1.0F, .max_ratio = 4.0F}));
     }
     int starts = 0;
     int stops = 0;
     bool replace_active = false;
     std::vector<float> targets;
-    std::function<void(CameraResult<ZoomState>)> completion;
-    std::function<void(CameraResult<ZoomState>)> replaced;
+    std::function<void(CameraResult<Zoom>)> completion;
+    std::function<void(CameraResult<Zoom>)> replaced;
   };
 
   PhotoTestFixture fixture;
@@ -328,7 +342,7 @@ void TestZoomRequests() {
   Check(replaced && replaced->Error().code == CameraErrorCode::Interrupted && backend->targets.back() == 3.0F,
         "A replaceable backend must receive the latest zoom before the previous result arrives.");
   auto stale = std::exchange(backend->replaced, {});
-  stale(CameraResult<ZoomState>::Success({.ratio = 2.0F, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+  stale(CameraResult<Zoom>::Success({.ratio = 2.0F, .min_ratio = 1.0F, .max_ratio = 4.0F}));
   fixture.Drain();
   Check(owner->status->zoom && owner->status->zoom->ratio == 3.75F && !latest,
         "An obsolete result must not change the applied zoom or complete the latest request.");
@@ -348,6 +362,81 @@ void TestZoomRequests() {
   fixture.Drain();
   Check(owner->status->state == SessionState::Closed && !owner->status->zoom,
         "A late zoom response must not restore closed camera state.");
+}
+
+void TestExposureCompensationRequests() {
+  class ExposureBackend final : public camera::detail::CameraBackend {
+  public:
+    void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+    void Stop(std::function<void()> completed) override {
+      ++stops;
+      if (completed) completed();
+    }
+    void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) override {
+      completed({{.ev = 0.0F, .min_ev = -2.0F, .max_ev = 2.0F, .step_ev = 0.5F}});
+    }
+    void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
+      targets.push_back(ev);
+      completion = std::move(completed);
+    }
+    void Complete(float ev) {
+      auto complete = std::exchange(completion, {});
+      complete(CameraResult<ExposureCompensation>::Success(
+          {.ev = ev, .min_ev = -2.0F, .max_ev = 2.0F, .step_ev = 0.5F}));
+    }
+
+    int starts = 0;
+    int stops = 0;
+    std::vector<float> targets;
+    std::function<void(CameraResult<ExposureCompensation>)> completion;
+  };
+
+  PhotoTestFixture fixture;
+  const auto owner = fixture.context.owner;
+  auto backend = std::make_shared<ExposureBackend>();
+  owner->backend = backend;
+  const auto launch = [&](float ev, std::optional<CameraResult<void>>& result) {
+    fixture.context.callers->Launch([owner, ev, &result]() -> Task<void> {
+      result = co_await camera::detail::SetExposureCompensation(owner, ev);
+    });
+    fixture.Drain();
+  };
+
+  std::optional<CameraResult<void>> unavailable;
+  launch(0.0F, unavailable);
+  Check(unavailable && unavailable->Error().code == CameraErrorCode::Unavailable,
+        "Exposure compensation requires an available device range.");
+  owner->ReadExposureCompensation();
+  fixture.Drain();
+  Check(owner->status->exposure_compensation && owner->status->exposure_compensation->step_ev == 0.5F,
+        "The exposure compensation range includes the device step.");
+
+  std::optional<CameraResult<void>> first;
+  std::optional<CameraResult<void>> superseded;
+  std::optional<CameraResult<void>> reset;
+  launch(-4.0F, first);
+  launch(0.8F, superseded);
+  launch(0.0F, reset);
+  Check(backend->targets == std::vector{-2.0F} && superseded &&
+        superseded->Error().code == CameraErrorCode::Interrupted,
+        "Exposure compensation must clamp the request and keep the newest pending value.");
+  backend->Complete(-1.5F);
+  fixture.Drain();
+  Check(first && first->Succeeded() && owner->status->exposure_compensation->ev == -1.5F &&
+        backend->targets == std::vector{-2.0F, 0.0F},
+        "The confirmed EV must be published before applying the pending reset.");
+  backend->Complete(0.0F);
+  fixture.Drain();
+  Check(reset && reset->Succeeded() && owner->status->exposure_compensation->ev == 0.0F &&
+        backend->starts == 0 && backend->stops == 0, "Resetting EV must keep capture running.");
+
+  std::optional<CameraResult<void>> interrupted;
+  launch(1.0F, interrupted);
+  owner->Close();
+  backend->Complete(1.0F);
+  fixture.Drain();
+  Check(interrupted && interrupted->Error().code == CameraErrorCode::Interrupted &&
+        !owner->status->exposure_compensation, "A late EV result must not restore a closed camera's capability.");
 }
 
 void TestPhotoRequests() {
@@ -480,6 +569,7 @@ int main() {
     TestProducerSize();
     TestSessionLifetime();
     TestZoomRequests();
+    TestExposureCompensationRequests();
     TestPhotoRequests();
     std::cout << "Camera tests passed.\n";
     return 0;

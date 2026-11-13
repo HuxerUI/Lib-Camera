@@ -84,12 +84,27 @@ public:
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
   /// Reads the active capture configuration's zoom range and applied ratio.
-  virtual void ReadZoom(std::function<void(std::optional<ZoomState>)> completed) { completed({}); }
+  virtual void ReadZoom(std::function<void(std::optional<Zoom>)> completed) { completed({}); }
   /// Indicates that a new zoom submission can supersede an unconfirmed device adjustment.
   virtual bool CanReplaceZoomRequest() const noexcept { return false; }
   /// Applies a ratio on the active device and returns its confirmed state.
-  virtual void SetZoomRatio(float, std::function<void(CameraResult<ZoomState>)> completed) {
-    completed(CameraResult<ZoomState>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+  virtual void SetZoomRatio(float, std::function<void(CameraResult<Zoom>)> completed) {
+    completed(CameraResult<Zoom>::Failure({CameraErrorCode::Unavailable, "Camera zoom is unavailable."}));
+  }
+  /// Reads the active capture configuration's exposure compensation range and applied EV.
+  virtual void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) {
+    completed({});
+  }
+  /// Indicates that a new submission can supersede an unconfirmed exposure compensation adjustment.
+  virtual bool CanReplaceExposureCompensationRequest() const noexcept { return false; }
+  /// Applies an exposure compensation in EV and returns the device's confirmed value and range.
+  virtual void SetExposureCompensation(float, std::function<void(CameraResult<ExposureCompensation>)> completed) {
+    completed(CameraResult<ExposureCompensation>::Failure(
+        {CameraErrorCode::Unavailable, "Camera exposure compensation is unavailable."}));
+  }
+  /// Sets a point expressed in normalized preview texture coordinates with a top-left origin.
+  virtual void FocusAndMeter(Point, std::function<void(CameraResult<void>)> completed) {
+    completed(CameraResult<void>::Failure({CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
   }
   /// Delivers one independent, upright JPEG. Stop must wait for accepted platform photo work to finish cleanup.
   virtual void CapturePhoto(PhotoOptions, std::function<void(CameraResult<ImageAsset>)> completed) {
@@ -112,5 +127,7 @@ struct PreviewPlacement {
 [[nodiscard]] std::optional<PreviewPlacement> PlacePreview(
     Size intrinsic, const PreviewOutput& output, PreviewOptions options, std::optional<Facing> facing, Size bounds
 );
+std::optional<Point> PreviewTexturePoint(const PreviewOutput& output, PreviewOptions options,
+                                        std::optional<Facing> facing, Size bounds, Point position);
 
 } // namespace huxerui::camera::detail

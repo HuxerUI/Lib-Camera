@@ -29,6 +29,7 @@ const Color foreground = Color::Rgb(242, 245, 247);
 const Color secondary = Color::Rgb(155, 166, 178);
 const Color accent = Color::Rgb(111, 226, 190);
 const Color record_red = Color::Rgb(255, 78, 89);
+const Color camera_yellow = Color::Rgb(255, 215, 78);
 
 enum class CaptureMode { Photo, Video };
 enum class VideoPhase { Idle, Authorizing, Starting, Recording, Finishing };
@@ -105,7 +106,6 @@ View RecordingBadge(camera::CameraSession session, bool recording, bool paused) 
 }
 
 struct ZoomControlState {
-  bool expanded = false;
   bool adjusting = false;
   bool applying = false;
   std::optional<float> proposal;
@@ -143,37 +143,273 @@ void SetZoomAdjusting(State<ZoomControlState> state, bool adjusting) {
   });
 }
 
-View ZoomControls(camera::CameraSession session, camera::ZoomState zoom, TaskScope tasks,
+std::string ZoomLabel(float ratio) {
+  char label[24];
+  std::snprintf(label, sizeof(label), ratio == std::round(ratio) ? "%.0f×" : "%.1f×",
+                static_cast<double>(ratio));
+  return label;
+}
+
+View ZoomButton(float ratio, std::string label, bool selected, const std::function<void(float)>& set_zoom) {
+  return Stack {
+    Label(std::move(label), 13.0F, selected ? background : foreground, FontWeight::SemiBold),
+  }.With(Frame{.width = 44.0F, .height = 44.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+         CornerRadius(22.0F), Background(selected ? camera_yellow : Color::Rgb(0, 0, 0, 0.0F)),
+         Focusable(), PointerCursor(PointerCursorKind::Hand),
+         Semantics{.role = SemanticRole::Button, .label = "Zoom " + ZoomLabel(ratio), .selected = selected,
+                   .descendants = SemanticDescendantPolicy::Exclude})
+      .OnClick([set_zoom, ratio] { set_zoom(ratio); });
+}
+
+View ZoomControls(camera::CameraSession session, camera::Zoom zoom, TaskScope tasks,
                   State<ZoomControlState> state) {
   const auto set_zoom = [session, tasks, state](float ratio) {
     RequestZoom(session, tasks, state, ratio);
   };
-  const float ratio = std::clamp(state->proposal.value_or(zoom.ratio), zoom.min_ratio, zoom.max_ratio);
-  char label[24];
-  std::snprintf(label, sizeof(label), "%.1f×", static_cast<double>(ratio));
+  const auto ratio = std::clamp(state->proposal.value_or(zoom.ratio), zoom.min_ratio, zoom.max_ratio);
   const auto supports = [zoom](float value) { return zoom.min_ratio <= value && value <= zoom.max_ratio; };
+  const bool wide = zoom.min_ratio < 0.99F;
+  const bool normal = supports(1.0F);
+  const bool tele = supports(2.0F);
+  float selected = wide ? zoom.min_ratio : normal ? 1.0F : 2.0F;
+  for (const auto candidate : {1.0F, 2.0F}) {
+    if (supports(candidate) && std::abs(std::log(ratio / candidate)) < std::abs(std::log(ratio / selected))) {
+      selected = candidate;
+    }
+  }
+  const auto button = [&](float preset) {
+    return ZoomButton(preset, ZoomLabel(preset == selected ? ratio : preset), preset == selected, set_zoom);
+  };
+  const auto adjust = [session, tasks, state](float scale) {
+    const auto current_zoom = session.Status().zoom;
+    if (!current_zoom) return;
+    const auto current = state->proposal.value_or(current_zoom->ratio);
+    const auto target = std::clamp(current * scale, current_zoom->min_ratio, current_zoom->max_ratio);
+    if (target != current) RequestZoom(session, tasks, state, target);
+  };
 
   return Column {
-    state->expanded ? View(Column {
-      Row {
-        supports(1.0F) ? View(Button("1×").OnClick([set_zoom] { set_zoom(1.0F); })) : View(),
-        supports(2.0F) ? View(Button("2×").OnClick([set_zoom] { set_zoom(2.0F); })) : View(),
-      }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
-      Slider(ratio).Range(zoom.min_ratio, zoom.max_ratio)
-          .OnStarted([state](float) { SetZoomAdjusting(state, true); })
-          .OnChanged(set_zoom)
-          .OnCommitted([state](float) { SetZoomAdjusting(state, false); })
-          .OnCanceled([state] { SetZoomAdjusting(state, false); })
-          .Key("zoom-slider"),
-      state->error.empty() ? View() : View(Label(state->error, 12.0F, foreground)),
-    }.With(Frame{.width = 216.0F}, Padding(10.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch),
-           Background(overlay_background), CornerRadius(16.0F))) : View(),
-    Button(std::string(label)).OnClick([state] {
-      SetZoomAdjusting(state, false);
-      state.Update([](ZoomControlState& value) { value.expanded = !value.expanded; });
-    }).Key("zoom-toggle"),
-  }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center),
-         Align(HorizontalAlignment::Center, VerticalAlignment::Center), Padding(8.0F));
+    state->error.empty() ? View() : View(Label(state->error, 12.0F, foreground)),
+    Row {
+      wide ? button(zoom.min_ratio).Key("wide") : View(),
+      normal ? button(1.0F).Key("normal") : View(),
+      tele ? button(2.0F).Key("tele") : View(),
+      !wide && !normal && !tele ? ZoomButton(zoom.min_ratio, ZoomLabel(ratio), true, set_zoom) : View(),
+    }.With(Padding(4.0F), Spacing(2.0F), Background(overlay_background), CornerRadius(26.0F),
+           DragGesture{.axis = Axis::Horizontal})
+        .On<DragEvents::Started>([state](const DragEvent&) { SetZoomAdjusting(state, true); })
+        .On<DragEvents::Changed>([adjust](const DragEvent& event) { adjust(std::exp(event.delta.x / 100.0F)); })
+        .On<DragEvents::Ended>([state](const DragEvent&) { SetZoomAdjusting(state, false); })
+        .On<DragEvents::Canceled>([state](const DragEvent&) { SetZoomAdjusting(state, false); })
+        .On<ViewEvents::ScrollInput>([adjust](const ScrollInputEvent& event) {
+          if (event.delta_y == 0.0F) return false;
+          adjust(std::exp(-event.delta_y / 160.0F));
+          return true;
+        }),
+  }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center), Padding(8.0F));
+}
+
+struct ViewfinderTap {
+  Point position;
+  Size size;
+
+  bool operator==(const ViewfinderTap&) const = default;
+};
+
+struct ViewfinderTapped : Event<void(ViewfinderTap)> {};
+
+struct ViewfinderTapInput {
+  class Extension;
+};
+
+class ViewfinderTapInput::Extension final : public NodeExtension {
+public:
+  Extension(ViewNode&, const ViewfinderTapInput&) {}
+  void Update(ViewNode&, const ViewfinderTapInput&) {}
+
+  bool HitTest(ViewNode& node, Point position) const override { return node.Bounds().Contains(position); }
+
+  PointerResult OnPointer(ViewNode& node, const PointerEvent& event) override {
+    if (event.type == PointerEventType::Down) {
+      if (down_) {
+        down_.reset();
+        return PointerResult::Ignored;
+      }
+      if (event.pressed_buttons != PointerButton::Primary) return PointerResult::Ignored;
+      down_ = event;
+      return PointerResult::Observe;
+    }
+    if (!down_ || down_->pointer_id != event.pointer_id) return PointerResult::Ignored;
+    const auto displacement = event.position - down_->position;
+    if (event.type == PointerEventType::Cancel || std::hypot(displacement.x, displacement.y) > 8.0F) {
+      down_.reset();
+      return PointerResult::Ignored;
+    }
+    if (event.type == PointerEventType::Up) {
+      down_.reset();
+      const auto bounds = node.Bounds();
+      if (bounds.Contains(event.position)) {
+        EmitEvent<ViewfinderTapped>(ViewfinderTap{event.position, {bounds.width, bounds.height}});
+      }
+      return PointerResult::Ignored;
+    }
+    return PointerResult::Observe;
+  }
+
+private:
+  std::optional<PointerEvent> down_;
+};
+
+struct ViewfinderPoint {
+  struct Value {
+    Point anchor;
+    bool beside_anchor = false;
+
+    bool operator==(const Value&) const = default;
+  };
+};
+
+class ViewfinderOverlay final : public Layout<ViewfinderOverlay> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    LayoutResult result;
+    const Size size{constraints.HasBoundedWidth() ? constraints.max_width : constraints.min_width,
+                    constraints.HasBoundedHeight() ? constraints.max_height : constraints.min_height};
+    for (auto& child : node.Children()) {
+      const auto child_size = context.Measure(child, constraints.Loose());
+      const auto* point = child.LayoutValue<ViewfinderPoint>();
+      Point origin{};
+      if (point) {
+        const Point anchor{point->anchor.x * size.width, point->anchor.y * size.height};
+        origin = {anchor.x - child_size.width / 2.0F, anchor.y - child_size.height / 2.0F};
+        if (point->beside_anchor) {
+          constexpr float gap = 38.0F;
+          const float bottom = std::max(0.0F, size.height - child_size.height - 64.0F);
+          origin.x = anchor.x + gap + child_size.width <= size.width - 8.0F
+              ? anchor.x + gap : anchor.x - gap - child_size.width;
+          origin.y = std::clamp(origin.y, std::min(64.0F, bottom), bottom);
+        }
+        origin.x = std::clamp(origin.x, 0.0F, size.width - child_size.width);
+        origin.y = std::clamp(origin.y, 0.0F, size.height - child_size.height);
+      }
+      result.Place(child, origin);
+    }
+    return result.SetSize(size);
+  }
+};
+
+class VerticalExposureSlider final : public Layout<VerticalExposureSlider> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    const auto size = constraints.Constrain({44.0F, 108.0F});
+    auto& child = node.ChildAt(0);
+    context.Measure(child, Constraints{}.TightWidth(size.height).TightHeight(size.width));
+    return LayoutResult{}.Place(child, {(size.width - size.height) / 2.0F, (size.height - size.width) / 2.0F})
+        .SetSize(size);
+  }
+};
+
+struct ViewfinderSelection {
+  std::optional<Point> point;
+  std::uint64_t id = 0;
+  bool adjusting_exposure = false;
+
+  bool operator==(const ViewfinderSelection&) const = default;
+};
+
+struct ExposureControlState {
+  std::optional<float> proposal;
+  std::optional<float> target;
+  std::uint64_t request_id = 0;
+  bool applying = false;
+  std::string error;
+
+  bool operator==(const ExposureControlState&) const = default;
+};
+
+[[huxerui::composable]]
+View ExposureControls(camera::CameraSession session, camera::ExposureCompensation exposure,
+                      State<ViewfinderSelection> selection) {
+  auto control = UseState(ExposureControlState{});
+  auto tasks = UseTaskScope();
+  const auto set_ev = [session, tasks, control, exposure](float ev) {
+    const double step = exposure.step_ev.value_or(0.0F);
+    const float target = std::clamp(step > 0.0 ? static_cast<float>(std::round(ev / step) * step) : ev,
+                                   exposure.min_ev, exposure.max_ev);
+    auto next = control.Get();
+    next.proposal = ev;
+    const bool same_device_step = std::abs(exposure.ev - target) <= step * 0.01;
+    if (next.applying ? next.target == target : same_device_step) {
+      next.target = target;
+      next.error.clear();
+      control = std::move(next);
+      return;
+    }
+    const auto id = ++next.request_id;
+    next.target = target;
+    next.applying = true;
+    next.error.clear();
+    control = std::move(next);
+    tasks.Launch([session, control, target, id]() -> Task<void> {
+      const auto result = co_await session.SetExposureCompensationAsync(target);
+      if (control->request_id != id) co_return;
+      control.Update([&](ExposureControlState& value) {
+        value.applying = false;
+        if (!result.Succeeded()) {
+          value.target.reset();
+          if (result.Error().code != camera::CameraErrorCode::Interrupted) value.error = result.Error().message;
+        }
+      });
+    });
+  };
+  const bool adjusting = selection->adjusting_exposure;
+  const auto ev = adjusting || control->applying ? control->target.value_or(exposure.ev) : exposure.ev;
+  const auto position = adjusting ? control->proposal.value_or(ev) : ev;
+  char label[24];
+  std::snprintf(label, sizeof(label), ev == 0.0F ? "%.1f" : "%+.2f", static_cast<double>(ev));
+  const auto set_adjusting = [selection](bool adjusting) {
+    selection.Update([adjusting](ViewfinderSelection& value) { value.adjusting_exposure = adjusting; });
+  };
+  auto slider = Slider(std::clamp(position, exposure.min_ev, exposure.max_ev))
+      .Range(exposure.min_ev, exposure.max_ev).OnChanged(set_ev)
+      .OnStarted([control, set_adjusting](float value) {
+        control.Update([value](ExposureControlState& state) { state.proposal = value; });
+        set_adjusting(true);
+      })
+      .OnCommitted([set_adjusting](float) { set_adjusting(false); })
+      .OnCanceled([set_adjusting] { set_adjusting(false); });
+
+  return Column {
+    VerticalExposureSlider {
+      std::move(slider).With(Rotation(-90.0F), Semantics{.label = "Exposure compensation"}),
+    },
+    Stack {
+      Label("☀", 17.0F, camera_yellow).With(Offset(Point{0.0F, -5.0F})),
+      Label(std::string(label), 10.0F, camera_yellow).With(Offset(Point{0.0F, 9.0F})),
+    }.With(Frame{.width = 44.0F, .height = 42.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center),
+           Focusable(), PointerCursor(PointerCursorKind::Hand),
+           Semantics{.role = SemanticRole::Button, .label = "Reset exposure compensation",
+                     .value = std::string(label) + " EV", .descendants = SemanticDescendantPolicy::Exclude})
+        .OnClick([set_ev, selection] {
+          selection.Update([](ViewfinderSelection& value) { ++value.id; });
+          set_ev(0.0F);
+        }),
+    adjusting || control->error.empty() ? View()
+        : View(Label(control->error, 11.0F, foreground).With(Frame{.max_width = 100.0F})),
+  }.With(CrossAlign(CrossAxisAlignment::Center), Background(overlay_background), CornerRadius(22.0F));
+}
+
+View MeteringReticle(bool metering) {
+  return Canvas([metering](PaintContext& paint, Size size) {
+    const Rect box{2.0F, 2.0F, size.width - 4.0F, size.height - 4.0F};
+    paint.DrawBorder(box, Color::Rgb(0, 0, 0, 0.65F), StrokeStyle{.width = 3.0F}, CornerRadii{6.0F});
+    paint.DrawBorder(box, metering ? camera_yellow : foreground,
+                     StrokeStyle{.width = 1.5F}, CornerRadii{6.0F});
+  }).With(Frame{.width = 60.0F, .height = 60.0F});
 }
 
 [[huxerui::composable]]
@@ -460,6 +696,7 @@ View CameraWorkspace() {
   auto saving_video = UseState(false);
   auto video_message = UseState(std::string{});
   auto zoom_controls = UseState(ZoomControlState{});
+  auto selection = UseState(ViewfinderSelection{});
   auto application = UseApplication();
   auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
@@ -478,7 +715,24 @@ View CameraWorkspace() {
     if (!zoom_available) zoom_controls = ZoomControlState{.request_id = zoom_controls->request_id + 1};
   }, zoom_available);
   const ImageFit selected_fit = fit;
+  const camera::PreviewOptions preview_options{.fit = selected_fit, .mirror = mirror};
   const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
+  const auto texture = status.preview ? status.preview->texture : nullptr;
+  const auto rotation = status.preview ? status.preview->rotation : camera::PreviewRotation::R0;
+  Lifecycle([selection] {
+    if (selection->point) selection = ViewfinderSelection{.id = selection->id + 1};
+  }, live, texture, rotation, preview_options);
+  Lifecycle([selection, tasks] {
+    TaskHandle timeout;
+    if (selection->point && !selection->adjusting_exposure) {
+      const auto id = selection->id;
+      timeout = tasks.Launch([selection, id]() -> Task<void> {
+        co_await Delay(std::chrono::seconds(4));
+        if (selection->id == id) selection = ViewfinderSelection{.id = id};
+      });
+    }
+    return [timeout] { timeout.Cancel(); };
+  }, selection->point.has_value(), selection->id, selection->adjusting_exposure);
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
   const bool video = mode == CaptureMode::Video;
@@ -638,9 +892,41 @@ View CameraWorkspace() {
       : StatusBadge(StateName(status.state), status_color);
 
   View preview = Stack {
-    camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
+    camera::CameraPreview(session, preview_options).Key("main-preview"),
     live && grid ? CompositionGrid() : View(),
   }.With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
+  if (live && (status.can_focus_and_meter || status.exposure_compensation)) {
+    preview = std::move(preview).With(ViewfinderTapInput{})
+        .On<ViewfinderTapped>([session, tasks, selection, preview_options](ViewfinderTap tap) {
+          const auto status = session.Status();
+          if (tap.size.width <= 0.0F || tap.size.height <= 0.0F || !status.preview ||
+              !status.preview->texture) return;
+          if (preview_options.fit == ImageFit::Contain) {
+            auto size = status.preview->texture->IntrinsicSize();
+            size.width *= status.preview->crop.width;
+            size.height *= status.preview->crop.height;
+            if (status.preview->rotation == camera::PreviewRotation::R90 ||
+                status.preview->rotation == camera::PreviewRotation::R270) std::swap(size.width, size.height);
+            if (size.width <= 0.0F || size.height <= 0.0F) return;
+            const auto scale = std::min(tap.size.width / size.width, tap.size.height / size.height);
+            const Rect content{(tap.size.width - size.width * scale) / 2.0F,
+                               (tap.size.height - size.height * scale) / 2.0F,
+                               size.width * scale, size.height * scale};
+            if (!content.Contains(tap.position)) return;
+          }
+          const auto id = selection->id + 1;
+          selection = ViewfinderSelection{.point = Point{tap.position.x / tap.size.width,
+                                                        tap.position.y / tap.size.height}, .id = id};
+          if (status.can_focus_and_meter) {
+            tasks.Launch([session, selection, tap, preview_options, id]() -> Task<void> {
+              const auto result = co_await session.FocusAndMeterAsync(tap.position, tap.size, preview_options);
+              if (!result.Succeeded() && !session.Status().exposure_compensation && selection->id == id) {
+                selection = ViewfinderSelection{.id = id};
+              }
+            });
+          }
+        });
+  }
   if (live && zoom_available) {
     const auto finish_zoom = [zoom_controls](const TransformEvent&) { SetZoomAdjusting(zoom_controls, false); };
     preview = std::move(preview).With(TransformGesture{})
@@ -657,15 +943,20 @@ View CameraWorkspace() {
         .On<TransformEvents::Canceled>(finish_zoom);
   }
 
+  const auto selected_point = live ? selection->point : std::nullopt;
   View viewfinder = Stack {
     std::move(preview).Key("preview-surface"),
     live ? View() : EmptyPreview(status, authorizing, permission_error),
+    selected_point ? View(ViewfinderOverlay {
+      MeteringReticle(status.can_focus_and_meter).LayoutValue<ViewfinderPoint>({*selected_point}),
+      status.exposure_compensation
+          ? ExposureControls(session, *status.exposure_compensation, selection)
+                .LayoutValue<ViewfinderPoint>({*selected_point, true}).Key("exposure") : View(),
+    }.Key("viewfinder-overlay")) : View(),
     Column {
       Row {
         badge,
         Spacer(),
-        live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
-            .With(Background(overlay_background), CornerRadius(14.0F))) : View(),
         IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
             .With(Background(overlay_background), CornerRadius(14.0F)),
       }.With(
@@ -688,7 +979,7 @@ View CameraWorkspace() {
           Label("FULL FRAME / MIRROR OFF", 9.0F, foreground, FontWeight::Medium).With(Padding(8.0F)),
         }.With(Background(background), Border(outline, 1.0F), CornerRadius(12.0F), ClipChildren()),
       }.With(Padding(16.0F), SafeAreaPadding{.top = false, .bottom = false})) : View(),
-      zoom_available ? ZoomControls(session, *status.zoom, tasks, zoom_controls).Key("camera-zoom") : View(),
+      live && zoom_available ? ZoomControls(session, *status.zoom, tasks, zoom_controls).Key("camera-zoom") : View(),
     }.With(CrossAlign(CrossAxisAlignment::Stretch)),
   }.With(
       Grow(),
@@ -700,20 +991,18 @@ View CameraWorkspace() {
   const char* photo_action = status.capturing_photo ? "Taking photo" : "Take photo";
   const char* video_action = recording ? "Stop recording" : phase == VideoPhase::Authorizing ? "Requesting microphone access"
       : phase == VideoPhase::Starting ? "Starting microphone" : video_busy ? "Processing video" : "Record video";
-  const bool shutter_enabled = video ? recording || (!video_busy && !saving_video) : !status.capturing_photo;
-  View primary = live || video_busy
-      ? ShutterButton(video ? video_action : photo_action, video, video_busy, shutter_enabled)
+  const bool shutter_enabled = video ? recording || (live && !video_busy && !saving_video)
+                                     : live && !status.capturing_photo;
+  const bool can_retry = !live && !video_busy && !authorizing && !stopping &&
+      (failed || !permission_error->empty());
+  View primary = can_retry
+      ? View(Button("Try again").OnClick(start_camera))
+      : ShutterButton(video ? video_action : photo_action, video, video_busy, shutter_enabled)
           .OnClick([video, take_photo, toggle_recording] {
             if (video) toggle_recording();
             else take_photo();
           })
-      : Button(authorizing ? "Requesting access" : stopping ? "Stopping camera"
-                           : failed || !permission_error->empty() ? "Try again"
-                           : active ? "Stop camera" : "Start camera")
-          .OnClick([active, failed, start_camera] {
-            if (active && !failed) active = false;
-            else start_camera();
-          }).With(Enabled(!authorizing && !stopping));
+          .With(Opacity(live || video_busy ? 1.0F : 0.35F));
 
   View left_control = (recording && live
       ? IconButton(paused ? app::images::resume : app::images::pause,
@@ -783,6 +1072,19 @@ View StyledWorkspace() {
   icon.icon_size = 22.0F;
   icon.corner_radius = 12.0F;
   theme.Set(icon);
+
+  auto slider = UseEnvironment<SliderStyle>();
+  slider.inactive_track = Color::Rgb(255, 255, 255, 0.28F);
+  slider.active_track = camera_yellow;
+  slider.thumb = camera_yellow;
+  slider.thumb_width = 10.0F;
+  slider.thumb_height = 10.0F;
+  slider.hovered_thumb_width = 12.0F;
+  slider.hovered_thumb_height = 12.0F;
+  slider.pressed_thumb_width = 14.0F;
+  slider.pressed_thumb_height = 14.0F;
+  slider.track_height = 2.0F;
+  theme.Set(slider);
 
   auto segmented = UseEnvironment<SegmentedButtonStyle>();
   segmented.minimum_height = 44.0F;

@@ -1,5 +1,6 @@
 package org.huxerui.lib.camera;
 
+import android.graphics.PointF;
 import android.graphics.SurfaceTexture;
 import android.opengl.EGL14;
 import android.opengl.EGLConfig;
@@ -100,6 +101,7 @@ final class CameraSurface {
     private final FloatBuffer vertices = ByteBuffer.allocateDirect(8 * Float.BYTES)
             .order(ByteOrder.nativeOrder()).asFloatBuffer();
     private final float[] transform = new float[16];
+    private volatile float[] meteringTransform;
     private final int[] textures = new int[2];
     private int framebuffer;
     private int program;
@@ -204,6 +206,7 @@ final class CameraSurface {
         if (timestamp == lastTimestamp) return null;
         lastTimestamp = timestamp;
         source.getTransformMatrix(transform);
+        if (!java.util.Arrays.equals(meteringTransform, transform)) meteringTransform = transform.clone();
         int width = renderSize[0];
         int height = renderSize[1];
         // Redefine the image storage to detach it from the previous frame's EGLImage.
@@ -234,6 +237,15 @@ final class CameraSurface {
         if (GLES20.glGetError() != GLES20.GL_NO_ERROR) throw new IllegalStateException("Cannot draw the camera frame.");
         // JNI publishes and processes the frame while its capture EGL context is current.
         return processFrame(output, textures[1], timestamp);
+    }
+
+    PointF bufferPoint(float x, float y) {
+        float[] matrix = meteringTransform;
+        if (matrix == null) return null;
+        // The frame shader maps bottom-left GL coordinates to top-left buffer coordinates.
+        float v = 1.0f - y;
+        return new PointF(matrix[0] * x + matrix[4] * v + matrix[12],
+                matrix[1] * x + matrix[5] * v + matrix[13]);
     }
 
     private static void bindTexture(int target, int texture) {
