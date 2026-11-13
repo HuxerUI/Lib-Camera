@@ -329,7 +329,8 @@ struct CameraStatus {
   /// Exposure compensation for the current camera. Empty while unavailable or before the range has been read.
   std::optional<ExposureCompensation> exposure_compensation;
   /// Whether the current preview supports setting a focus or metering point.
-  /// Empty previews, frame processors, and explicitly sized outputs do not provide point control.
+  /// Available with the camera's default or explicitly sized output when the device supports point control.
+  /// Empty previews and custom frame processors do not provide point control.
   bool can_focus_and_meter = false;
   /// Still-photo flash capability. Both modes are false while unavailable or before the capability is read.
   PhotoFlash photo_flash;
@@ -411,6 +412,7 @@ public:
   /// @brief Sets a focus and metering point on the active camera.
   ///
   /// Pass the point and size in the same local logical coordinates as CameraPreview, with its presentation options.
+  /// The session maps the point through preview placement and any configured output crop to the camera source.
   /// Points outside the displayed image return Unavailable. The camera applies the supported operations at the point.
   /// A successful result confirms the request, without implying that the lens acquired focus.
   /// Starting another request supersedes an earlier one. The camera stays open and any recording continues.

@@ -26,6 +26,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   std::shared_ptr<CameraBackend> backend;
   CameraOptions desired;
   CameraOptions opened;
+  Rect preview_source_crop;
   std::shared_ptr<FramePipeline> frames;
   std::shared_ptr<VideoRecording> recording;
   std::chrono::microseconds completed_recording_duration{};

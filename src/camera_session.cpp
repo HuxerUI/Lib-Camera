@@ -78,7 +78,7 @@ struct PhotoRequest {
 };
 
 CameraSessionData::CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app)
-    : status(value), tasks(scope), application(app) {}
+    : status(value), tasks(scope), application(app), preview_source_crop(full_texture_crop) {}
 
 void CameraSessionData::InterruptControls() {
   ++control_generation;
@@ -338,8 +338,8 @@ void CameraSessionData::Reconcile() {
       self->frames = std::make_shared<FramePipeline>(self->opened);
       self->backend->SetFramePipeline(self->frames);
       self->engaged = true;
-      self->backend->Start(self->opened.facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
-        scope.Post([weak, opening_generation, value = std::move(value)]() mutable {
+      auto changed = [weak, scope = self->tasks, opening_generation](CameraStatus value, Rect source_crop) {
+        scope.Post([weak, opening_generation, value = std::move(value), source_crop]() mutable {
           auto owner = weak.lock();
           if (!owner || owner->closed || owner->generation != opening_generation) {
             return;
@@ -357,9 +357,9 @@ void CameraSessionData::Reconcile() {
             value.capturing_photo = static_cast<bool>(owner->photo);
             value.recording_video = static_cast<bool>(owner->recording);
             value.recording_paused = value.recording_video && owner->status->recording_paused;
-            // Processed textures can have a different field of view from the platform source.
+            // A custom processor can change geometry without a known mapping to the capture source.
             value.can_focus_and_meter = value.state == SessionState::Running && value.preview &&
-                value.can_focus_and_meter && !owner->opened.frame_processor_factory && !owner->opened.output_pixel_width;
+                value.can_focus_and_meter && !owner->opened.frame_processor_factory;
             if (value.state == SessionState::Running && previous == SessionState::Running) {
               value.zoom = owner->status->zoom;
               value.exposure_compensation = owner->status->exposure_compensation;
@@ -367,6 +367,7 @@ void CameraSessionData::Reconcile() {
               value.torch = owner->status->torch;
             }
             const bool read_controls = value.state == SessionState::Running && previous != SessionState::Running;
+            owner->preview_source_crop = source_crop;
             owner->status = std::move(value);
             if (read_controls) {
               owner->ReadZoom();
@@ -375,7 +376,8 @@ void CameraSessionData::Reconcile() {
             }
           }
         });
-      });
+      };
+      self->backend->Start(self->opened.facing, std::move(changed));
     } catch (const std::exception& error) {
       if (auto self = weak.lock(); self && !self->closed && self->generation == opening_generation) {
         self->failure = CameraError{CameraErrorCode::CaptureFailed, error.what()};
@@ -543,7 +545,8 @@ Task<CameraResult<void>> FocusAndMeter(std::shared_ptr<CameraSessionData> owner,
           completion.Complete(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera preview is not ready."}));
           return {};
         }
-        const auto point = PreviewTexturePoint(*status.preview, options, status.actual_facing, size, position);
+        const auto point = PreviewTexturePoint(*status.preview, options, status.actual_facing, size, position,
+                                               owner->preview_source_crop);
         if (!status.can_focus_and_meter || !point) {
           completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Unavailable,
               "The camera cannot focus or meter at this preview point."}));

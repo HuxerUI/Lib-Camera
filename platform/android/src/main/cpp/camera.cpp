@@ -90,6 +90,7 @@ public:
           const auto& facing = fields.at("facing");
           if (!facing.IsNull()) status.actual_facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
           status.can_focus_and_meter = fields.at("canFocusAndMeter").AsBoolean();
+          auto source_crop = full_texture_crop;
           const auto& output = fields.at("preview");
           if (!output.IsNull()) {
             const auto& preview = output.AsObject();
@@ -103,8 +104,11 @@ public:
                          static_cast<float>(preview.at("width").AsDouble()), static_cast<float>(preview.at("height").AsDouble())},
                 .rotation = static_cast<PreviewRotation>(rotation),
                 .mirrored = preview.at("mirrored").AsBoolean()};
+            const auto& source = preview.at("sourceCrop").AsObject();
+            source_crop = {static_cast<float>(source.at("x").AsDouble()), static_cast<float>(source.at("y").AsDouble()),
+                           static_cast<float>(source.at("width").AsDouble()), static_cast<float>(source.at("height").AsDouble())};
           }
-          self->changed_(std::move(status));
+          self->changed_(std::move(status), source_crop);
         } catch (const std::exception& error) {
           self->Fail(CameraErrorCode::ConfigurationFailed, error.what());
         }
@@ -112,7 +116,7 @@ public:
     });
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing> facing, StatusCallback changed) override {
     changed_ = std::move(changed);
     const auto run = ++run_;
     if (frame_pipeline_) {
@@ -267,11 +271,11 @@ private:
   }
 
   void Fail(CameraErrorCode code, std::string message) {
-    changed_({.state = SessionState::Failed, .error = CameraError{code, std::move(message)}});
+    changed_({.state = SessionState::Failed, .error = CameraError{code, std::move(message)}}, full_texture_crop);
   }
 
   PlatformChannel channel_;
-  std::function<void(CameraStatus)> changed_;
+  StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lighting_;
   std::int64_t run_ = 0;
   std::int64_t pipeline_ = 0;
@@ -296,6 +300,7 @@ namespace {
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using huxerui::camera::detail::ProcessedFrame;
 
 struct CameraOutput {
   std::shared_ptr<android::GlTexture> texture;
@@ -305,7 +310,7 @@ struct CameraOutput {
   PreviewRotation rotation;
   bool mirrored;
   bool realtime_timestamps;
-  std::optional<PreviewOutput> published;
+  std::optional<ProcessedFrame> published;
   camera::detail::FrameProducer producer;
 };
 
@@ -360,21 +365,25 @@ Java_org_huxerui_lib_camera_CameraSurface_processFrame(JNIEnv* env, jclass, jlon
     auto& output = *reinterpret_cast<CameraOutput*>(handle);
     output.texture->PublishCurrent({.texture_name = static_cast<std::uint32_t>(texture),
         .pixel_width = output.width, .pixel_height = output.height, .alpha = android::GlTexture::Alpha::Opaque});
-    PreviewOutput preview{.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored};
+    ProcessedFrame frame{.output = {.texture = output.texture, .rotation = output.rotation, .mirrored = output.mirrored}};
     if (output.frames) {
       const auto capture_time = std::chrono::nanoseconds(time);
       const auto synchronized_time = output.realtime_timestamps ? std::optional{capture_time} : std::nullopt;
-      auto processed = output.frames->Process(output.producer, std::move(preview), capture_time,
+      auto processed = output.frames->Process(output.producer, std::move(frame.output), capture_time,
           static_cast<std::uint32_t>(output.width), static_cast<std::uint32_t>(output.height), synchronized_time);
       if (!processed.Succeeded()) throw std::runtime_error(processed.Error().message);
-      preview = std::move(processed).Value();
+      frame = std::move(processed).Value();
     }
-    if (!preview.texture || preview == output.published) return nullptr;
-    output.published = preview;
+    if (!frame.output.texture || frame == output.published) return nullptr;
+    output.published = std::move(frame);
+    const auto& [preview, source_crop] = *output.published;
     return android::PlatformPayloadToJava(env, PlatformPayload(PlatformPayload::Object{
         {"texture", preview.texture}, {"x", double(preview.crop.x)}, {"y", double(preview.crop.y)},
         {"width", double(preview.crop.width)}, {"height", double(preview.crop.height)},
-        {"rotation", static_cast<std::int64_t>(preview.rotation)}, {"mirrored", preview.mirrored}})).Release();
+        {"rotation", static_cast<std::int64_t>(preview.rotation)}, {"mirrored", preview.mirrored},
+        {"sourceCrop", PlatformPayload::Object{
+            {"x", double(source_crop.x)}, {"y", double(source_crop.y)},
+            {"width", double(source_crop.width)}, {"height", double(source_crop.height)}}}})).Release();
   } catch (const std::exception& error) {
     ThrowJava(env, error);
     return nullptr;

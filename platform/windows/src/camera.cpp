@@ -122,7 +122,7 @@ std::optional<ExposureCompensation> DriverExposureCompensation(IMFExtendedCamera
 
 class CaptureEvents final : public Callback<IMFCaptureEngineOnEventCallback> {
 public:
-  std::function<void(CameraStatus)> changed;
+  CameraBackend::StatusCallback changed;
 
   HRESULT STDMETHODCALLTYPE OnEvent(IMFMediaEvent* event) override {
     GUID type{};
@@ -159,7 +159,7 @@ public:
   }
 
   void Fail(HRESULT result, std::optional<CameraError> error = {}) {
-    std::function<void(CameraStatus)> callback;
+    CameraBackend::StatusCallback callback;
     {
       std::lock_guard lock(mutex_);
       failure_ = result;
@@ -171,16 +171,16 @@ public:
     ready_.notify_all();
     if (callback)
       callback({.state = SessionState::Failed,
-                .error = error ? std::move(*error) : Error(result, CameraErrorCode::CaptureFailed)});
+                .error = error ? std::move(*error) : Error(result, CameraErrorCode::CaptureFailed)}, full_texture_crop);
   }
 
   void Publish(CameraStatus status) {
-    std::function<void(CameraStatus)> callback;
+    CameraBackend::StatusCallback callback;
     {
       std::lock_guard lock(mutex_);
       if (!reported_ && !silent_) callback = changed;
     }
-    if (callback) callback(std::move(status));
+    if (callback) callback(std::move(status), full_texture_crop);
   }
 
   void Silence() {
@@ -296,8 +296,8 @@ public:
         if (!processed.Succeeded()) {
           finished_ = true;
           events->Fail(E_FAIL, processed.Error());
-        } else if (processed.Value().texture && processed.Value() != preview_) {
-          preview_ = std::move(processed).Value();
+        } else if (processed.Value().output.texture && processed.Value().output != preview_) {
+          preview_ = std::move(processed).Value().output;
           if (running_) Publish();
         }
       }
@@ -436,7 +436,7 @@ public:
     scheduled_ = true;
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed, std::shared_ptr<FramePipeline> pipeline) {
+  void Start(std::optional<Facing> facing, CameraBackend::StatusCallback changed, std::shared_ptr<FramePipeline> pipeline) {
     changed_ = std::move(changed);
     try {
       Require(com_status_);
@@ -445,7 +445,8 @@ public:
       auto device = SelectDevice(facing, facing_);
       if (!device) {
         changed_({.state = SessionState::Failed,
-                  .error = CameraError{CameraErrorCode::DeviceNotFound, "No camera matches the requested facing."}});
+                  .error = CameraError{CameraErrorCode::DeviceNotFound, "No camera matches the requested facing."}},
+                 full_texture_crop);
         return;
       }
       Require(device->ActivateObject(IID_PPV_ARGS(&device_)));
@@ -471,9 +472,10 @@ public:
       if (events_)
         events_->Fail(result, std::move(error));
       else
-        changed_({.state = SessionState::Failed, .error = std::move(error)});
+        changed_({.state = SessionState::Failed, .error = std::move(error)}, full_texture_crop);
     } catch (const std::exception& error) {
-      changed_({.state = SessionState::Failed, .error = CameraError{CameraErrorCode::ConfigurationFailed, error.what()}});
+      changed_({.state = SessionState::Failed, .error = CameraError{CameraErrorCode::ConfigurationFailed, error.what()}},
+               full_texture_crop);
     }
   }
 
@@ -788,7 +790,7 @@ private:
   bool preview_started_ = false;
   HRESULT com_status_ = S_OK;
   std::optional<Facing> facing_;
-  std::function<void(CameraStatus)> changed_;
+  CameraBackend::StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lighting_changed_;
   ComPtr<IMFMediaSource> device_;
   ComPtr<IMFCaptureEngine> engine_;
@@ -806,7 +808,7 @@ public:
       capture_->Post([capture = capture_] { capture->Stop({}); });
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing> facing, StatusCallback changed) override {
     capture_->Post([capture = capture_, facing, changed = std::move(changed), pipeline = frame_pipeline_] {
       capture->Start(facing, changed, pipeline);
     });

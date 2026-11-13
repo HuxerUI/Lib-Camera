@@ -98,7 +98,7 @@ TextureResizer::TextureResizer() = default;
 TextureResizer::~TextureResizer() = default;
 void TextureResizer::Reset() { state_.reset(); }
 
-bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
+std::optional<Rect> TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
   const auto* source = dynamic_cast<const windows::D3D11Texture*>(frame.texture.get());
   const auto snapshot = source ? source->AcquireFrame() : nullptr;
   if (!snapshot) {
@@ -106,7 +106,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
   }
   const auto source_width = static_cast<UINT>(snapshot->PixelWidth());
   const auto source_height = static_cast<UINT>(snapshot->PixelHeight());
-  if (width == source_width && height == source_height && frame.crop == full_texture_crop) return true;
+  if (width == source_width && height == source_height && frame.crop == full_texture_crop) return full_texture_crop;
   const auto crop = CropForOutput(frame.crop, source_width, source_height, width, height);
 
   if (!state_) {
@@ -117,7 +117,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
   auto& state = *state_;
   state.SetSource(source_width, source_height, snapshot->Alpha() == windows::D3D11Texture::Alpha::Opaque
       ? D2D1_ALPHA_MODE_IGNORE : D2D1_ALPHA_MODE_PREMULTIPLIED);
-  if (!snapshot->TryCopyTo(*context_, *state.source.Get())) return false;
+  if (!snapshot->TryCopyTo(*context_, *state.source.Get())) return {};
 
   const auto from = D2D1::RectF(crop.x * source_width, crop.y * source_height,
                                (crop.x + crop.width) * source_width, (crop.y + crop.height) * source_height);
@@ -133,7 +133,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
   state.texture->Publish({.texture = state.target.Get(), .alpha = snapshot->Alpha()});
   frame.texture = state.texture;
   frame.crop = full_texture_crop;
-  return true;
+  return crop;
 }
 
 } // namespace huxerui::camera::detail

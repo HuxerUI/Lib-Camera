@@ -31,8 +31,9 @@ class TextureResizer {
 public:
   TextureResizer();
   ~TextureResizer();
-  /// Replaces the texture and crop in place. Returns false if the frame is temporarily unavailable.
-  bool Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height);
+  /// Replaces the texture and crop in place and returns the region sampled from the input texture.
+  /// An empty result means the frame is temporarily unavailable.
+  std::optional<Rect> Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height);
   void Reset();
 #if defined(_WIN32)
   void SetContext(ID3D11DeviceContext& context) { context_ = &context; }
@@ -51,6 +52,14 @@ struct FrameProducer {
   TextureResizer resizer;
 };
 
+struct ProcessedFrame {
+  PreviewOutput output;
+  /// For point control without a custom processor, the source region covered by the entire output texture.
+  Rect source_crop = full_texture_crop;
+
+  bool operator==(const ProcessedFrame&) const = default;
+};
+
 /// Processes and sizes one shared output per frame for preview and recording.
 class FramePipeline {
 public:
@@ -58,7 +67,7 @@ public:
   /// Selects the initial render size when uniform scaling can produce the configured output directly.
   std::pair<std::uint32_t, std::uint32_t> ProducerSize(std::uint32_t width, std::uint32_t height) const noexcept;
   /// Acquires the recording snapshot before return. A success without a texture skips the frame.
-  CameraResult<PreviewOutput> Process(FrameProducer& producer, PreviewOutput input,
+  CameraResult<ProcessedFrame> Process(FrameProducer& producer, PreviewOutput input,
       std::chrono::nanoseconds capture_time, std::uint32_t pixel_width, std::uint32_t pixel_height,
       std::optional<std::chrono::nanoseconds> synchronized_time = {});
   /// Called on the UI thread. An empty pointer detaches the recorder from subsequent frames.
@@ -78,9 +87,12 @@ private:
 /// Operations enter on the UI thread; callbacks may originate on a producer queue.
 class CameraBackend {
 public:
+  /// Publishes the session status and the source crop used for point control.
+  using StatusCallback = std::function<void(CameraStatus, Rect)>;
+
   virtual ~CameraBackend() = default;
   void SetFramePipeline(std::shared_ptr<FramePipeline> frames) { frame_pipeline_ = std::move(frames); }
-  virtual void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) = 0;
+  virtual void Start(std::optional<Facing> facing, StatusCallback changed) = 0;
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
   /// Reads the active capture configuration's zoom range and applied ratio.
@@ -102,7 +114,7 @@ public:
     completed(CameraResult<ExposureCompensation>::Failure(
         {CameraErrorCode::Unavailable, "Camera exposure compensation is unavailable."}));
   }
-  /// Sets a point expressed in normalized preview texture coordinates with a top-left origin.
+  /// Sets a point expressed in normalized capture source texture coordinates with a top-left origin.
   virtual void FocusAndMeter(Point, std::function<void(CameraResult<void>)> completed) {
     completed(CameraResult<void>::Failure({CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
   }
@@ -134,6 +146,7 @@ struct PreviewPlacement {
     Size intrinsic, const PreviewOutput& output, PreviewOptions options, std::optional<Facing> facing, Size bounds
 );
 std::optional<Point> PreviewTexturePoint(const PreviewOutput& output, PreviewOptions options,
-                                        std::optional<Facing> facing, Size bounds, Point position);
+                                        std::optional<Facing> facing, Size bounds, Point position,
+                                        Rect source_crop = full_texture_crop);
 
 } // namespace huxerui::camera::detail

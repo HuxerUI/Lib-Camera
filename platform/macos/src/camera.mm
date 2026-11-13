@@ -13,8 +13,11 @@
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using huxerui::camera::detail::CameraBackend;
 using huxerui::camera::detail::FramePipeline;
 using huxerui::camera::detail::FrameProducer;
+using huxerui::camera::detail::ProcessedFrame;
+using huxerui::camera::detail::full_texture_crop;
 
 namespace {
 
@@ -150,14 +153,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::shared_ptr<macos::PixelBufferTexture> texture_;
   std::shared_ptr<FramePipeline> frames_;
   FrameProducer producer_;
-  std::optional<PreviewOutput> preview_;
+  std::optional<ProcessedFrame> preview_;
   std::optional<Facing> facing_;
   bool failed_;
-  std::function<void(CameraStatus)> changed_;
+  CameraBackend::StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
-      changed:(std::function<void(CameraStatus)>)changed;
+      changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed;
 - (void)setTorchEnabled:(bool)enabled completed:(std::function<void(CameraResult<void>)>)completed;
@@ -183,12 +186,12 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   if (changed_ && !failed_) {
     failed_ = true;
     changed_({.state = SessionState::Failed,
-              .error = CameraError{code, message.UTF8String ?: "Camera capture failed."}});
+              .error = CameraError{code, message.UTF8String ?: "Camera capture failed."}}, full_texture_crop);
   }
 }
 
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
-      changed:(std::function<void(CameraStatus)>)changed {
+      changed:(CameraBackend::StatusCallback)changed {
   dispatch_async(queue_, ^{
     changed_ = changed;
     frames_ = frames;
@@ -294,7 +297,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       [self fail:CameraErrorCode::CaptureFailed message:@"The camera did not start."];
       return;
     }
-    changed_({.state = SessionState::Running, .actual_facing = facing_});
+    changed_({.state = SessionState::Running, .actual_facing = facing_}, full_texture_crop);
   });
 }
 
@@ -319,7 +322,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_ = std::make_shared<macos::PixelBufferTexture>(size);
     }
     texture_->Publish(buffer);
-    PreviewOutput frame{.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)};
+    ProcessedFrame frame{.output = {.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)}};
     if (frames_) {
       const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
                                           kCMTimeRoundingMethod_Default);
@@ -330,19 +333,19 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
         const auto timestamp = CMTimeConvertScale(host, 1'000'000'000, kCMTimeRoundingMethod_Default);
         if (CMTIME_IS_NUMERIC(timestamp)) synchronized_time = std::chrono::nanoseconds(timestamp.value);
       }
-      auto processed = frames_->Process(producer_, std::move(frame), std::chrono::nanoseconds(time.value), width, height,
-                                        synchronized_time);
+      auto processed = frames_->Process(producer_, std::move(frame.output), std::chrono::nanoseconds(time.value),
+                                        width, height, synchronized_time);
       if (!processed.Succeeded()) {
         failed_ = true;
-        changed_({.state = SessionState::Failed, .error = processed.Error()});
+        changed_({.state = SessionState::Failed, .error = processed.Error()}, full_texture_crop);
         return;
       }
       frame = std::move(processed).Value();
     }
-    if (frame.texture && frame != preview_) {
+    if (frame.output.texture && frame != preview_) {
       preview_ = std::move(frame);
-changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_,
-                .can_focus_and_meter = [self supportsPointControl]});
+      changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_->output,
+                .can_focus_and_meter = [self supportsPointControl]}, preview_->source_crop);
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
@@ -375,7 +378,7 @@ changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = p
     }
     NSString* failure = nil;
     @try {
-      const CGPoint target = CGPointMake(preview_->mirrored ? 1.0F - point.x : point.x, point.y);
+      const CGPoint target = CGPointMake(preview_->output.mirrored ? 1.0F - point.x : point.x, point.y);
       if (device_.isFocusPointOfInterestSupported &&
           [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
         device_.focusPointOfInterest = target;
@@ -612,7 +615,7 @@ namespace {
 class AppleCamera final : public CameraBackend {
 public:
   AppleCamera() : capture_([HUXCameraCapture new]) {}
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing> facing, StatusCallback changed) override {
     [capture_ start:facing frames:frame_pipeline_ changed:std::move(changed)];
   }
   void Stop(std::function<void()> completed) override {

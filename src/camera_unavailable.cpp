@@ -9,7 +9,7 @@ TextureResizer::TextureResizer() = default;
 TextureResizer::~TextureResizer() = default;
 void TextureResizer::Reset() {}
 
-bool TextureResizer::Resize(PreviewOutput&, std::uint32_t, std::uint32_t) {
+std::optional<Rect> TextureResizer::Resize(PreviewOutput&, std::uint32_t, std::uint32_t) {
   throw CameraError{CameraErrorCode::Unavailable, "Sizing camera textures is not implemented on this platform."};
 }
 
@@ -17,9 +17,10 @@ namespace {
 
 class UnavailableCamera final : public CameraBackend {
 public:
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing>, StatusCallback changed) override {
     changed({.state = SessionState::Failed,
-             .error = CameraError{CameraErrorCode::Unavailable, "Camera capture is not implemented on this platform."}});
+             .error = CameraError{CameraErrorCode::Unavailable, "Camera capture is not implemented on this platform."}},
+            full_texture_crop);
   }
 
   void Stop(std::function<void()> completed) override {

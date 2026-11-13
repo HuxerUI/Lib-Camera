@@ -85,7 +85,7 @@ public:
   camera::PhotoOptions options;
   int captures = 0;
 
-  void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
+  void Start(std::optional<camera::Facing>, StatusCallback) override {}
   void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
   void SetTorchEnabled(bool, std::function<void(camera::CameraResult<void>)> completed) override {
     pending_torch = std::move(completed);

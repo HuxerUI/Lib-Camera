@@ -30,7 +30,7 @@ std::pair<std::uint32_t, std::uint32_t> FramePipeline::ProducerSize(std::uint32_
   return {width, height};
 }
 
-CameraResult<PreviewOutput> FramePipeline::Process(
+CameraResult<ProcessedFrame> FramePipeline::Process(
     FrameProducer& producer, PreviewOutput input, std::chrono::nanoseconds capture_time,
     std::uint32_t pixel_width, std::uint32_t pixel_height,
     std::optional<std::chrono::nanoseconds> synchronized_time) {
@@ -40,30 +40,33 @@ CameraResult<PreviewOutput> FramePipeline::Process(
       if (!processor) {
         processor = (*factory_)(pixel_width, pixel_height);
         if (!processor) {
-          return CameraResult<PreviewOutput>::Failure(
+          return CameraResult<ProcessedFrame>::Failure(
               {CameraErrorCode::CaptureFailed, "The camera frame processor factory returned an empty processor."});
         }
       }
       auto result = processor(input, capture_time);
-      if (!result.Succeeded()) return result;
+      if (!result.Succeeded()) return CameraResult<ProcessedFrame>::Failure(result.Error());
       input = std::move(result).Value();
     }
     if (!input.texture || !std::isfinite(input.crop.x) || !std::isfinite(input.crop.y) ||
         !std::isfinite(input.crop.width) || !std::isfinite(input.crop.height) ||
         input.crop.IsEmpty() || input.rotation < PreviewRotation::R0 || input.rotation > PreviewRotation::R270) {
-      return CameraResult<PreviewOutput>::Failure({CameraErrorCode::ConfigurationFailed, "Invalid processed camera frame."});
+      return CameraResult<ProcessedFrame>::Failure({CameraErrorCode::ConfigurationFailed, "Invalid processed camera frame."});
     }
-    if (output_width_ && !producer.resizer.Resize(input, output_width_, output_height_)) {
-      return CameraResult<PreviewOutput>::Success({});
+    Rect source_crop = full_texture_crop;
+    if (output_width_) {
+      const auto crop = producer.resizer.Resize(input, output_width_, output_height_);
+      if (!crop) return CameraResult<ProcessedFrame>::Success({});
+      if (!factory_) source_crop = *crop;
     }
     OfferRecordingFrame(input, capture_time, synchronized_time);
-    return CameraResult<PreviewOutput>::Success(std::move(input));
+    return CameraResult<ProcessedFrame>::Success({std::move(input), source_crop});
   } catch (const CameraError& error) {
-    return CameraResult<PreviewOutput>::Failure(error);
+    return CameraResult<ProcessedFrame>::Failure(error);
   } catch (const std::exception& error) {
-    return CameraResult<PreviewOutput>::Failure({CameraErrorCode::CaptureFailed, error.what()});
+    return CameraResult<ProcessedFrame>::Failure({CameraErrorCode::CaptureFailed, error.what()});
   } catch (...) {
-    return CameraResult<PreviewOutput>::Failure({CameraErrorCode::CaptureFailed, "The camera frame processor failed."});
+    return CameraResult<ProcessedFrame>::Failure({CameraErrorCode::CaptureFailed, "The camera frame processor failed."});
   }
 }
 

@@ -49,7 +49,7 @@ TextureResizer::TextureResizer() = default;
 TextureResizer::~TextureResizer() = default;
 void TextureResizer::Reset() { state_.reset(); }
 
-bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
+std::optional<Rect> TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
   @autoreleasepool {
     const auto* source = dynamic_cast<const ios::PixelBufferTexture*>(frame.texture.get());
     const PixelBuffer input(source ? source->AcquireFrame() : nullptr, CVPixelBufferRelease);
@@ -59,7 +59,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
     }
     const auto source_width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(input.get()));
     const auto source_height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(input.get()));
-    if (width == source_width && height == source_height && frame.crop == full_texture_crop) return true;
+    if (width == source_width && height == source_height && frame.crop == full_texture_crop) return full_texture_crop;
     const auto crop = CropForOutput(frame.crop, source_width, source_height, width, height);
 
     if (!state_) {
@@ -86,7 +86,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
     state_->texture->Publish(output.get());
     frame.texture = state_->texture;
     frame.crop = full_texture_crop;
-    return true;
+    return crop;
   }
 }
 

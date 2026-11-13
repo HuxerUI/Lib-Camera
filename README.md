@@ -107,8 +107,9 @@ Tap the viewfinder to reveal the exposure slider on supported cameras. Tap the s
 
 When `session.Status().can_focus_and_meter` is true, call `session.FocusAndMeterAsync(point, size, options)` with
 the point and size in preview-local logical coordinates and the same presentation options as `CameraPreview`.
-The call accounts for fitting, rotation, and mirroring. It controls autofocus or metering as supported by the
-active camera on Android, iOS, and macOS. Point control is available for the default camera output geometry.
+The call accounts for fitting, rotation, mirroring, and the crop applied for an explicitly sized output. It
+controls autofocus or metering as supported by the active camera on Android, iOS, and macOS. Point control is
+unavailable with a custom frame processor.
 
 ## Capture a Photo
 

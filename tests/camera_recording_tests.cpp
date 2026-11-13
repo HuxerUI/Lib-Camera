@@ -28,7 +28,8 @@ void TestRecordingPause(PhotoTestFixture& fixture, const File& file) {
         "Pausing must keep the recording in progress.");
   const auto unpublished = std::make_shared<macos::PixelBufferTexture>(huxerui::Size{64.0F, 64.0F});
   const auto preview = TakeRecordingResult(owner->frames->Process(producer, {.texture = unpublished}, 1s, 64, 64));
-  Check(preview.texture == unpublished, "Preview must continue while recording is paused.");
+  Check(preview.output.texture == unpublished && preview.source_crop == camera::detail::full_texture_crop,
+        "Preview must continue at the original geometry while recording is paused.");
   owner->SetRecordingPaused(false);
   Check(!owner->status->recording_paused, "Resuming must clear the pause state.");
 
@@ -85,8 +86,9 @@ std::shared_ptr<ExternalTexture> TestRecordedFrame(PhotoTestFixture& fixture, ca
   Check(owner->RecordedDuration().count() == 0, "A new recording must start at zero duration.");
 
   const auto input = SolidTexture(255, 0);
-  const auto preview = TakeRecordingResult(
+  const auto processed = TakeRecordingResult(
       owner->frames->Process(producer, {.texture = input}, std::chrono::seconds(17), 64, 64));
+  const auto& preview = processed.output;
   Check(preview.rotation == PreviewRotation::R90 && preview.mirrored && preview.crop == huxerui::Rect{0, 0, 1, 1},
         "Sizing must consume the processed crop and preserve rotation and mirroring.");
   const auto* texture = dynamic_cast<const macos::PixelBufferTexture*>(preview.texture.get());
@@ -147,6 +149,22 @@ std::shared_ptr<ExternalTexture> TestRecordedFrame(PhotoTestFixture& fixture, ca
   return preview.texture;
 }
 
+void TestSizedPreviewMetering() {
+  using namespace camera::detail;
+  FramePipeline pipeline({.output_pixel_width = 64, .output_pixel_height = 64});
+  FrameProducer producer;
+  const auto input = SolidTexture(255, 0, 128, 64);
+  const auto frame = TakeRecordingResult(pipeline.Process(
+      producer, {.texture = input, .rotation = PreviewRotation::R90}, std::chrono::seconds(1), 128, 64));
+  Check(frame.output.crop == full_texture_crop && frame.source_crop == huxerui::Rect{0.25F, 0, 0.5F, 1},
+        "The sized preview must report the source region that it displays.");
+  const huxerui::Size bounds{128, 96};
+  const PreviewOptions options{.fit = ImageFit::Cover};
+  const auto point = PreviewTexturePoint(frame.output, options, Facing::Front, bounds, {96, 16}, frame.source_crop);
+  Check(point && *point == huxerui::Point{0.375F, 0.75F},
+        "Metering must undo cover placement, rotation, mirroring, and the output crop.");
+}
+
 void TestRecording() {
   struct Directory {
     std::filesystem::path path = std::filesystem::temp_directory_path() /
@@ -187,6 +205,7 @@ void TestRecording() {
 
 int main() {
   try {
+    TestSizedPreviewMetering();
     TestRecording();
     return 0;
   } catch (const std::exception& error) {

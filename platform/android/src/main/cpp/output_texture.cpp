@@ -127,7 +127,7 @@ TextureResizer::TextureResizer() = default;
 TextureResizer::~TextureResizer() = default;
 void TextureResizer::Reset() { state_.reset(); }
 
-bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
+std::optional<Rect> TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint32_t height) {
   const auto* source = dynamic_cast<const android::GlTexture*>(frame.texture.get());
   const auto snapshot = source ? source->AcquireFrame() : nullptr;
   if (!snapshot) {
@@ -135,7 +135,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
   }
   const auto source_width = static_cast<std::uint32_t>(snapshot->PixelWidth());
   const auto source_height = static_cast<std::uint32_t>(snapshot->PixelHeight());
-  if (width == source_width && height == source_height && frame.crop == full_texture_crop) return true;
+  if (width == source_width && height == source_height && frame.crop == full_texture_crop) return full_texture_crop;
   const auto crop = CropForOutput(frame.crop, source_width, source_height, width, height);
 
   if (!state_) {
@@ -177,7 +177,7 @@ bool TextureResizer::Resize(PreviewOutput& frame, std::uint32_t width, std::uint
   state.texture->PublishCurrent({.texture_name = state.target, .pixel_width = pixel_width, .pixel_height = pixel_height});
   frame.texture = state.texture;
   frame.crop = full_texture_crop;
-  return true;
+  return crop;
 }
 
 } // namespace huxerui::camera::detail

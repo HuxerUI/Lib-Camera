@@ -117,16 +117,16 @@ void TestFrameProcessorFactory() {
   camera::detail::FrameProducer first;
   Check(factory_calls == 0, "The factory must wait for a source frame.");
   auto output = pipeline.Process(first, input, timestamp, width, height);
-  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 1,
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R90 && factory_calls == 1,
         "The first frame must create and use the processor.");
   const auto first_instance = last_instance;
   output = pipeline.Process(first, input, timestamp, width, height);
-  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R180 && factory_calls == 1,
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R180 && factory_calls == 1,
         "Successive frames must retain the producer's processor state.");
   camera::detail::FrameProducer next;
   expected_dimensions = {height, width};
   output = pipeline.Process(next, input, timestamp, height, width);
-  Check(output.Succeeded() && output.Value().rotation == PreviewRotation::R90 && factory_calls == 2,
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R90 && factory_calls == 2,
         "A new producer must get independent processor state.");
   first.processor = {};
   Check(first_instance.expired() && !last_instance.expired(), "Retiring one producer must release its processor.");
@@ -175,7 +175,7 @@ class TestBackend final : public camera::detail::CameraBackend {
 public:
   int starts = 0;
   int stops = 0;
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+  void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
   void Stop(std::function<void()> completed) override {
     ++stops;
     if (completed) {
@@ -269,7 +269,7 @@ void TestSessionLifetime() {
 void TestZoomRequests() {
   class ZoomBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+    void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();
@@ -367,7 +367,7 @@ void TestZoomRequests() {
 void TestExposureCompensationRequests() {
   class ExposureBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+    void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();
