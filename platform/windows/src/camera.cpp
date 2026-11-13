@@ -39,6 +39,18 @@ void Require(HRESULT result) {
     throw result;
 }
 
+std::optional<double> ReadFrameRate(IMFMediaType& type, REFGUID key) {
+  UINT32 numerator = 0;
+  UINT32 denominator = 0;
+  if (FAILED(MFGetAttributeRatio(&type, key, &numerator, &denominator)) || !numerator || !denominator) return {};
+  return double(numerator) / denominator;
+}
+
+std::optional<FrameRateRange> FixedFrameRate(IMFMediaType& type) {
+  if (const auto fps = ReadFrameRate(type, MF_MT_FRAME_RATE)) return FrameRateRange{*fps, *fps};
+  return {};
+}
+
 CameraError Error(HRESULT result, CameraErrorCode fallback) {
   auto code = fallback;
   if (result == E_ACCESSDENIED)
@@ -202,13 +214,16 @@ public:
   std::shared_ptr<windows::D3D11Texture> texture;
   ComPtr<CaptureEvents> events;
 
-  void Configure(UINT width, UINT height, LONG stride, PreviewRotation rotation, std::optional<Facing> facing,
+  void Configure(CaptureFormat capture_format, LONG stride, PreviewRotation rotation, std::optional<Facing> facing,
                  std::shared_ptr<FramePipeline> pipeline) {
+    const auto width = capture_format.pixel_width;
+    const auto height = capture_format.pixel_height;
     width_ = width;
     height_ = height;
     stride_ = stride;
     rotation_ = rotation;
     facing_ = facing;
+    capture_format_ = capture_format;
     pipeline_ = std::move(pipeline);
     if (!width || !height || width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
       throw E_INVALIDARG;
@@ -329,7 +344,8 @@ public:
 
 private:
   void Publish() {
-    events->Publish({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_});
+    events->Publish({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_,
+                     .capture_format = capture_format_});
   }
   void Upload(const BYTE* first, LONG stride) {
     if (stride < 0) {
@@ -348,6 +364,7 @@ private:
   bool running_ = false;
   std::shared_ptr<FramePipeline> pipeline_;
   std::optional<PreviewOutput> preview_;
+  std::optional<CaptureFormat> capture_format_;
   std::optional<Facing> facing_;
   PreviewRotation rotation_ = PreviewRotation::R0;
   UINT width_ = 0;
@@ -436,7 +453,8 @@ public:
     scheduled_ = true;
   }
 
-  void Start(std::optional<Facing> facing, CameraBackend::StatusCallback changed, std::shared_ptr<FramePipeline> pipeline) {
+  void Start(std::optional<Facing> facing, CapturePreferences preferred, CameraBackend::StatusCallback changed,
+             std::shared_ptr<FramePipeline> pipeline) {
     changed_ = std::move(changed);
     try {
       Require(com_status_);
@@ -461,7 +479,7 @@ public:
       Require(engine_->Initialize(events_.Get(), attributes.Get(), nullptr, device_.Get()));
       Require(events_->Wait(MF_CAPTURE_ENGINE_INITIALIZED));
       Require(engine_->GetSource(&source_));
-      ConfigurePreview(std::move(pipeline));
+      ConfigurePreview(preferred, std::move(pipeline));
       Require(engine_->StartPreview());
       preview_started_ = true;
       Require(events_->Wait(MF_CAPTURE_ENGINE_PREVIEW_STARTED));
@@ -750,8 +768,50 @@ private:
     }
   }
 
-  void ConfigurePreview(std::shared_ptr<FramePipeline> pipeline) {
+  void SelectCaptureFormat(DWORD stream, const CapturePreferences& preferred) {
+    if (!preferred.pixel_width && !preferred.fps) return;
+    struct Candidate {
+      ComPtr<IMFMediaType> type;
+      std::tuple<double, double, double> rank;
+    };
+    std::vector<Candidate> candidates;
+    for (DWORD index = 0;; ++index) {
+      ComPtr<IMFMediaType> type;
+      if (FAILED(source_->GetAvailableDeviceMediaType(stream, index, &type))) break;
+      UINT32 width = 0, height = 0;
+      if (FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height)) || !width || !height) continue;
+      CaptureFormat format{width, height, FixedFrameRate(*type.Get())};
+      if (preferred.fps) {
+        const auto minimum = ReadFrameRate(*type.Get(), MF_MT_FRAME_RATE_RANGE_MIN);
+        const auto maximum = ReadFrameRate(*type.Get(), MF_MT_FRAME_RATE_RANGE_MAX);
+        if (minimum && maximum && *minimum <= *maximum) {
+          const auto fps = std::clamp(*preferred.fps, *minimum, *maximum);
+          if ((!format.frame_rate || fps != format.frame_rate->max_fps) && fps >= 0.001 && fps <= 1'000'000) {
+            ComPtr<IMFMediaType> adjusted;
+            Require(MFCreateMediaType(&adjusted));
+            Require(type->CopyAllItems(adjusted.Get()));
+            Require(MFSetAttributeRatio(adjusted.Get(), MF_MT_FRAME_RATE, static_cast<UINT32>(std::llround(fps * 1000)), 1000));
+            candidates.push_back({std::move(adjusted), CaptureFormatRank(preferred, {width, height, FrameRateRange{fps, fps}})});
+          }
+        }
+      }
+      candidates.push_back({std::move(type), CaptureFormatRank(preferred, format)});
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const Candidate& left, const Candidate& right) { return left.rank < right.rank; });
+    for (const auto& candidate : candidates) {
+      if (SUCCEEDED(source_->SetCurrentDeviceMediaType(stream, candidate.type.Get()))) return;
+    }
+  }
+
+  void ConfigurePreview(const CapturePreferences& preferred, std::shared_ptr<FramePipeline> pipeline) {
     constexpr DWORD stream = MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_VIDEO_PREVIEW;
+    if (preferred.pixel_width || preferred.fps) {
+      DWORD stream_index = 0;
+      if (SUCCEEDED(source_->GetStreamIndexFromFriendlyName(stream, &stream_index))) {
+        SelectCaptureFormat(stream_index, preferred);
+      }
+    }
     ComPtr<IMFMediaType> source_type;
     Require(source_->GetCurrentDeviceMediaType(stream, &source_type));
     const auto rotation = Rotation(source_type.Get());
@@ -778,7 +838,7 @@ private:
       Require(MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.Data1, width, &stride));
     frames_ = Make<PreviewFrames>();
     frames_->events = events_;
-    frames_->Configure(width, height, stride, rotation, facing_, std::move(pipeline));
+    frames_->Configure({width, height, FixedFrameRate(*negotiated.Get())}, stride, rotation, facing_, std::move(pipeline));
     Require(preview_->SetSampleCallback(output, frames_.Get()));
   }
 
@@ -808,9 +868,9 @@ public:
       capture_->Post([capture = capture_] { capture->Stop({}); });
   }
 
-  void Start(std::optional<Facing> facing, StatusCallback changed) override {
-    capture_->Post([capture = capture_, facing, changed = std::move(changed), pipeline = frame_pipeline_] {
-      capture->Start(facing, changed, pipeline);
+  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
+    capture_->Post([capture = capture_, facing, preferred, changed = std::move(changed), pipeline = frame_pipeline_] {
+      capture->Start(facing, preferred, changed, pipeline);
     });
     needs_stop_ = true;
   }

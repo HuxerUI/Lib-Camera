@@ -171,11 +171,27 @@ void TestProducerSize() {
         "The default output must use the original producer size.");
 }
 
+void TestCaptureFormatRank() {
+  using camera::detail::CaptureFormatRank;
+  using camera::detail::CapturePreferences;
+  const CaptureFormat full_hd{1080, 1920, FrameRateRange{30, 30}};
+  const CaptureFormat hd{1280, 720, FrameRateRange{60, 60}};
+  const CapturePreferences preferred{1920, 1080, 60};
+  Check(CaptureFormatRank(preferred, full_hd) < CaptureFormatRank(preferred, hd),
+        "Capture size must take priority over frame rate, independent of orientation.");
+  const CapturePreferences fps_only{.fps = 60};
+  Check(CaptureFormatRank(fps_only, hd) < CaptureFormatRank(fps_only, full_hd),
+        "Without a size preference, frame rate must take priority.");
+  const CaptureFormat variable{1280, 720, FrameRateRange{30, 60}};
+  Check(CaptureFormatRank(fps_only, hd) < CaptureFormatRank(fps_only, variable),
+        "A fixed matching frame rate must rank ahead of a variable range.");
+}
+
 class TestBackend final : public camera::detail::CameraBackend {
 public:
   int starts = 0;
   int stops = 0;
-  void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
+  void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
   void Stop(std::function<void()> completed) override {
     ++stops;
     if (completed) {
@@ -241,6 +257,16 @@ void TestSessionLifetime() {
     Check(retained_session->Status().state == SessionState::Failed &&
               retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
           "An incomplete output size must fail before opening capture.");
+    for (const auto& invalid : {CameraOptions{.preferred_capture_pixel_height = 720},
+                                CameraOptions{.preferred_capture_fps = 0},
+                                CameraOptions{.preferred_capture_fps = std::numeric_limits<double>::infinity()}}) {
+      requested = invalid;
+      runtime.BuildFrame();
+      platform.Drain(runtime);
+      Check(retained_session->Status().state == SessionState::Failed &&
+                retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
+            "Invalid capture preferences must fail before opening capture.");
+    }
     requested = CameraOptions{.active = true};
     runtime.BuildFrame();
     platform.Drain(runtime);
@@ -269,7 +295,7 @@ void TestSessionLifetime() {
 void TestZoomRequests() {
   class ZoomBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
+    void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();
@@ -367,7 +393,7 @@ void TestZoomRequests() {
 void TestExposureCompensationRequests() {
   class ExposureBackend final : public camera::detail::CameraBackend {
   public:
-    void Start(std::optional<Facing>, StatusCallback) override { ++starts; }
+    void Start(std::optional<Facing>, camera::detail::CapturePreferences, StatusCallback) override { ++starts; }
     void Stop(std::function<void()> completed) override {
       ++stops;
       if (completed) completed();
@@ -639,6 +665,7 @@ int main() {
     TestFrameProcessorFactory();
     TestOutputCrop();
     TestProducerSize();
+    TestCaptureFormatRank();
     TestSessionLifetime();
     TestZoomRequests();
     TestExposureCompensationRequests();

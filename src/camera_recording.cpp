@@ -50,7 +50,6 @@ CodecResult<VideoFrame> AcquireRecordingFrame(const std::shared_ptr<ExternalText
 namespace {
 
 constexpr std::uint32_t recording_timescale = 1'000'000;
-constexpr std::int64_t nominal_frame_duration = recording_timescale / 30;
 
 struct RecordingFrame {
   VideoFrame video;
@@ -207,10 +206,18 @@ private:
 class VideoRecording : public std::enable_shared_from_this<VideoRecording> {
 public:
   VideoRecording(OpenMuxer output, bool fragmented, RecordingCompletion complete,
-                 std::optional<audio::AudioReader> microphone)
+                 std::optional<audio::AudioReader> microphone, std::optional<FrameRateRange> frame_rate)
       : output_(std::move(output)), fragmented_(fragmented), complete_(std::move(complete)),
         microphone_(std::move(microphone)) {
     if (microphone_) timeline_.emplace(RecordingClockNow());
+    if (frame_rate && frame_rate->max_fps >= 1.0 && frame_rate->max_fps <= 240.0) {
+      // The configured rate is a codec hint. Capture timestamps still determine presentation.
+      constexpr std::uint32_t scale = 1'000;
+      const auto numerator = static_cast<std::uint32_t>(std::llround(frame_rate->max_fps * scale));
+      const auto divisor = std::gcd(numerator, scale);
+      frame_rate_numerator_ = numerator / divisor;
+      frame_rate_denominator_ = scale / divisor;
+    }
   }
 
   ~VideoRecording() {
@@ -424,6 +431,7 @@ private:
     PreviewRotation rotation = PreviewRotation::R0;
     std::int64_t timeline_origin = 0;
     std::int64_t last_input = -1;
+    const auto nominal_frame_duration = std::int64_t{recording_timescale} * frame_rate_denominator_ / frame_rate_numerator_;
     std::int64_t duration = nominal_frame_duration;
     std::uint64_t input_generation = 0;
     bool draining = false;
@@ -527,7 +535,9 @@ private:
             input_format = frame.format;
             crop = input->crop;
             rotation = input->rotation;
-            encoder.emplace(Require(VideoEncoder::Create({.input = input_format, .profile = H264Profile::Baseline,
+            encoder.emplace(Require(VideoEncoder::Create({.input = input_format,
+                .frame_rate_numerator = frame_rate_numerator_, .frame_rate_denominator = frame_rate_denominator_,
+                .profile = H264Profile::Baseline,
                 .wakeup = wakeup, .input_storage = frame.Storage()})));
           }
           if (frame.format != input_format) {
@@ -609,6 +619,8 @@ private:
   bool ready_ = false;
   bool stopping_ = false;
   bool paused_ = false;
+  std::uint32_t frame_rate_numerator_ = 30;
+  std::uint32_t frame_rate_denominator_ = 1;
   std::atomic<std::int64_t> duration_ticks_ = 0;
   std::atomic<bool> finished_ = false;
   std::thread worker_;
@@ -653,7 +665,8 @@ Task<CameraResult<void>> RecordVideoTask(std::shared_ptr<CameraSessionData> owne
                   }
                 });
                 complete.Complete(std::move(result));
-              }, std::move(reader));
+              }, std::move(reader),
+              owner->status->capture_format ? owner->status->capture_format->frame_rate : std::nullopt);
           std::function<void()> cancel = [weak = std::weak_ptr(recording)] {
             if (auto recording = weak.lock()) recording->Stop();
           };

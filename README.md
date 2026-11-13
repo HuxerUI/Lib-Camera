@@ -71,6 +71,13 @@ Configure capture through `CameraOptions`:
 | `active` | `true` | Starts or stops capture asynchronously. Capture suspends in the background. |
 | `facing` | Empty | Selects the default camera. `Facing::Front` or `Facing::Back` requires that facing, without falling back to the opposite one. |
 | `output_pixel_width`, `output_pixel_height` | Both `0` | Set both to positive pixel counts to size the shared preview and recording texture before rotation. Changing the pair reopens active capture and finishes any current recording. |
+| `preferred_capture_pixel_width`, `preferred_capture_pixel_height` | Both `0` | Request the pixel dimensions of the source video stream. Matching ignores orientation. Set both to zero for the platform default. |
+| `preferred_capture_fps` | Empty | Request a positive, finite capture frame rate. The platform can choose a different rate or leave it under automatic control. |
+
+Capture selection favors a working preview and photo combination, then the preferred video resolution,
+then the closest frame rate. Read `session.Status().capture_format` for the delivered source dimensions
+before frame processing or output sizing, and the configured rate range when available. Frame timestamps
+describe actual delivery timing. Changing capture preferences reopens capture and finalizes an active recording.
 
 Configure each preview through `PreviewOptions`:
 

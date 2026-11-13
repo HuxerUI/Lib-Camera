@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.util.Range;
+import android.util.Size;
 import android.view.Choreographer;
 import android.view.Surface;
 import android.view.WindowManager;
@@ -24,16 +25,22 @@ import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.CameraState;
 import androidx.camera.core.ExposureState;
+import androidx.camera.core.ExperimentalSessionConfig;
 import androidx.camera.core.FocusMeteringAction;
 import androidx.camera.core.FocusMeteringResult;
 import androidx.camera.core.Preview;
+import androidx.camera.core.ResolutionInfo;
+import androidx.camera.core.SessionConfig;
 import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.SurfaceRequest;
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory;
 import androidx.camera.core.TorchState;
+import androidx.camera.core.UseCase;
 import androidx.camera.core.ZoomState;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
@@ -49,6 +56,7 @@ import org.huxerui.PlatformPayload;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -88,6 +96,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private ProcessCameraProvider provider;
         private Preview preview;
         private ImageCapture photoOutput;
+        private SessionConfig rateSession;
         private final ExecutorService photoExecutor = Executors.newSingleThreadExecutor();
         private boolean photoPending;
         private Camera camera;
@@ -132,7 +141,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 run = arguments.requireField("run").requireInt64();
                 frames = arguments.requireField("frames").requireInt64();
                 PlatformPayload requested = arguments.requireField("facing");
-                start(requested.isNull() ? null : requested.requireString());
+                long width = arguments.requireField("captureWidth").requireInt64();
+                long height = arguments.requireField("captureHeight").requireInt64();
+                PlatformPayload rate = arguments.requireField("captureFps");
+                start(requested.isNull() ? null : requested.requireString(), width, height,
+                        rate.isNull() ? null : rate.requireDouble());
                 result.complete(PlatformPayload.nullValue());
             } else if (method.equals("capturePhoto")) {
                 capturePhoto(arguments, result);
@@ -163,7 +176,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             return null;
         }
 
-        private void start(String requested) {
+        private void start(String requested, long width, long height, Double fps) {
             active = true;
             opened = false;
             facing = null;
@@ -174,7 +187,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                     if (!active || token != generation) return;
                     try {
                         provider = future.get();
-                        bind(requested, token);
+                        bind(requested, width, height, fps, token);
                     } catch (SecurityException error) {
                         fail("permission-denied", error.toString());
                     } catch (Exception error) {
@@ -186,7 +199,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             }
         }
 
-        private void bind(String requested, long token) throws Exception {
+        private void bind(String requested, long width, long height, Double fps, long token) {
             CameraInfo selected = null;
             for (CameraInfo candidate : provider.getAvailableCameraInfos()) {
                 int lens = candidate.getLensFacing();
@@ -206,7 +219,10 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             int lens = selected.getLensFacing();
             facing = lens == CameraSelector.LENS_FACING_FRONT ? "front"
                     : lens == CameraSelector.LENS_FACING_BACK ? "back" : null;
-            preview = new Preview.Builder().setTargetRotation(displayRotation()).build();
+            photoOutput = new ImageCapture.Builder().setJpegQuality(100)
+                    .setTargetRotation(displayRotation()).build();
+            bindOutputs(selected, width, height);
+            if (fps != null) applyFrameRate(selected, fps, width != 0);
             preview.setSurfaceProvider(executor, request -> {
                 if (!active || token != generation) {
                     request.willNotProvideSurface();
@@ -219,15 +235,6 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 });
                 request.setTransformationInfoListener(executor, output::configure);
             });
-            photoOutput = new ImageCapture.Builder().setJpegQuality(100)
-                    .setTargetRotation(displayRotation()).build();
-            try {
-                camera = provider.bindToLifecycle(this, selected.getCameraSelector(), preview, photoOutput);
-            } catch (IllegalArgumentException unsupported) {
-                provider.unbind(preview, photoOutput);
-                photoOutput = null;
-                camera = provider.bindToLifecycle(this, selected.getCameraSelector(), preview);
-            }
             cameraObserver = state -> {
                 if (!active || token != generation) return;
                 CameraState.StateError error = state.getError();
@@ -251,6 +258,104 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             camera.getCameraInfo().getCameraState().observeForever(cameraObserver);
             displays.registerDisplayListener(this, main);
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME);
+        }
+
+        private Preview makePreview(long width, long height, Size exactSize) {
+            Preview.Builder builder = new Preview.Builder().setTargetRotation(displayRotation());
+            if (exactSize != null || width != 0) {
+                builder.setResolutionSelector(new ResolutionSelector.Builder()
+                        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                        .setResolutionFilter((sizes, rotation) -> {
+                            if (exactSize != null) {
+                                return sizes.contains(exactSize) ? Collections.singletonList(exactSize) : Collections.emptyList();
+                            }
+                            ArrayList<Size> ordered = new ArrayList<>(sizes);
+                            Collections.sort(ordered, (left, right) -> Double.compare(
+                                    sizeDistance(left, width, height), sizeDistance(right, width, height)));
+                            return ordered;
+                        }).build());
+            }
+            return builder.build();
+        }
+
+        private static double sizeDistance(Size size, long width, long height) {
+            int shorter = Math.min(size.getWidth(), size.getHeight());
+            int longer = Math.max(size.getWidth(), size.getHeight());
+            return Math.abs(Math.log((double) shorter / Math.min(width, height)))
+                    + Math.abs(Math.log((double) longer / Math.max(width, height)));
+        }
+
+        private void bindOutputs(CameraInfo selected, long width, long height) {
+            preview = makePreview(width, height, null);
+            CameraSelector selector = selected.getCameraSelector();
+            try {
+                camera = provider.bindToLifecycle(this, selector, preview, photoOutput);
+                return;
+            } catch (IllegalArgumentException unsupported) {
+                provider.unbind(preview, photoOutput);
+            }
+            if (width != 0) {
+                Preview defaults = makePreview(0, 0, null);
+                try {
+                    camera = provider.bindToLifecycle(this, selector, defaults, photoOutput);
+                    preview = defaults;
+                    return;
+                } catch (IllegalArgumentException unsupported) {
+                    provider.unbind(defaults, photoOutput);
+                }
+            }
+            photoOutput = null;
+            try {
+                camera = provider.bindToLifecycle(this, selector, preview);
+            } catch (IllegalArgumentException unsupported) {
+                if (width == 0) throw unsupported;
+                provider.unbind(preview);
+                preview = makePreview(0, 0, null);
+                camera = provider.bindToLifecycle(this, selector, preview);
+            }
+        }
+
+        @ExperimentalSessionConfig
+        private void applyFrameRate(CameraInfo selected, double fps, boolean keepSize) {
+            // Resolve size with the same photo use case before applying any frame rate constraint.
+            ResolutionInfo resolution = preview.getResolutionInfo();
+            if (keepSize && resolution == null) return;
+            Preview candidate = makePreview(0, 0, keepSize ? resolution.getResolution() : null);
+            UseCase[] useCases = photoOutput == null ? new UseCase[]{candidate} : new UseCase[]{candidate, photoOutput};
+            Range<Integer> range = null;
+            try {
+                double bestDistance = Double.POSITIVE_INFINITY;
+                int bestSpan = Integer.MAX_VALUE;
+                for (Range<Integer> supported : selected.getSupportedFrameRateRanges(new SessionConfig(useCases))) {
+                    int lower = supported.getLower();
+                    int upper = supported.getUpper();
+                    if (lower <= 0) continue;
+                    double distance = Math.abs(fps - Math.max(lower, Math.min(fps, upper)));
+                    int span = upper - lower;
+                    if (range == null || distance < bestDistance || (distance == bestDistance
+                            && (span < bestSpan || (span == bestSpan && lower < range.getLower())))) {
+                        range = supported;
+                        bestDistance = distance;
+                        bestSpan = span;
+                    }
+                }
+            } catch (IllegalArgumentException unsupported) {
+                return;
+            }
+            if (range == null) return;
+            SessionConfig config = new SessionConfig.Builder(useCases).setFrameRateRange(range).build();
+            CameraSelector selector = selected.getCameraSelector();
+            if (photoOutput != null) provider.unbind(preview, photoOutput);
+            else provider.unbind(preview);
+            try {
+                camera = provider.bindToLifecycle(this, selector, config);
+                preview = candidate;
+                rateSession = config;
+            } catch (IllegalArgumentException unsupported) {
+                provider.unbind(config);
+                camera = photoOutput == null ? provider.bindToLifecycle(this, selector, preview)
+                        : provider.bindToLifecycle(this, selector, preview, photoOutput);
+            }
         }
 
         private boolean isCurrentCamera(PlatformPayload arguments) {
@@ -583,6 +688,13 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             cameraObserver = null;
             camera = null;
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP);
+            if (rateSession != null) {
+                preview.setSurfaceProvider(null);
+                provider.unbind(rateSession);
+                rateSession = null;
+                preview = null;
+                photoOutput = null;
+            }
             if (preview != null) {
                 preview.setSurfaceProvider(null);
                 provider.unbind(preview);
@@ -646,6 +758,8 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             snapshot.put("facing", facing == null ? PlatformPayload.nullValue() : PlatformPayload.string(facing));
             snapshot.put("error", error == null ? PlatformPayload.nullValue() : error);
             snapshot.put("preview", current == null || current.output == null ? PlatformPayload.nullValue() : current.output);
+            snapshot.put("captureFormat", current == null || current.output == null
+                    ? PlatformPayload.nullValue() : current.captureFormat());
             snapshot.put("canFocusAndMeter", PlatformPayload.booleanValue(supportsPointControl && current != null
                     && !current.invalidated && current.output != null));
             events.emit("snapshot", PlatformPayload.object(snapshot));
@@ -678,6 +792,17 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             Output(SurfaceRequest request, long token) {
                 this.request = request;
                 this.token = token;
+            }
+
+            PlatformPayload captureFormat() {
+                Size size = request.getResolution();
+                Range<Integer> range = rateSession == null ? null : rateSession.getFrameRateRange();
+                Map<String, PlatformPayload> format = new HashMap<>();
+                format.put("width", PlatformPayload.int64(size.getWidth()));
+                format.put("height", PlatformPayload.int64(size.getHeight()));
+                format.put("minFps", range == null ? PlatformPayload.nullValue() : PlatformPayload.doubleValue(range.getLower()));
+                format.put("maxFps", range == null ? PlatformPayload.nullValue() : PlatformPayload.doubleValue(range.getUpper()));
+                return PlatformPayload.object(format);
             }
 
             void configure(SurfaceRequest.TransformationInfo info) {

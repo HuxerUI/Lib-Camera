@@ -494,9 +494,23 @@ View ShutterButton(const char* label, bool video, bool recording, bool enabled) 
   );
 }
 
+std::string CaptureFormatLabel(const camera::CaptureFormat& format) {
+  auto text = std::to_string(format.pixel_width) + " × " + std::to_string(format.pixel_height);
+  if (format.frame_rate) {
+    const auto [minimum, maximum] = *format.frame_rate;
+    char rate[64]{};
+    if (minimum == maximum) std::snprintf(rate, sizeof(rate), "%.4g fps", maximum);
+    else std::snprintf(rate, sizeof(rate), "%.4g–%.4g fps", minimum, maximum);
+    text += std::string(" · ") + rate;
+  }
+  return text;
+}
+
 [[huxerui::composable]]
-View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit> fit,
-                    State<camera::MirrorMode> mirror, State<bool> grid, State<bool> comparison) {
+View CameraSettings(camera::CameraSession session, State<std::optional<camera::Facing>> facing, State<ImageFit> fit,
+                    State<camera::MirrorMode> mirror, State<bool> grid, State<bool> comparison,
+                    State<std::size_t> resolution, State<std::size_t> frame_rate) {
+  const auto status = session.Status();
   const std::optional<camera::Facing> selected_facing = facing;
   const ImageFit selected_fit = fit;
   const camera::MirrorMode selected_mirror = mirror;
@@ -511,6 +525,15 @@ View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit>
             : std::optional(index == 1 ? camera::Facing::Front : camera::Facing::Back);
       }),
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+    Column {
+      Label("Capture resolution", 13.0F, foreground, FontWeight::Medium),
+      SegmentedButton({"Auto", "720p", "1080p"}, resolution)
+          .OnChanged([resolution](std::size_t index) { resolution = index; }),
+      Label("Capture frame rate", 13.0F, foreground, FontWeight::Medium),
+      SegmentedButton({"Auto", "30 fps", "60 fps"}, frame_rate)
+          .OnChanged([frame_rate](std::size_t index) { frame_rate = index; }),
+      status.capture_format ? View(Label(CaptureFormatLabel(*status.capture_format), 12.0F)) : View{},
+    }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch), Enabled(!status.recording_video && !status.capturing_photo)),
     Column {
       Label("Frame fit", 13.0F, foreground, FontWeight::Medium),
       SegmentedButton({"Fill", "Fit"}, selected_fit == ImageFit::Cover ? 0 : 1)
@@ -704,6 +727,8 @@ View CameraWorkspace() {
   auto changing_torch = UseState(false);
   auto torch_error = UseState(std::string{});
   auto facing = UseState(std::optional<camera::Facing>{});
+  auto capture_resolution = UseState(std::size_t{0});
+  auto capture_frame_rate = UseState(std::size_t{0});
   auto fit = UseState(ImageFit::Cover);
   auto mirror = UseState(camera::MirrorMode::Auto);
   auto grid = UseState(false);
@@ -723,7 +748,13 @@ View CameraWorkspace() {
   auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
-  auto session = camera::UseCamera({.facing = facing, .active = active});
+  const std::size_t resolution = capture_resolution;
+  const std::size_t frame_rate = capture_frame_rate;
+  constexpr std::uint32_t widths[]{0, 1280, 1920};
+  constexpr std::uint32_t heights[]{0, 720, 1080};
+  auto session = camera::UseCamera({.facing = facing, .active = active,
+      .preferred_capture_pixel_width = widths[resolution], .preferred_capture_pixel_height = heights[resolution],
+      .preferred_capture_fps = frame_rate == 0 ? std::nullopt : std::optional{frame_rate == 1 ? 30.0 : 60.0}});
   const VideoPhase phase = video_phase;
   const auto microphone = audio::UseAudioCapture({
       .active = phase == VideoPhase::Starting || phase == VideoPhase::Recording || phase == VideoPhase::Finishing,
@@ -785,15 +816,15 @@ View CameraWorkspace() {
     if (!video && torch_enabled && !changing_torch && torch_error->empty()) set_torch(false);
   }, video, torch_enabled, changing_torch.Get());
 
-  auto show_settings = [sheets, facing, fit, mirror, grid, comparison] {
-    sheets.Show([facing, fit, mirror, grid, comparison](BottomSheetContext sheet) {
+  auto show_settings = [sheets, session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate] {
+    sheets.Show([session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate](BottomSheetContext sheet) {
       return Column {
         Row {
           Label("Preview settings", 20.0F, foreground, FontWeight::SemiBold),
           Spacer(),
           IconButton(app::images::close, "Close settings").OnClick([sheet] { sheet.Dismiss(); }),
         }.With(CrossAlign(CrossAxisAlignment::Center)),
-        ScrollView(CameraSettings(facing, fit, mirror, grid, comparison)).With(Grow()),
+        ScrollView(CameraSettings(session, facing, fit, mirror, grid, comparison, capture_resolution, capture_frame_rate)).With(Grow()),
       }.With(Padding(20.0F), Spacing(16.0F), Frame{.max_height = 580.0F}, CrossAlign(CrossAxisAlignment::Stretch));
     });
   };

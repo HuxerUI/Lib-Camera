@@ -2,6 +2,8 @@
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <utility>
 
@@ -14,6 +16,8 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 using huxerui::camera::detail::CameraBackend;
+using huxerui::camera::detail::CaptureFormatRank;
+using huxerui::camera::detail::CapturePreferences;
 using huxerui::camera::detail::FramePipeline;
 using huxerui::camera::detail::FrameProducer;
 using huxerui::camera::detail::ProcessedFrame;
@@ -22,6 +26,71 @@ using huxerui::camera::detail::full_texture_crop;
 namespace {
 
 char lighting_observation;
+
+std::optional<FrameRateRange> ReadFrameRate(AVCaptureDevice* device) {
+  const double shortest = CMTimeGetSeconds(device.activeVideoMinFrameDuration);
+  const double longest = CMTimeGetSeconds(device.activeVideoMaxFrameDuration);
+  if (shortest <= 0 || longest < shortest || !std::isfinite(shortest) || !std::isfinite(longest)) return {};
+  return FrameRateRange{1.0 / longest, 1.0 / shortest};
+}
+
+bool ConfigureCaptureFormat(AVCaptureDevice* device, const CapturePreferences& preferred) {
+  if (!preferred.pixel_width && !preferred.fps) return false;
+  AVCaptureDeviceFormat* selected = nil;
+  CMTime interval = kCMTimeInvalid;
+  std::tuple<double, double, double> best;
+  for (AVCaptureDeviceFormat* format in device.formats) {
+    if (![format.mediaType isEqualToString:AVMediaTypeVideo]) continue;
+    const auto size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    if (size.width <= 0 || size.height <= 0) continue;
+    CaptureFormat candidate{static_cast<std::uint32_t>(size.width), static_cast<std::uint32_t>(size.height), {}};
+    if (!preferred.fps) {
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (!selected || rank < best) {
+        selected = format;
+        best = rank;
+      }
+      continue;
+    }
+    for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+      if (range.minFrameRate <= 0 || range.maxFrameRate < range.minFrameRate ||
+          !std::isfinite(range.minFrameRate) || !std::isfinite(range.maxFrameRate)) continue;
+      candidate.frame_rate = FrameRateRange{range.minFrameRate, range.maxFrameRate};
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (selected && rank >= best) continue;
+      selected = format;
+      best = rank;
+      if (*preferred.fps <= range.minFrameRate) {
+        interval = range.maxFrameDuration;
+      } else if (*preferred.fps >= range.maxFrameRate) {
+        interval = range.minFrameDuration;
+      } else {
+        interval = CMTimeMakeWithSeconds(1.0 / *preferred.fps, 1'000'000'000);
+        if (CMTimeCompare(interval, range.minFrameDuration) < 0) interval = range.minFrameDuration;
+        if (CMTimeCompare(interval, range.maxFrameDuration) > 0) interval = range.maxFrameDuration;
+      }
+    }
+  }
+  if (!selected || ![device lockForConfiguration:nil]) return false;
+  @try {
+    device.activeFormat = selected;
+    if (CMTIME_IS_NUMERIC(interval) && interval.value > 0) {
+      @try {
+        device.activeVideoMinFrameDuration = interval;
+        device.activeVideoMaxFrameDuration = interval;
+      } @catch (NSException*) {
+        // Keep the selected size and let the device choose the frame rate.
+        device.activeVideoMinFrameDuration = kCMTimeInvalid;
+        device.activeVideoMaxFrameDuration = kCMTimeInvalid;
+      }
+    }
+    return true;
+  } @catch (NSException*) {
+    return false;
+  } @finally {
+    [device unlockForConfiguration];
+  }
+}
 
 CMClockRef SessionClock(AVCaptureSession* session) {
   if (@available(macOS 12.3, *)) return session.synchronizationClock;
@@ -154,12 +223,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::shared_ptr<FramePipeline> frames_;
   FrameProducer producer_;
   std::optional<ProcessedFrame> preview_;
+  std::optional<CaptureFormat> captureFormat_;
   std::optional<Facing> facing_;
   bool failed_;
   CameraBackend::StatusCallback changed_;
   std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
-- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed;
@@ -190,7 +261,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   }
 }
 
-- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed {
   dispatch_async(queue_, ^{
     changed_ = changed;
@@ -264,6 +336,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     } else {
       photoOutput_ = nil;
     }
+    ConfigureCaptureFormat(device_, preferred);
     [output_ setSampleBufferDelegate:self queue:queue_];
     [session_ commitConfiguration];
     __weak HUXCameraCapture* weak = self;
@@ -342,10 +415,12 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       }
       frame = std::move(processed).Value();
     }
-    if (frame.output.texture && frame != preview_) {
+    const CaptureFormat capture_format{width, height, ReadFrameRate(device_)};
+    if (frame.output.texture && (frame != preview_ || capture_format != captureFormat_)) {
       preview_ = std::move(frame);
+      captureFormat_ = capture_format;
       changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_->output,
-                .can_focus_and_meter = [self supportsPointControl]}, preview_->source_crop);
+                .can_focus_and_meter = [self supportsPointControl], .capture_format = captureFormat_}, preview_->source_crop);
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
@@ -592,6 +667,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_.reset();
     }
     preview_.reset();
+    captureFormat_.reset();
     frames_.reset();
     [self completeStops];
   });
@@ -615,8 +691,8 @@ namespace {
 class AppleCamera final : public CameraBackend {
 public:
   AppleCamera() : capture_([HUXCameraCapture new]) {}
-  void Start(std::optional<Facing> facing, StatusCallback changed) override {
-    [capture_ start:facing frames:frame_pipeline_ changed:std::move(changed)];
+  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
+    [capture_ start:facing preferred:preferred frames:frame_pipeline_ changed:std::move(changed)];
   }
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];

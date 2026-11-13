@@ -2,8 +2,28 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace huxerui::camera::detail {
+
+std::tuple<double, double, double> CaptureFormatRank(const CapturePreferences& preferred, const CaptureFormat& format) {
+  double size_distance = 0;
+  if (preferred.pixel_width && preferred.pixel_height) {
+    const auto [short_side, long_side] = std::minmax(format.pixel_width, format.pixel_height);
+    const auto [preferred_short, preferred_long] = std::minmax(preferred.pixel_width, preferred.pixel_height);
+    size_distance = std::abs(std::log(static_cast<double>(short_side) / preferred_short)) +
+                    std::abs(std::log(static_cast<double>(long_side) / preferred_long));
+  }
+  if (!preferred.fps) return {size_distance, 0, 0};
+  if (!format.frame_rate || format.frame_rate->min_fps <= 0 ||
+      format.frame_rate->max_fps < format.frame_rate->min_fps ||
+      !std::isfinite(format.frame_rate->min_fps) || !std::isfinite(format.frame_rate->max_fps)) {
+    return {size_distance, std::numeric_limits<double>::infinity(), 0};
+  }
+  const auto [min_fps, max_fps] = *format.frame_rate;
+  const auto target = *preferred.fps;
+  return {size_distance, std::abs(target - std::clamp(target, min_fps, max_fps)), max_fps - min_fps};
+}
 
 Rect CropForOutput(Rect crop, std::uint32_t source_width, std::uint32_t source_height,
                    std::uint32_t output_width, std::uint32_t output_height) {

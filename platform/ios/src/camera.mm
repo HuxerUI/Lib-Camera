@@ -2,10 +2,11 @@
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #import <UIKit/UIKit.h>
 
-#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -19,6 +20,8 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 using huxerui::camera::detail::CameraBackend;
+using huxerui::camera::detail::CaptureFormatRank;
+using huxerui::camera::detail::CapturePreferences;
 using huxerui::camera::detail::FramePipeline;
 using huxerui::camera::detail::FrameProducer;
 using huxerui::camera::detail::ProcessedFrame;
@@ -27,6 +30,74 @@ using huxerui::camera::detail::full_texture_crop;
 namespace {
 
 char lighting_observation;
+
+std::optional<FrameRateRange> ReadFrameRate(AVCaptureDevice* device) {
+  const double shortest = CMTimeGetSeconds(device.activeVideoMinFrameDuration);
+  const double longest = CMTimeGetSeconds(device.activeVideoMaxFrameDuration);
+  if (shortest <= 0 || longest < shortest || !std::isfinite(shortest) || !std::isfinite(longest)) return {};
+  return FrameRateRange{1.0 / longest, 1.0 / shortest};
+}
+
+bool ConfigureCaptureFormat(AVCaptureDevice* device, const CapturePreferences& preferred, bool with_photo) {
+  if (!preferred.pixel_width && !preferred.fps) return false;
+  AVCaptureDeviceFormat* selected = nil;
+  CMTime interval = kCMTimeInvalid;
+  std::tuple<double, double, double> best;
+  for (AVCaptureDeviceFormat* format in device.formats) {
+    if (![format.mediaType isEqualToString:AVMediaTypeVideo]) continue;
+    NSArray<Class>* unsupported = format.unsupportedCaptureOutputClasses;
+    if ([unsupported containsObject:[AVCaptureVideoDataOutput class]] ||
+        (with_photo && [unsupported containsObject:[AVCapturePhotoOutput class]])) continue;
+    const auto size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    if (size.width <= 0 || size.height <= 0) continue;
+    CaptureFormat candidate{static_cast<std::uint32_t>(size.width), static_cast<std::uint32_t>(size.height), {}};
+    if (!preferred.fps) {
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (!selected || rank < best) {
+        selected = format;
+        best = rank;
+      }
+      continue;
+    }
+    for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+      if (range.minFrameRate <= 0 || range.maxFrameRate < range.minFrameRate ||
+          !std::isfinite(range.minFrameRate) || !std::isfinite(range.maxFrameRate)) continue;
+      candidate.frame_rate = FrameRateRange{range.minFrameRate, range.maxFrameRate};
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (selected && rank >= best) continue;
+      selected = format;
+      best = rank;
+      if (*preferred.fps <= range.minFrameRate) {
+        interval = range.maxFrameDuration;
+      } else if (*preferred.fps >= range.maxFrameRate) {
+        interval = range.minFrameDuration;
+      } else {
+        interval = CMTimeMakeWithSeconds(1.0 / *preferred.fps, 1'000'000'000);
+        if (CMTimeCompare(interval, range.minFrameDuration) < 0) interval = range.minFrameDuration;
+        if (CMTimeCompare(interval, range.maxFrameDuration) > 0) interval = range.maxFrameDuration;
+      }
+    }
+  }
+  if (!selected || ![device lockForConfiguration:nil]) return false;
+  @try {
+    device.activeFormat = selected;
+    if (CMTIME_IS_NUMERIC(interval) && interval.value > 0) {
+      @try {
+        device.activeVideoMinFrameDuration = interval;
+        device.activeVideoMaxFrameDuration = interval;
+      } @catch (NSException*) {
+        // Keep the selected size and let the device choose the frame rate.
+        device.activeVideoMinFrameDuration = kCMTimeInvalid;
+        device.activeVideoMaxFrameDuration = kCMTimeInvalid;
+      }
+    }
+    return true;
+  } @catch (NSException*) {
+    return false;
+  } @finally {
+    [device unlockForConfiguration];
+  }
+}
 
 CMClockRef SessionClock(AVCaptureSession* session) {
   if (@available(iOS 15.4, *)) return session.synchronizationClock;
@@ -256,6 +327,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::shared_ptr<FramePipeline> frames_;
   FrameProducer producer_;
   std::optional<ProcessedFrame> preview_;
+  std::optional<CaptureFormat> captureFormat_;
   std::optional<Facing> facing_;
   PreviewRotation rotation_;
   bool interrupted_;
@@ -264,7 +336,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
 - (instancetype)initWithOwner:(UIViewController*)owner;
-- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
 - (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed;
@@ -300,7 +373,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   CameraStatus status{.state = interrupted_ ? SessionState::Suspended : SessionState::Running,
                       .actual_facing = facing_,
                       .preview = preview_ ? std::optional{preview_->output} : std::nullopt,
-                      .can_focus_and_meter = !interrupted_ && [self supportsPointControl]};
+                      .can_focus_and_meter = !interrupted_ && [self supportsPointControl],
+                      .capture_format = captureFormat_};
   changed_(std::move(status), preview_ ? preview_->source_crop : full_texture_crop);
 }
 
@@ -329,7 +403,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   [observers_ addObject:token];
 }
 
-- (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
+- (void)start:(std::optional<Facing>)facing preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
       changed:(CameraBackend::StatusCallback)changed {
   UIViewController* owner = owner_;
   if (!owner) {
@@ -428,6 +503,13 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     } else {
       photoOutput_ = nil;
     }
+    if (preferred.pixel_width || preferred.fps) {
+      if (ConfigureCaptureFormat(device_, preferred, photoOutput_ != nil)) {
+        output_.automaticallyConfiguresOutputBufferDimensions = NO;
+      } else if ([session_ canSetSessionPreset:AVCaptureSessionPreset1280x720]) {
+        session_.sessionPreset = AVCaptureSessionPreset1280x720;
+      }
+    }
     [output_ setSampleBufferDelegate:self queue:queue_];
     [session_ commitConfiguration];
 
@@ -514,8 +596,10 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       }
       frame = std::move(processed).Value();
     }
-    if (frame.output.texture && frame != preview_) {
+    const CaptureFormat capture_format{width, height, ReadFrameRate(device_)};
+    if (frame.output.texture && (frame != preview_ || capture_format != captureFormat_)) {
       preview_ = std::move(frame);
+      captureFormat_ = capture_format;
       [self publish];
     }
   } catch (const std::exception& error) {
@@ -903,6 +987,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       texture_.reset();
     }
     preview_.reset();
+    captureFormat_.reset();
     frames_.reset();
     [self completeStops];
   });
@@ -927,8 +1012,8 @@ class IOSCamera final : public CameraBackend {
 public:
   explicit IOSCamera(UIViewController* owner) : capture_([[HUXIOSCameraCapture alloc] initWithOwner:owner]) {}
 
-  void Start(std::optional<Facing> facing, StatusCallback changed) override {
-    [capture_ start:facing frames:frame_pipeline_ changed:std::move(changed)];
+  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
+    [capture_ start:facing preferred:preferred frames:frame_pipeline_ changed:std::move(changed)];
   }
 
   void Stop(std::function<void()> completed) override {

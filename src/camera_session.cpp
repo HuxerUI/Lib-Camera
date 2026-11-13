@@ -278,9 +278,14 @@ void CameraSessionData::Reconcile() {
   if (closed || !backend || status->state == SessionState::Stopping) {
     return;
   }
-  if (desired.active && !background && !failure &&
-      ((desired.output_pixel_width == 0) != (desired.output_pixel_height == 0))) {
-    failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both camera output dimensions."};
+  if (desired.active && !background && !failure) {
+    if ((desired.output_pixel_width == 0) != (desired.output_pixel_height == 0)) {
+      failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both camera output dimensions."};
+    } else if ((desired.preferred_capture_pixel_width == 0) != (desired.preferred_capture_pixel_height == 0)) {
+      failure = CameraError{CameraErrorCode::ConfigurationFailed, "Specify both preferred camera capture dimensions."};
+    } else if (const auto fps = desired.preferred_capture_fps; fps && (!std::isfinite(*fps) || *fps <= 0)) {
+      failure = CameraError{CameraErrorCode::ConfigurationFailed, "The preferred camera frame rate must be positive and finite."};
+    }
   }
   const bool configuration_changed = desired != opened;
   if (!desired.active || background || failure ||
@@ -350,6 +355,7 @@ void CameraSessionData::Reconcile() {
           } else {
             const auto previous = owner->status->state;
             if (value.state == SessionState::Suspended) {
+              value.capture_format.reset();
               owner->InterruptPhoto();
               owner->InterruptControls();
               owner->StopRecording();
@@ -377,7 +383,8 @@ void CameraSessionData::Reconcile() {
           }
         });
       };
-      self->backend->Start(self->opened.facing, std::move(changed));
+      self->backend->Start(self->opened.facing, {self->opened.preferred_capture_pixel_width,
+          self->opened.preferred_capture_pixel_height, self->opened.preferred_capture_fps}, std::move(changed));
     } catch (const std::exception& error) {
       if (auto self = weak.lock(); self && !self->closed && self->generation == opening_generation) {
         self->failure = CameraError{CameraErrorCode::CaptureFailed, error.what()};

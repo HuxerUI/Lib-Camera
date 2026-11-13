@@ -90,6 +90,17 @@ public:
           const auto& facing = fields.at("facing");
           if (!facing.IsNull()) status.actual_facing = facing.AsString() == "front" ? Facing::Front : Facing::Back;
           status.can_focus_and_meter = fields.at("canFocusAndMeter").AsBoolean();
+          const auto& capture = fields.at("captureFormat");
+          if (!capture.IsNull()) {
+            const auto& format = capture.AsObject();
+            status.capture_format = CaptureFormat{
+                .pixel_width = static_cast<std::uint32_t>(format.at("width").AsInteger()),
+                .pixel_height = static_cast<std::uint32_t>(format.at("height").AsInteger())};
+            const auto& minimum = format.at("minFps");
+            if (!minimum.IsNull()) {
+              status.capture_format->frame_rate = FrameRateRange{minimum.AsDouble(), format.at("maxFps").AsDouble()};
+            }
+          }
           auto source_crop = full_texture_crop;
           const auto& output = fields.at("preview");
           if (!output.IsNull()) {
@@ -116,7 +127,7 @@ public:
     });
   }
 
-  void Start(std::optional<Facing> facing, StatusCallback changed) override {
+  void Start(std::optional<Facing> facing, CapturePreferences preferred, StatusCallback changed) override {
     changed_ = std::move(changed);
     const auto run = ++run_;
     if (frame_pipeline_) {
@@ -126,6 +137,9 @@ public:
     }
     auto weak = weak_from_this();
     PlatformPayload::Object arguments{{"run", run}, {"frames", pipeline_},
+        {"captureWidth", static_cast<std::int64_t>(preferred.pixel_width)},
+        {"captureHeight", static_cast<std::int64_t>(preferred.pixel_height)},
+        {"captureFps", preferred.fps ? PlatformPayload(*preferred.fps) : PlatformPayload{}},
         {"facing", facing ? PlatformPayload(*facing == Facing::Front ? "front" : "back") : PlatformPayload{}}};
     channel_.Invoke("start", PlatformPayload(std::move(arguments)), [weak, run](PlatformResult<PlatformPayload> result) {
       if (auto self = weak.lock(); self && self->run_ == run && self->changed_) {

@@ -130,6 +130,8 @@ std::shared_ptr<ExternalTexture> TestRecordedFrame(PhotoTestFixture& fixture, ca
   } else {
     Check(packet.duration && MediaTimestamp{duration.count(), 1'000'000} == *packet.duration,
           "The final recorded duration must match the MP4 sample duration.");
+    Check(duration == std::chrono::microseconds(16'666),
+          "A single-frame recording must use the configured 60 fps interval.");
   }
   fixture.platform.Await(fixture.runtime, [&] {
     return TakeRecordingResult(decoder.TrySubmit({packet.data, *packet.pts, packet.dts, packet.duration,
@@ -175,6 +177,9 @@ void TestRecording() {
   int factory_calls = 0;
   PhotoTestFixture fixture;
   TestRecordingPause(fixture, File((directory.path / "paused.mp4").u8string()));
+  auto status = fixture.context.owner->status.Get();
+  status.capture_format = CaptureFormat{64, 64, FrameRateRange{60, 60}};
+  fixture.context.owner->status = std::move(status);
   auto factory = std::make_shared<const FrameProcessorFactory>([&](std::uint32_t width, std::uint32_t height) -> FrameProcessor {
     Check(width == 64 && height == 64, "The recording factory must receive the source frame size.");
     ++factory_calls;

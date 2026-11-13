@@ -243,6 +243,29 @@ using FrameProcessor = std::function<CameraResult<PreviewOutput>(
 /// @see CameraOptions::frame_processor_factory, FrameProcessor
 using FrameProcessorFactory = std::function<FrameProcessor(std::uint32_t pixel_width, std::uint32_t pixel_height)>;
 
+/// @brief Configured capture frame rate bounds in frames per second.
+struct FrameRateRange {
+  /// Minimum configured rate in frames per second.
+  double min_fps = 0;
+  /// Maximum configured rate in frames per second.
+  double max_fps = 0;
+
+  bool operator==(const FrameRateRange&) const = default;
+};
+
+/// @brief Video frames delivered by the platform before Camera processes or sizes them.
+struct CaptureFormat {
+  /// Width in physical pixels, in the platform's delivered orientation.
+  std::uint32_t pixel_width = 0;
+  /// Height in physical pixels, in the platform's delivered orientation.
+  std::uint32_t pixel_height = 0;
+  /// Configured rate bounds, if known. The bounds can be equal for a fixed rate.
+  /// Delivered frames can arrive at a lower rate. Use capture timestamps for frame timing.
+  std::optional<FrameRateRange> frame_rate;
+
+  bool operator==(const CaptureFormat&) const = default;
+};
+
 /// @brief Declarative capture intent applied by UseCamera on recomposition.
 struct CameraOptions {
   /// Required camera facing, or an empty value to select the platform's default video device.
@@ -270,6 +293,17 @@ struct CameraOptions {
   std::uint32_t output_pixel_width = 0;
   /// Height in physical pixels of the shared texture, before rotation. Specify it together with output_pixel_width.
   std::uint32_t output_pixel_height = 0;
+  /// Preferred capture width and height in physical pixels. Set both to zero for the platform default.
+  /// The match ignores orientation. The platform can choose a different size to keep capture available.
+  /// An incomplete pair reports CameraErrorCode::ConfigurationFailed.
+  /// Changing either dimension reopens active capture and finalizes any current recording.
+  std::uint32_t preferred_capture_pixel_width = 0;
+  std::uint32_t preferred_capture_pixel_height = 0;
+  /// Preferred capture rate in frames per second. An empty value leaves frame rate selection to the platform.
+  /// Specify a positive finite value. Capture prioritizes a working preview and photo combination, then size,
+  /// then frame rate. Changing this preference reopens active capture and finalizes any current recording.
+  /// An invalid value reports CameraErrorCode::ConfigurationFailed.
+  std::optional<double> preferred_capture_fps;
 
   bool operator==(const CameraOptions&) const = default;
 };
@@ -336,6 +370,8 @@ struct CameraStatus {
   PhotoFlash photo_flash;
   /// Continuous light control. Empty while unsupported or before the capability is read.
   std::optional<Torch> torch;
+  /// Current video capture format. Empty until the platform reports the source geometry and while capture is inactive.
+  std::optional<CaptureFormat> capture_format;
 
   bool operator==(const CameraStatus&) const = default;
 };
