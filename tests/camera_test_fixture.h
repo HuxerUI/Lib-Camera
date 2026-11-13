@@ -81,11 +81,15 @@ class PhotoBackend final : public camera::detail::CameraBackend {
 public:
   std::function<void(camera::CameraResult<ImageAsset>)> pending;
   std::function<void()> stopped;
+  std::function<void(camera::CameraResult<void>)> pending_torch;
   camera::PhotoOptions options;
   int captures = 0;
 
   void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
   void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
+  void SetTorchEnabled(bool, std::function<void(camera::CameraResult<void>)> completed) override {
+    pending_torch = std::move(completed);
+  }
   void CapturePhoto(camera::PhotoOptions value,
                     std::function<void(camera::CameraResult<ImageAsset>)> completed) override {
     ++captures;

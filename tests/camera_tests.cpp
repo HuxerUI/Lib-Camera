@@ -439,6 +439,78 @@ void TestExposureCompensationRequests() {
         !owner->status->exposure_compensation, "A late EV result must not restore a closed camera's capability.");
 }
 
+void TestFlashAndTorchRequests() {
+  PhotoTestFixture fixture;
+  const auto& owner = fixture.context.owner;
+  const auto& backend = fixture.context.backend;
+  auto status = owner->status.Get();
+  status.photo_flash.supports_on = true;
+  status.torch = Torch{.available = true};
+  owner->status = status;
+  const auto request_torch = [&](bool enabled, std::optional<CameraResult<void>>& result) {
+    fixture.context.callers->Launch([owner, enabled, &result]() -> Task<void> {
+      result = co_await camera::detail::SetTorchEnabled(owner, enabled);
+    });
+    fixture.Drain();
+  };
+
+  std::optional<CameraResult<ImageAsset>> photo;
+  fixture.Launch(photo, {.flash_mode = FlashMode::Auto});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::Unavailable && backend->captures == 0,
+        "An unsupported flash mode must not reach the camera.");
+
+  std::optional<CameraResult<void>> torch;
+  request_torch(true, torch);
+  Check(backend->pending_torch && !torch, "The torch task must wait for platform completion.");
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::OperationInProgress && backend->captures == 0,
+        "A pending torch adjustment must exclude flash photos.");
+  status.torch->enabled = true;
+  owner->status = status;
+  std::exchange(backend->pending_torch, {})(CameraResult<void>::Success());
+  fixture.Drain();
+  Check(torch && torch->Succeeded(), "The torch task must report the platform result.");
+
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::Unavailable && backend->captures == 0,
+        "The torch must be off before taking a flash photo.");
+  photo.reset();
+  fixture.Launch(photo);
+  fixture.Drain();
+  Check(backend->captures == 1 && backend->options.flash_mode == FlashMode::Off,
+        "A photo with flash off can use the continuous light.");
+  backend->Complete(CameraResult<ImageAsset>::Success(ImageAsset{}));
+  fixture.Await(photo);
+
+  status.torch->enabled = false;
+  owner->status = status;
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Drain();
+  Check(backend->options.flash_mode == FlashMode::On, "The selected flash mode must reach the photo backend.");
+  torch.reset();
+  request_torch(true, torch);
+  Check(torch && torch->Error().code == CameraErrorCode::OperationInProgress && !backend->pending_torch,
+        "A pending flash photo must exclude torch adjustments.");
+  backend->Complete(CameraResult<ImageAsset>::Success(ImageAsset{}));
+  fixture.Await(photo);
+
+  torch.reset();
+  request_torch(true, torch);
+  owner->Close();
+  fixture.Drain();
+  Check(torch && torch->Error().code == CameraErrorCode::Interrupted && !owner->status->torch,
+        "Closing capture must interrupt an active torch adjustment and clear its status.");
+  std::exchange(backend->pending_torch, {})(CameraResult<void>::Success());
+  fixture.Drain();
+  Check(!owner->status->torch, "A late torch result must not restore closed camera status.");
+}
+
 void TestPhotoRequests() {
   {
     PhotoTestFixture fixture;
@@ -570,6 +642,7 @@ int main() {
     TestSessionLifetime();
     TestZoomRequests();
     TestExposureCompensationRequests();
+    TestFlashAndTorchRequests();
     TestPhotoRequests();
     std::cout << "Camera tests passed.\n";
     return 0;

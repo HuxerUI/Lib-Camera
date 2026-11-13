@@ -412,6 +412,25 @@ View MeteringReticle(bool metering) {
   }).With(Frame{.width = 60.0F, .height = 60.0F});
 }
 
+camera::FlashMode NextFlashMode(camera::FlashMode mode, camera::PhotoFlash flash) {
+  if (mode == camera::FlashMode::Off && flash.supports_auto) return camera::FlashMode::Auto;
+  if (mode != camera::FlashMode::On && flash.supports_on) return camera::FlashMode::On;
+  return camera::FlashMode::Off;
+}
+
+View LightingButton(ImageResource icon, const char* label, const char* indicator, bool active, bool enabled) {
+  const auto tint = active ? camera_yellow : foreground;
+  return Row {
+    Image(std::move(icon)).Tint(tint).With(Frame{.width = 22.0F, .height = 22.0F}),
+    indicator ? View(Label(indicator, 12.0F, tint, FontWeight::SemiBold)) : View(),
+  }.With(Frame{.width = indicator ? 60.0F : 48.0F, .height = 48.0F},
+         Padding(EdgeInsets::Symmetric(10.0F, 0.0F)),
+         Spacing(4.0F), MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center),
+         Background(overlay_background), CornerRadius(14.0F), Focusable(), PointerCursor(PointerCursorKind::Hand),
+         Enabled(enabled), Semantics{.role = SemanticRole::Button, .label = label,
+                                     .descendants = SemanticDescendantPolicy::Exclude});
+}
+
 [[huxerui::composable]]
 View CaptureModePicker(State<CaptureMode> mode, bool enabled) {
   static constexpr float tab_width = 88.0F;
@@ -681,6 +700,9 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
 View CameraWorkspace() {
   auto active = UseState(false);
   auto mode = UseState(CaptureMode::Photo);
+  auto flash_mode = UseState(camera::FlashMode::Off);
+  auto changing_torch = UseState(false);
+  auto torch_error = UseState(std::string{});
   auto facing = UseState(std::optional<camera::Facing>{});
   auto fit = UseState(ImageFit::Cover);
   auto mirror = UseState(camera::MirrorMode::Auto);
@@ -739,6 +761,29 @@ View CameraWorkspace() {
   const bool video_busy = video_phase != VideoPhase::Idle;
   const bool recording = status.recording_video && video_phase == VideoPhase::Recording;
   const bool paused = recording && status.recording_paused;
+  const bool torch_enabled = status.torch && status.torch->enabled;
+  const auto flash = status.photo_flash;
+  const camera::FlashMode requested_flash = flash_mode;
+  const auto selected_flash =
+      (requested_flash == camera::FlashMode::Auto && flash.supports_auto) ||
+      (requested_flash == camera::FlashMode::On && flash.supports_on)
+      ? requested_flash : camera::FlashMode::Off;
+
+  auto set_torch = [session, tasks, changing_torch, torch_error](bool enabled) {
+    if (changing_torch) return;
+    changing_torch = true;
+    torch_error = std::string{};
+    tasks.Launch([session, changing_torch, torch_error, enabled]() -> Task<void> {
+      const auto result = co_await session.SetTorchEnabledAsync(enabled);
+      if (!result.Succeeded() && result.Error().code != camera::CameraErrorCode::Interrupted) {
+        torch_error = result.Error().message;
+      }
+      changing_torch = false;
+    });
+  };
+  Lifecycle([video, torch_enabled, changing_torch, set_torch, torch_error] {
+    if (!video && torch_enabled && !changing_torch && torch_error->empty()) set_torch(false);
+  }, video, torch_enabled, changing_torch.Get());
 
   auto show_settings = [sheets, facing, fit, mirror, grid, comparison] {
     sheets.Show([facing, fit, mirror, grid, comparison](BottomSheetContext sheet) {
@@ -779,12 +824,12 @@ View CameraWorkspace() {
   };
   Lifecycle(start_camera);
 
-  auto take_photo = [session, tasks, photo, photo_error] {
+  auto take_photo = [session, tasks, photo, photo_error, selected_flash] {
     if (session.Status().capturing_photo) return;
     photo_error = std::string{};
-    tasks.Launch([session, photo, photo_error]() -> Task<void> {
+    tasks.Launch([session, photo, photo_error, selected_flash]() -> Task<void> {
       try {
-        auto result = co_await session.CapturePhotoAsync();
+        auto result = co_await session.CapturePhotoAsync({.flash_mode = selected_flash});
         if (result.Succeeded()) photo = std::move(result).Value();
         else photo_error = result.Error().message;
       } catch (const std::exception& error) {
@@ -944,6 +989,20 @@ View CameraWorkspace() {
   }
 
   const auto selected_point = live ? selection->point : std::nullopt;
+  View light_control;
+  if (live && video && status.torch) {
+    light_control = LightingButton(app::images::torch, torch_enabled ? "Turn off torch" : "Turn on torch",
+                                   nullptr, torch_enabled,
+                                   !changing_torch && (torch_enabled || status.torch->available))
+        .OnClick([set_torch, torch_enabled] { set_torch(!torch_enabled); }).Key("torch");
+  } else if (live && !video && (flash.supports_auto || flash.supports_on)) {
+    const bool automatic = selected_flash == camera::FlashMode::Auto;
+    const bool forced = selected_flash == camera::FlashMode::On;
+    light_control = LightingButton(automatic || forced ? app::images::flash : app::images::flash_off,
+                                   automatic ? "Flash auto" : forced ? "Flash on" : "Flash off",
+                                   automatic ? "A" : nullptr, forced, !status.capturing_photo)
+        .OnClick([flash_mode, selected_flash, flash] { flash_mode = NextFlashMode(selected_flash, flash); }).Key("flash");
+  }
   View viewfinder = Stack {
     std::move(preview).Key("preview-surface"),
     live ? View() : EmptyPreview(status, authorizing, permission_error),
@@ -957,6 +1016,7 @@ View CameraWorkspace() {
       Row {
         badge,
         Spacer(),
+        std::move(light_control),
         IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
             .With(Background(overlay_background), CornerRadius(14.0F)),
       }.With(
@@ -992,7 +1052,8 @@ View CameraWorkspace() {
   const char* video_action = recording ? "Stop recording" : phase == VideoPhase::Authorizing ? "Requesting microphone access"
       : phase == VideoPhase::Starting ? "Starting microphone" : video_busy ? "Processing video" : "Record video";
   const bool shutter_enabled = video ? recording || (live && !video_busy && !saving_video)
-                                     : live && !status.capturing_photo;
+      : live && !status.capturing_photo &&
+          (selected_flash == camera::FlashMode::Off || (!changing_torch && !torch_enabled));
   const bool can_retry = !live && !video_busy && !authorizing && !stopping &&
       (failed || !permission_error->empty());
   View primary = can_retry
@@ -1018,7 +1079,8 @@ View CameraWorkspace() {
         .OnClick(save_video).With(Enabled(!saving_video && !video_busy))) : View(),
     video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
     photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
-    CaptureModePicker(mode, !video_busy && !status.capturing_photo),
+    torch_error->empty() ? View() : View(Label(torch_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
+    CaptureModePicker(mode, !video_busy && !status.capturing_photo && !changing_torch),
     Stack {
       Row {
         left_control,

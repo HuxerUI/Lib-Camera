@@ -17,6 +17,7 @@ class VideoRecording;
 struct PhotoRequest;
 struct CameraControlRequest;
 struct FocusRequest;
+struct TorchRequest;
 
 struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   State<CameraStatus> status;
@@ -35,12 +36,14 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   bool engaged = false;
   bool closed = false;
   std::shared_ptr<PhotoRequest> photo;
+  bool flash_photo_pending = false;
   std::uint64_t control_generation = 0;
   std::shared_ptr<CameraControlRequest> active_zoom;
   std::shared_ptr<CameraControlRequest> pending_zoom;
   std::shared_ptr<CameraControlRequest> active_exposure_compensation;
   std::shared_ptr<CameraControlRequest> pending_exposure_compensation;
   std::shared_ptr<FocusRequest> focus_request;
+  std::shared_ptr<TorchRequest> torch_request;
 
   CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app);
   void InterruptPhoto();
@@ -49,6 +52,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   void ApplyZoom();
   void ReadExposureCompensation();
   void ApplyExposureCompensation();
+  void ObserveLighting();
   std::chrono::microseconds RecordedDuration() const noexcept;
   void SetRecordingPaused(bool paused);
   void StopRecording();
@@ -63,6 +67,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options);
 Task<CameraResult<void>> SetZoomRatio(std::shared_ptr<CameraSessionData> owner, float ratio);
 Task<CameraResult<void>> SetExposureCompensation(std::shared_ptr<CameraSessionData> owner, float ev);
+Task<CameraResult<void>> SetTorchEnabled(std::shared_ptr<CameraSessionData> owner, bool enabled);
 Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, File destination,
                                     std::optional<audio::AudioCaptureSession> microphone = std::nullopt);
 Task<CameraResult<void>> RecordVideo(std::shared_ptr<CameraSessionData> owner, RandomAccessStream destination,

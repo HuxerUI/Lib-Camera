@@ -40,6 +40,10 @@ struct FocusRequest {
   CallbackCompletion<CameraResult<void>> completion;
 };
 
+struct TorchRequest {
+  CallbackCompletion<CameraResult<void>> completion;
+};
+
 namespace {
 
 void InterruptRequests(const std::shared_ptr<CameraControlRequest>& first,
@@ -83,6 +87,30 @@ void CameraSessionData::InterruptControls() {
                     "Camera exposure compensation was interrupted.");
   if (auto focus = std::exchange(focus_request, {})) {
     focus->completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Interrupted, "Camera focus was interrupted."}));
+  }
+  if (auto torch = std::exchange(torch_request, {})) {
+    torch->completion.Complete(CameraResult<void>::Failure(
+        {CameraErrorCode::Interrupted, "The camera torch adjustment was interrupted."}));
+  }
+}
+
+void CameraSessionData::ObserveLighting() {
+  const auto update = [weak = weak_from_this(), scope = tasks, token = control_generation](
+                          PhotoFlash flash, std::optional<Torch> torch) {
+    scope.Post([weak, token, flash, torch] {
+      if (auto owner = weak.lock(); owner && token == owner->control_generation &&
+          owner->status->state == SessionState::Running) {
+        CameraStatus value = owner->status;
+        value.photo_flash = flash;
+        value.torch = torch;
+        owner->status = std::move(value);
+      }
+    });
+  };
+  try {
+    backend->ObserveLighting(update);
+  } catch (const std::exception&) {
+    // A failed control query leaves the capabilities unavailable.
   }
 }
 
@@ -198,6 +226,7 @@ void CameraSessionData::InterruptPhoto() {
 
 void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request) {
   photo = request;
+  flash_photo_pending = options.flash_mode != FlashMode::Off;
   CameraStatus value = status;
   value.capturing_photo = true;
   status = value;
@@ -212,6 +241,7 @@ void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<P
       if (!owner || owner->photo != request)
         return;
       owner->photo.reset();
+      owner->flash_photo_pending = false;
       CameraStatus value = owner->status;
       value.capturing_photo = false;
       owner->status = std::move(value);
@@ -333,12 +363,15 @@ void CameraSessionData::Reconcile() {
             if (value.state == SessionState::Running && previous == SessionState::Running) {
               value.zoom = owner->status->zoom;
               value.exposure_compensation = owner->status->exposure_compensation;
+              value.photo_flash = owner->status->photo_flash;
+              value.torch = owner->status->torch;
             }
             const bool read_controls = value.state == SessionState::Running && previous != SessionState::Running;
             owner->status = std::move(value);
             if (read_controls) {
               owner->ReadZoom();
               owner->ReadExposureCompensation();
+              owner->ObserveLighting();
             }
           }
         });
@@ -388,6 +421,23 @@ Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> o
   if (owner->photo) {
     co_return CameraResult<ImageAsset>::Failure(
         {CameraErrorCode::OperationInProgress, "A photo capture is already in progress."});
+  }
+  if (options.flash_mode != FlashMode::Off) {
+    const auto current = owner->status.Get();
+    if (owner->torch_request) {
+      co_return CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::OperationInProgress, "A torch adjustment is in progress."});
+    }
+    if (current.torch && current.torch->enabled) {
+      co_return CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::Unavailable, "Turn off the torch before using the flash."});
+    }
+    const bool supported = options.flash_mode == FlashMode::Auto ? current.photo_flash.supports_auto
+                                                                 : current.photo_flash.supports_on;
+    if (!supported) {
+      co_return CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::Unavailable, "The requested flash mode is unavailable."});
+    }
   }
   auto request = std::make_shared<PhotoRequest>();
   owner->BeginPhoto(options, request);
@@ -443,6 +493,43 @@ Task<CameraResult<void>> SetExposureCompensation(std::shared_ptr<CameraSessionDa
             owner->pending_exposure_compensation.reset();
           }
         };
+      });
+}
+
+Task<CameraResult<void>> SetTorchEnabled(std::shared_ptr<CameraSessionData> owner, bool enabled) {
+  return AwaitCallback<CameraResult<void>>(
+      [owner = std::move(owner), enabled](CallbackCompletion<CameraResult<void>> completion)
+          -> std::function<void()> {
+        const auto status = owner->status.Get();
+        if (owner->closed || !owner->engaged || status.state != SessionState::Running) {
+          completion.Complete(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
+          return {};
+        }
+        if (owner->torch_request || owner->flash_photo_pending) {
+          completion.Complete(CameraResult<void>::Failure(
+              {CameraErrorCode::OperationInProgress, "A torch adjustment or flash photo is in progress."}));
+          return {};
+        }
+        if (!status.torch || (enabled && !status.torch->available)) {
+          completion.Complete(CameraResult<void>::Failure({CameraErrorCode::Unavailable, "The camera torch is unavailable."}));
+          return {};
+        }
+        const auto request = std::make_shared<TorchRequest>(TorchRequest{completion});
+        owner->torch_request = request;
+        const auto finish = [weak = owner->weak_from_this(), scope = owner->tasks, request](CameraResult<void> result) {
+          scope.Post([weak, request, result = std::move(result)]() mutable {
+            if (auto owner = weak.lock(); owner && owner->torch_request == request) {
+              owner->torch_request.reset();
+              request->completion.Complete(std::move(result));
+            }
+          });
+        };
+        try {
+          owner->backend->SetTorchEnabled(enabled, finish);
+        } catch (const std::exception& error) {
+          finish(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+        }
+        return {};
       });
 }
 
@@ -515,6 +602,10 @@ Task<CameraResult<void>> CameraSession::SetExposureCompensationAsync(float ev) c
   return detail::SetExposureCompensation(data_, ev);
 }
 
+Task<CameraResult<void>> CameraSession::SetTorchEnabledAsync(bool enabled) const {
+  return detail::SetTorchEnabled(data_, enabled);
+}
+
 Task<CameraResult<void>> CameraSession::FocusAndMeterAsync(Point position, Size preview_size, PreviewOptions options) const {
   return detail::FocusAndMeter(data_, position, preview_size, options);
 }
@@ -523,6 +614,12 @@ Task<CameraResult<ImageAsset>> CameraSession::CapturePhotoAsync(PhotoOptions opt
   if (options.jpeg_quality < 1 || options.jpeg_quality > 100 ||
       (options.mirror != MirrorMode::Auto && options.mirror != MirrorMode::Off && options.mirror != MirrorMode::On)) {
     throw std::invalid_argument("Invalid photo quality or mirror mode.");
+  }
+  switch (options.flash_mode) {
+    case FlashMode::Off:
+    case FlashMode::Auto:
+    case FlashMode::On: break;
+    default: throw std::invalid_argument("Invalid photo flash mode.");
   }
   return detail::CapturePhoto(data_, options);
 }

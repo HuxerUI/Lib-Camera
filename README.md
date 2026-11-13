@@ -114,6 +114,10 @@ active camera on Android, iOS, and macOS. Point control is available for the def
 
 Launch `CapturePhotoAsync` from a UI event or task. It returns `CameraResult<ImageAsset>`, an alias for `Result<ImageAsset, CameraError>`.
 
+Set `PhotoOptions::flash_mode` to `FlashMode::Auto` or `FlashMode::On` when the corresponding capability is
+reported by `session.Status().photo_flash`. The default is `FlashMode::Off`. Turn off the continuous light
+before requesting a flash photo.
+
 The following component stores the captured image in state supplied by its caller:
 
 ```cpp
@@ -221,6 +225,14 @@ Poll `session.RecordedDuration()` on the UI thread for the current recording dur
 | `OutputStream` | Transfers a fresh writable sequential stream and writes fragmented MP4. |
 
 Android recording requires API 28 or later.
+
+## Use the Torch
+
+Read `session.Status().torch` for the active camera's continuous light capability and observed state. Call
+`session.SetTorchEnabledAsync(true)` from a UI task to turn on the light during preview or recording.
+The light belongs to the camera session and stays on when recording pauses or ends. Switching cameras
+or closing the session turns it off. The example shows a torch button in video mode and turns off the
+light when switching to photo mode.
 
 ## Record with a Microphone
 

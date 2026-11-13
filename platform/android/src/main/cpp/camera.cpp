@@ -63,6 +63,18 @@ public:
 
   void Connect() {
     auto weak = weak_from_this();
+    channel_.On("lighting", [weak](const PlatformPayload& payload) {
+      if (auto self = weak.lock(); self && self->lighting_) {
+        const auto& fields = payload.AsObject();
+        if (fields.at("run").AsInteger() != self->run_) return;
+        std::optional<Torch> torch;
+        if (fields.at("hasTorch").AsBoolean()) {
+          torch = Torch{.available = true, .enabled = fields.at("torchEnabled").AsBoolean()};
+        }
+        self->lighting_({.supports_auto = fields.at("hasFlash").AsBoolean(),
+                         .supports_on = fields.at("hasFlash").AsBoolean()}, torch);
+      }
+    });
     channel_.On("snapshot", [weak](const PlatformPayload& payload) {
       if (auto self = weak.lock(); self && self->changed_) {
         try {
@@ -123,6 +135,7 @@ public:
   void Stop(std::function<void()> completed) override {
     ++run_;
     changed_ = {};
+    lighting_ = {};
     ReleasePipeline();
     channel_.Invoke<std::monostate>("stop", [completed = std::move(completed)](PlatformResult<std::monostate>) {
       if (completed) completed();
@@ -208,9 +221,28 @@ public:
         });
   }
 
+  void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) override {
+    lighting_ = std::move(changed);
+    channel_.Invoke<std::monostate>("observeLighting", PlatformPayload(PlatformPayload::Object{{"run", run_}}),
+                                  [](PlatformResult<std::monostate>) {});
+  }
+
+  void SetTorchEnabled(bool enabled, std::function<void(CameraResult<void>)> completed) override {
+    channel_.Invoke<std::monostate>("setTorchEnabled",
+        PlatformPayload(PlatformPayload::Object{{"run", run_}, {"enabled", enabled}}),
+        [completed = std::move(completed)](PlatformResult<std::monostate> result) {
+          if (const auto* error = std::get_if<PlatformError>(&result)) {
+            completed(CameraResult<void>::Failure({DecodeError(error->code), error->message}));
+          } else {
+            completed(CameraResult<void>::Success());
+          }
+        });
+  }
+
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     PlatformPayload::Object arguments{
-        {"run", run_}, {"quality", options.jpeg_quality}, {"mirror", options.mirror == MirrorMode::On}};
+        {"run", run_}, {"quality", options.jpeg_quality}, {"mirror", options.mirror == MirrorMode::On},
+        {"flash", options.flash_mode == FlashMode::Auto ? "auto" : options.flash_mode == FlashMode::On ? "on" : "off"}};
     channel_.Invoke(
         "capturePhoto", PlatformPayload(std::move(arguments)),
         [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
@@ -240,6 +272,7 @@ private:
 
   PlatformChannel channel_;
   std::function<void(CameraStatus)> changed_;
+  std::function<void(PhotoFlash, std::optional<Torch>)> lighting_;
   std::int64_t run_ = 0;
   std::int64_t pipeline_ = 0;
 };

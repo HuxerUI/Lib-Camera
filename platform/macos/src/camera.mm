@@ -18,6 +18,8 @@ using huxerui::camera::detail::FrameProducer;
 
 namespace {
 
+char lighting_observation;
+
 CMClockRef SessionClock(AVCaptureSession* session) {
   if (@available(macOS 12.3, *)) return session.synchronizationClock;
 #pragma clang diagnostic push
@@ -152,10 +154,14 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   std::optional<Facing> facing_;
   bool failed_;
   std::function<void(CameraStatus)> changed_;
+  std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
 - (void)start:(std::optional<Facing>)facing frames:(std::shared_ptr<FramePipeline>)frames
       changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
+- (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed;
+- (void)setTorchEnabled:(bool)enabled completed:(std::function<void(CameraResult<void>)>)completed;
+- (void)turnOffTorch;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 - (bool)supportsPointControl;
 - (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed;
@@ -393,6 +399,106 @@ changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = p
   });
 }
 
+- (PhotoFlash)photoFlash {
+  if (@available(macOS 13.0, *)) {
+    NSArray<NSNumber*>* modes = photoOutput_.supportedFlashModes;
+    return {.supports_auto = [modes containsObject:@(AVCaptureFlashModeAuto)] == YES,
+            .supports_on = [modes containsObject:@(AVCaptureFlashModeOn)] == YES};
+  }
+  return {};
+}
+
+- (std::optional<Torch>)torch {
+  if (!device_.hasTorch || ![device_ isTorchModeSupported:AVCaptureTorchModeOn] ||
+      ![device_ isTorchModeSupported:AVCaptureTorchModeOff]) return {};
+  return Torch{.available = device_.isTorchAvailable == YES, .enabled = device_.isTorchActive == YES};
+}
+
+- (void)publishLighting {
+  if (lightingChanged_ && changed_ && session_.isRunning && !failed_) {
+    lightingChanged_([self photoFlash], [self torch]);
+  }
+}
+
+- (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning || failed_) return;
+    if (!lightingChanged_) {
+      if (device_.hasTorch) {
+        [device_ addObserver:self forKeyPath:@"torchAvailable" options:0 context:&lighting_observation];
+        [device_ addObserver:self forKeyPath:@"torchActive" options:0 context:&lighting_observation];
+      }
+      if (@available(macOS 13.0, *)) {
+        [photoOutput_ addObserver:self forKeyPath:@"supportedFlashModes" options:0 context:&lighting_observation];
+      }
+    }
+    lightingChanged_ = changed;
+    [self publishLighting];
+  });
+}
+
+- (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(id)object
+                       change:(NSDictionary<NSKeyValueChangeKey, id>*)change context:(void*)context {
+  if (context != &lighting_observation) {
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    return;
+  }
+  dispatch_async(queue_, ^{
+    if (object == device_ || object == photoOutput_) [self publishLighting];
+  });
+}
+
+- (CameraResult<void>)applyTorchEnabled:(bool)enabled {
+  const auto torch = [self torch];
+  if (!torch || (enabled && !torch->available)) {
+    return CameraResult<void>::Failure({CameraErrorCode::Unavailable, "The camera torch is unavailable."});
+  }
+  NSError* error = nil;
+  if (![device_ lockForConfiguration:&error]) {
+    return CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+        error.localizedDescription.UTF8String ?: "Cannot configure the camera torch."});
+  }
+  @try {
+    device_.torchMode = enabled ? AVCaptureTorchModeOn : AVCaptureTorchModeOff;
+  } @catch (NSException* exception) {
+    return CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+        exception.reason.UTF8String ?: "Cannot change the camera torch."});
+  } @finally {
+    [device_ unlockForConfiguration];
+  }
+  return CameraResult<void>::Success();
+}
+
+- (void)setTorchEnabled:(bool)enabled completed:(std::function<void(CameraResult<void>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning || failed_) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
+      return;
+    }
+    auto result = [self applyTorchEnabled:enabled];
+    [self publishLighting];
+    completed(std::move(result));
+  });
+}
+
+- (void)stopObservingLighting {
+  if (!lightingChanged_) return;
+  if (device_.hasTorch) {
+    [device_ removeObserver:self forKeyPath:@"torchAvailable" context:&lighting_observation];
+    [device_ removeObserver:self forKeyPath:@"torchActive" context:&lighting_observation];
+  }
+  if (@available(macOS 13.0, *)) {
+    [photoOutput_ removeObserver:self forKeyPath:@"supportedFlashModes" context:&lighting_observation];
+  }
+  lightingChanged_ = {};
+}
+
+- (void)turnOffTorch {
+  if (device_.torchMode != AVCaptureTorchModeOff) {
+    CAMERA_UNUSED([self applyTorchEnabled:false]);
+  }
+}
+
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
   dispatch_async(queue_, ^{
     if (!changed_ || !session_.isRunning || failed_) {
@@ -409,6 +515,15 @@ changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = p
       completed(CameraResult<ImageAsset>::Failure(
           {CameraErrorCode::Unavailable, "This camera cannot combine preview and still photos."}));
       return;
+    }
+    if (options.flash_mode != FlashMode::Off) {
+      const auto flash = [self photoFlash];
+      const bool supported = options.flash_mode == FlashMode::Auto ? flash.supports_auto : flash.supports_on;
+      if (!supported || !device_.isFlashAvailable || device_.torchMode == AVCaptureTorchModeOn) {
+        completed(CameraResult<ImageAsset>::Failure(
+            {CameraErrorCode::Unavailable, "The requested flash mode is unavailable."}));
+        return;
+      }
     }
     AVCaptureConnection* connection = [photoOutput_ connectionWithMediaType:AVMediaTypeVideo];
     if (connection.isVideoMirroringSupported) {
@@ -438,6 +553,11 @@ changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = p
     @try {
       AVCapturePhotoSettings* settings =
           [AVCapturePhotoSettings photoSettingsWithFormat:@{AVVideoCodecKey : AVVideoCodecTypeJPEG}];
+      if (@available(macOS 13.0, *)) {
+        if (options.flash_mode != FlashMode::Off) {
+          settings.flashMode = options.flash_mode == FlashMode::Auto ? AVCaptureFlashModeAuto : AVCaptureFlashModeOn;
+        }
+      }
       [photoOutput_ capturePhotoWithSettings:settings delegate:photo_];
     } @catch (NSException* exception) {
       finish(CameraResult<ImageAsset>::Failure(
@@ -456,6 +576,8 @@ changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = p
       [NSNotificationCenter.defaultCenter removeObserver:observer];
     }
     [observers_ removeAllObjects];
+    [self stopObservingLighting];
+    [self turnOffTorch];
     [output_ setSampleBufferDelegate:nil queue:nullptr];
     [session_ stopRunning];
     producer_.processor = {};
@@ -495,6 +617,12 @@ public:
   }
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];
+  }
+  void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) override {
+    [capture_ observeLighting:std::move(changed)];
+  }
+  void SetTorchEnabled(bool enabled, std::function<void(CameraResult<void>)> completed) override {
+    [capture_ setTorchEnabled:enabled completed:std::move(completed)];
   }
   void FocusAndMeter(Point point, std::function<void(CameraResult<void>)> completed) override {
     [capture_ focusAndMeter:point completed:std::move(completed)];

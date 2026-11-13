@@ -478,6 +478,14 @@ public:
   }
 
   void Stop(std::function<void()> completed) {
+    if (const auto torch = ReadTorch(); torch && torch->enabled) {
+      try {
+        ApplyTorch(false);
+      } catch (HRESULT) {
+        // Shutting down the device releases the torch if the control is no longer reachable.
+      }
+    }
+    lighting_changed_ = {};
     running_ = false;
     changed_ = {};
     if (events_)
@@ -561,12 +569,40 @@ public:
     }
   }
 
+  void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) {
+    lighting_changed_ = std::move(changed);
+    PublishLighting();
+  }
+
+  CameraResult<void> SetTorchEnabled(bool enabled) {
+    if (!running_) {
+      return CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera is not running."});
+    }
+    try {
+      if (!ApplyTorch(enabled)) {
+        return CameraResult<void>::Failure({CameraErrorCode::Unavailable, "The camera torch is unavailable."});
+      }
+      PublishLighting();
+      return CameraResult<void>::Success();
+    } catch (HRESULT result) {
+      return CameraResult<void>::Failure(Error(result, CameraErrorCode::CaptureFailed));
+    }
+  }
+
   void Photo(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) {
     if (!running_) {
       completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
       return;
     }
     ComPtr<IMFCapturePhotoSink> photo;
+    ComPtr<IMFExtendedCameraControl> flash;
+    const auto reset_flash = [&] {
+      if (flash && options.flash_mode != FlashMode::Off &&
+          SUCCEEDED(flash->SetFlags(KSCAMERA_EXTENDEDPROP_FLASH_OFF))) {
+        flash->CommitSettings();
+      }
+      flash.Reset();
+    };
     try {
       Require(com_status_);
       constexpr DWORD stream = MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_PHOTO;
@@ -597,8 +633,26 @@ public:
       ComPtr<IMFByteStream> bytes;
       Require(MFCreateMFByteStreamOnStream(storage.Get(), &bytes));
       Require(photo->SetOutputByteStream(bytes.Get()));
+      flash = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_FLASHMODE);
+      if (options.flash_mode != FlashMode::Off) {
+        const auto flags = options.flash_mode == FlashMode::Auto ? KSCAMERA_EXTENDEDPROP_FLASH_AUTO
+                                                               : KSCAMERA_EXTENDEDPROP_FLASH_ON;
+        if (!flash || !(flash->GetCapabilities() & flags)) {
+          flash.Reset();
+          photo->RemoveAllStreams();
+          completed(CameraResult<ImageAsset>::Failure(
+              {CameraErrorCode::Unavailable, "The requested flash mode is unavailable."}));
+          return;
+        }
+        Require(flash->SetFlags(flags));
+        Require(flash->CommitSettings());
+      } else if (flash && flash->GetFlags() != KSCAMERA_EXTENDEDPROP_FLASH_OFF) {
+        Require(flash->SetFlags(KSCAMERA_EXTENDEDPROP_FLASH_OFF));
+        Require(flash->CommitSettings());
+      }
       Require(engine_->TakePhoto());
       const HRESULT captured = events_->Wait(MF_CAPTURE_ENGINE_PHOTO_TAKEN);
+      reset_flash();
       if (captured == HRESULT_FROM_WIN32(WAIT_TIMEOUT)) {
         // An unacknowledged request cannot safely share the engine with another photo.
         events_->Fail(captured);
@@ -621,10 +675,12 @@ public:
       photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Success(std::move(image)));
     } catch (HRESULT result) {
+      reset_flash();
       if (photo)
         photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Failure(Error(result, CameraErrorCode::CaptureFailed)));
     } catch (const std::exception& error) {
+      reset_flash();
       if (photo)
         photo->RemoveAllStreams();
       completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
@@ -632,6 +688,35 @@ public:
   }
 
 private:
+  std::optional<Torch> ReadTorch() {
+    const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_TORCHMODE);
+    if (!control || !(control->GetCapabilities() & KSCAMERA_EXTENDEDPROP_VIDEOTORCH_ON)) return {};
+    return Torch{.available = true, .enabled = control->GetFlags() != KSCAMERA_EXTENDEDPROP_VIDEOTORCH_OFF};
+  }
+
+  bool ApplyTorch(bool enabled) {
+    const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_TORCHMODE);
+    if (!control || !(control->GetCapabilities() & KSCAMERA_EXTENDEDPROP_VIDEOTORCH_ON)) return false;
+    Require(control->SetFlags(enabled ? KSCAMERA_EXTENDEDPROP_VIDEOTORCH_ON : KSCAMERA_EXTENDEDPROP_VIDEOTORCH_OFF));
+    Require(control->CommitSettings());
+    return true;
+  }
+
+  void PublishLighting() {
+    if (!lighting_changed_) return;
+    PhotoFlash flash;
+    ComPtr<IMFMediaType> type;
+    if (source_ && SUCCEEDED(source_->GetCurrentDeviceMediaType(MF_CAPTURE_ENGINE_PREFERRED_SOURCE_STREAM_FOR_PHOTO,
+                                                                &type))) {
+      if (const auto control = OpenCameraControl(KSPROPERTY_CAMERACONTROL_EXTENDED_FLASHMODE)) {
+        const auto flags = control->GetCapabilities();
+        flash.supports_auto = (flags & KSCAMERA_EXTENDEDPROP_FLASH_AUTO) != 0;
+        flash.supports_on = (flags & KSCAMERA_EXTENDEDPROP_FLASH_ON) != 0;
+      }
+    }
+    lighting_changed_(flash, ReadTorch());
+  }
+
   ComPtr<IMFExtendedCameraControl> OpenCameraControl(ULONG property) {
     ComPtr<IMFExtendedCameraController> controller;
     ComPtr<IMFExtendedCameraControl> control;
@@ -704,6 +789,7 @@ private:
   HRESULT com_status_ = S_OK;
   std::optional<Facing> facing_;
   std::function<void(CameraStatus)> changed_;
+  std::function<void(PhotoFlash, std::optional<Torch>)> lighting_changed_;
   ComPtr<IMFMediaSource> device_;
   ComPtr<IMFCaptureEngine> engine_;
   ComPtr<IMFCaptureSource> source_;
@@ -755,6 +841,16 @@ public:
   void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
     capture_->Post([capture = capture_, ev, completed = std::move(completed)] {
       completed(capture->SetExposureCompensation(ev));
+    });
+  }
+
+  void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) override {
+    capture_->Post([capture = capture_, changed = std::move(changed)] { capture->ObserveLighting(changed); });
+  }
+
+  void SetTorchEnabled(bool enabled, std::function<void(CameraResult<void>)> completed) override {
+    capture_->Post([capture = capture_, enabled, completed = std::move(completed)] {
+      completed(capture->SetTorchEnabled(enabled));
     });
   }
 

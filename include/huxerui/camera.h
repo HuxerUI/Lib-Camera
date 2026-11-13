@@ -126,15 +126,47 @@ struct CameraError {
 /// @tparam T Owned result payload, or void for operations without a payload.
 template <class T> using CameraResult = Result<T, CameraError>;
 
-/// @brief Encoding and final appearance of one still photo, independent of preview settings.
+/// @brief Hardware flash requested for one still photo.
+enum class FlashMode {
+  /// Capture without firing the flash.
+  Off,
+  /// Let the camera decide whether to fire the flash.
+  Auto,
+  /// Request a flash for this capture.
+  On,
+};
+
+/// @brief Capture and encoding options for one still photo.
 struct PhotoOptions {
   /// Final JPEG encoding quality in [1, 100]. Higher values generally produce larger files.
   int jpeg_quality = 90;
   /// Final horizontal mirroring after orientation is applied. Defaults to MirrorMode::Off.
   /// Auto mirrors only a confirmed front camera.
   MirrorMode mirror = MirrorMode::Off;
+  /// Hardware flash for this request. Off also permits capture under an enabled torch.
+  FlashMode flash_mode = FlashMode::Off;
 
   bool operator==(const PhotoOptions&) const = default;
+};
+
+/// @brief Flash modes supported by the active still-photo output.
+struct PhotoFlash {
+  /// Whether the photo output supports FlashMode::Auto.
+  bool supports_auto = false;
+  /// Whether the photo output supports FlashMode::On.
+  bool supports_on = false;
+
+  bool operator==(const PhotoFlash&) const = default;
+};
+
+/// @brief Observed continuous light capability of the active camera.
+struct Torch {
+  /// Whether the camera can currently turn on its torch.
+  bool available = false;
+  /// Whether the platform reports the torch on.
+  bool enabled = false;
+
+  bool operator==(const Torch&) const = default;
 };
 
 /// @brief Presentation options for one CameraPreview.
@@ -299,6 +331,10 @@ struct CameraStatus {
   /// Whether the current preview supports setting a focus or metering point.
   /// Empty previews, frame processors, and explicitly sized outputs do not provide point control.
   bool can_focus_and_meter = false;
+  /// Still-photo flash capability. Both modes are false while unavailable or before the capability is read.
+  PhotoFlash photo_flash;
+  /// Continuous light control. Empty while unsupported or before the capability is read.
+  std::optional<Torch> torch;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -362,6 +398,16 @@ public:
   /// @throws std::invalid_argument Before returning a task if ev is nonfinite.
   Task<CameraResult<void>> SetExposureCompensationAsync(float ev) const;
 
+  /// @brief Turns the active camera's continuous light on or off during preview or recording.
+  ///
+  /// Start the lazy task on the owning UI thread. Read CameraStatus::torch for the observed light status.
+  /// The light belongs to the camera session and stays on across recording pause and stop. Switching cameras,
+  /// suspending capture, or closing the session releases the light. The session does not restore it on restart.
+  /// @param enabled Whether to turn on the continuous light.
+  /// @return Unavailable when there is no torch or it cannot be turned on. OperationInProgress when a torch
+  /// adjustment or a flash photo is pending. NotReady means the camera is not running.
+  Task<CameraResult<void>> SetTorchEnabledAsync(bool enabled) const;
+
   /// @brief Sets a focus and metering point on the active camera.
   ///
   /// Pass the point and size in the same local logical coordinates as CameraPreview, with its presentation options.
@@ -386,9 +432,11 @@ public:
   /// Task cancellation suppresses delivery while platform cleanup continues. Cleanup must finish before
   /// another request is accepted.
   /// No file or photo-library entry is created. Save EncodedBytes() with the SDK File APIs when needed.
-  /// @param options JPEG quality and final mirroring for this request only.
-  /// @return A task yielding an owned JPEG image or CameraError. Unavailable indicates missing still-photo output.
-  /// @throws std::invalid_argument Before returning a task if quality or mirror mode is invalid.
+  /// @param options JPEG quality, final mirroring, and flash mode for this request only.
+  /// @return A task yielding an owned JPEG image or CameraError. Unavailable indicates missing still-photo output,
+  /// an unavailable flash mode, or a request for flash while the torch is on. A pending torch adjustment
+  /// prevents a flash photo with OperationInProgress. FlashMode::On requests flash subject to platform availability.
+  /// @throws std::invalid_argument Before returning a task if quality, mirror mode, or flash mode is invalid.
   /// @code{.cpp}
   /// auto result = co_await session.CapturePhotoAsync({.jpeg_quality = 90});
   /// if (result.Succeeded()) {

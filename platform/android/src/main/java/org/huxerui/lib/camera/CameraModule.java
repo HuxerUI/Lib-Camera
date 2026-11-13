@@ -32,6 +32,7 @@ import androidx.camera.core.ImageCaptureException;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.SurfaceRequest;
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory;
+import androidx.camera.core.TorchState;
 import androidx.camera.core.ZoomState;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.Lifecycle;
@@ -91,6 +92,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private boolean photoPending;
         private Camera camera;
         private Observer<CameraState> cameraObserver;
+        private Observer<Integer> torchObserver;
         private HuxerUIPlatformChannel.Result pendingZoom;
         private float requestedZoomRatio;
         private final Choreographer.FrameCallback zoomFrame = time -> applyZoomRatio();
@@ -145,6 +147,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                         : exposurePayload(exposure, exposure.getExposureCompensationIndex()));
             } else if (method.equals("setExposureCompensation")) {
                 setExposureCompensation(arguments, result);
+            } else if (method.equals("observeLighting")) {
+                if (isCurrentCamera(arguments)) observeLighting();
+                result.complete(PlatformPayload.nullValue());
+            } else if (method.equals("setTorchEnabled")) {
+                setTorchEnabled(arguments, result);
             } else if (method.equals("focusAndMeter")) {
                 focusAndMeter(arguments, result);
             } else if (method.equals("stop")) {
@@ -414,6 +421,63 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             }
         }
 
+        private void observeLighting() {
+            CameraInfo info = camera.getCameraInfo();
+            if (info.hasFlashUnit() && torchObserver == null) {
+                torchObserver = state -> emitLighting();
+                info.getTorchState().observeForever(torchObserver);
+            }
+            emitLighting();
+        }
+
+        private boolean torchEnabled() {
+            return Integer.valueOf(TorchState.ON).equals(camera.getCameraInfo().getTorchState().getValue());
+        }
+
+        private void emitLighting() {
+            if (!active || !opened || camera == null) return;
+            boolean hasTorch = camera.getCameraInfo().hasFlashUnit();
+            Map<String, PlatformPayload> lighting = new HashMap<>();
+            lighting.put("run", PlatformPayload.int64(run));
+            lighting.put("hasFlash", PlatformPayload.booleanValue(hasTorch && photoOutput != null));
+            lighting.put("hasTorch", PlatformPayload.booleanValue(hasTorch));
+            lighting.put("torchEnabled", PlatformPayload.booleanValue(hasTorch && torchEnabled()));
+            events.emit("lighting", PlatformPayload.object(lighting));
+        }
+
+        private void setTorchEnabled(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
+            if (!isCurrentCamera(arguments)) {
+                result.fail("not-ready", "The camera is not running.", PlatformPayload.nullValue());
+                return;
+            }
+            if (!camera.getCameraInfo().hasFlashUnit()) {
+                result.fail("unavailable", "The camera torch is unavailable.", PlatformPayload.nullValue());
+                return;
+            }
+            boolean enabled = arguments.requireField("enabled").requireBoolean();
+            long token = generation;
+            try {
+                ListenableFuture<Void> applied = camera.getCameraControl().enableTorch(enabled);
+                applied.addListener(() -> {
+                    if (!active || token != generation) {
+                        result.fail("interrupted", "The camera torch adjustment was interrupted.", PlatformPayload.nullValue());
+                        return;
+                    }
+                    try {
+                        applied.get();
+                        emitLighting();
+                        result.complete(PlatformPayload.nullValue());
+                    } catch (Exception error) {
+                        String code = error.getCause() instanceof CameraControl.OperationCanceledException
+                                ? "interrupted" : "capture-failed";
+                        result.fail(code, error.toString(), PlatformPayload.nullValue());
+                    }
+                }, executor);
+            } catch (RuntimeException error) {
+                result.fail("capture-failed", error.toString(), PlatformPayload.nullValue());
+            }
+        }
+
         private void capturePhoto(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
             if (!active || !opened || arguments.requireField("run").requireInt64() != run) {
                 result.fail("not-ready", "Start the camera before taking a photo.", PlatformPayload.nullValue());
@@ -429,10 +493,18 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             }
             int quality = (int) arguments.requireField("quality").requireInt64();
             boolean mirror = arguments.requireField("mirror").requireBoolean();
+            String flash = arguments.requireField("flash").requireString();
+            int flashMode = flash.equals("on") ? ImageCapture.FLASH_MODE_ON
+                    : flash.equals("auto") ? ImageCapture.FLASH_MODE_AUTO : ImageCapture.FLASH_MODE_OFF;
+            if (flashMode != ImageCapture.FLASH_MODE_OFF && (!camera.getCameraInfo().hasFlashUnit() || torchEnabled())) {
+                result.fail("unavailable", "The requested flash mode is unavailable.", PlatformPayload.nullValue());
+                return;
+            }
             long token = generation;
             photoPending = true;
             try {
                 photoOutput.setTargetRotation(displayRotation());
+                photoOutput.setFlashMode(flashMode);
                 photoOutput.takePicture(photoExecutor, new ImageCapture.OnImageCapturedCallback() {
                     @Override public void onCaptureSuccess(@NonNull ImageProxy image) {
                         byte[] encoded = null;
@@ -503,6 +575,11 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             if (camera != null && cameraObserver != null) {
                 camera.getCameraInfo().getCameraState().removeObserver(cameraObserver);
             }
+            if (camera != null && torchObserver != null) {
+                camera.getCameraInfo().getTorchState().removeObserver(torchObserver);
+                camera.getCameraControl().enableTorch(false);
+            }
+            torchObserver = null;
             cameraObserver = null;
             camera = null;
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP);

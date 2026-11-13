@@ -106,6 +106,12 @@ public:
   virtual void FocusAndMeter(Point, std::function<void(CameraResult<void>)> completed) {
     completed(CameraResult<void>::Failure({CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
   }
+  /// Reports the current light controls and subsequent changes until capture stops.
+  virtual void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) { changed({}, {}); }
+  /// Changes the continuous light and publishes its observed status before completing the request.
+  virtual void SetTorchEnabled(bool, std::function<void(CameraResult<void>)> completed) {
+    completed(CameraResult<void>::Failure({CameraErrorCode::Unavailable, "The camera torch is unavailable."}));
+  }
   /// Delivers one independent, upright JPEG. Stop must wait for accepted platform photo work to finish cleanup.
   virtual void CapturePhoto(PhotoOptions, std::function<void(CameraResult<ImageAsset>)> completed) {
     completed(CameraResult<ImageAsset>::Failure(
