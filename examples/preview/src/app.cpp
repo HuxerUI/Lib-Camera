@@ -853,9 +853,9 @@ View CameraWorkspace() {
   }, selection->point.has_value(), selection->id, selection->adjusting_exposure);
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
-  const bool video = mode == CaptureMode::Video;
-  const bool video_busy = video_phase != VideoPhase::Idle;
-  const bool recording = status.recording_video && video_phase == VideoPhase::Recording;
+  const bool video = mode.Get() == CaptureMode::Video;
+  const bool video_busy = phase != VideoPhase::Idle;
+  const bool recording = status.recording_video && phase == VideoPhase::Recording;
   const bool paused = recording && status.recording_paused;
   const bool torch_enabled = status.torch && status.torch->enabled;
   const auto flash = status.photo_flash;
@@ -944,8 +944,9 @@ View CameraWorkspace() {
   };
 
   auto toggle_recording = [session, tasks, application, active, video_phase, saving_video, video_message] {
-    if (video_phase != VideoPhase::Idle) {
-      if (video_phase == VideoPhase::Recording && session.Status().recording_video) {
+    const VideoPhase current_phase = video_phase;
+    if (current_phase != VideoPhase::Idle) {
+      if (current_phase == VideoPhase::Recording && session.Status().recording_video) {
         video_phase = VideoPhase::Finishing;
         session.StopRecording();
       }
@@ -974,7 +975,7 @@ View CameraWorkspace() {
 
   Lifecycle([session, microphone, tasks, application, active, status, microphone_status,
              video_phase, video_file, video_message] {
-    if (video_phase != VideoPhase::Starting) return;
+    if (video_phase.Get() != VideoPhase::Starting) return;
     if (!active || status.state == camera::SessionState::Failed) {
       video_phase = VideoPhase::Idle;
       return;
@@ -1010,7 +1011,7 @@ View CameraWorkspace() {
 
   auto save_video = [tasks, picker, video_phase, video_file, saving_video, video_message] {
     const auto source = video_file.Get();
-    if (!source || saving_video || video_phase != VideoPhase::Idle || !picker->CanSaveFiles()) return;
+    if (!source || saving_video || video_phase.Get() != VideoPhase::Idle || !picker->CanSaveFiles()) return;
     saving_video = true;
     tasks.Launch([picker, source = *source, video_file, saving_video, video_message]() -> Task<void> {
       bool saved = false;
@@ -1030,7 +1031,7 @@ View CameraWorkspace() {
   };
 
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
-  View badge = recording || video_phase == VideoPhase::Finishing
+  View badge = recording || phase == VideoPhase::Finishing
       ? RecordingBadge(session, recording && live, paused)
       : StatusBadge(StateName(status.state), status_color);
 
