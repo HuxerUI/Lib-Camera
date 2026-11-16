@@ -3,6 +3,8 @@
 #include <huxerui/camera.h>
 #include <app_resources.h>
 
+#include "qr_scan.h"
+
 #if defined(__ANDROID__)
 #include <huxerui/android/platform_registry.h>
 #endif
@@ -20,6 +22,12 @@ using namespace huxerui;
 
 namespace {
 
+using app::OpenQrDecoder;
+using app::QrDecoderHandle;
+using app::QrScanningAvailable;
+using app::ScanCandidate;
+using app::ScanQrFromJpeg;
+
 const Color background = Color::Rgb(15, 18, 22);
 const Color surface = Color::Rgb(24, 28, 33);
 const Color control_background = Color::Rgb(34, 40, 47);
@@ -31,7 +39,7 @@ const Color accent = Color::Rgb(111, 226, 190);
 const Color record_red = Color::Rgb(255, 78, 89);
 const Color camera_yellow = Color::Rgb(255, 215, 78);
 
-enum class CaptureMode { Photo, Video };
+enum class CaptureMode { Photo, Video, Scan };
 enum class VideoPhase { Idle, Authorizing, Starting, Recording, Finishing };
 
 Text Label(StringVariant text, float size = 13.0F, Color color = secondary,
@@ -321,6 +329,11 @@ struct ViewfinderSelection {
   bool operator==(const ViewfinderSelection&) const = default;
 };
 
+struct ScanState {
+  std::uint64_t generation = 0;
+  std::string error;
+};
+
 struct ExposureControlState {
   std::optional<float> proposal;
   std::optional<float> target;
@@ -436,8 +449,8 @@ View CaptureModePicker(State<CaptureMode> mode, bool enabled) {
   static constexpr float tab_width = 88.0F;
   auto drag = UseState(std::optional<float>{});
   const CaptureMode selected = mode;
-  const bool video = selected == CaptureMode::Video;
-  const float centered = video ? -tab_width / 2.0F : tab_width / 2.0F;
+  const int selected_index = selected == CaptureMode::Photo ? 0 : selected == CaptureMode::Video ? 1 : 2;
+  const float centered = (1.0F - static_cast<float>(selected_index)) * tab_width;
   const auto displacement = drag.Get();
   auto select = [mode, drag](CaptureMode value) {
     mode = value;
@@ -460,6 +473,7 @@ View CaptureModePicker(State<CaptureMode> mode, bool enabled) {
     Row {
       tab(CaptureMode::Photo, "PHOTO"),
       tab(CaptureMode::Video, "VIDEO"),
+      tab(CaptureMode::Scan, "SCAN"),
     }.With(displacement ? Offset(Point{centered + *displacement, 0.0F})
         : Offset(AnimateTo(Point{centered, 0.0F}, TweenSpec{0.18, Easing::EaseOut}))),
   }.With(
@@ -467,12 +481,17 @@ View CaptureModePicker(State<CaptureMode> mode, bool enabled) {
       Semantics{.role = SemanticRole::TabList, .label = "Capture mode"},
       Enabled(enabled),
       DragGesture{.axis = Axis::Horizontal}
-  ).On<DragEvents::Changed>([drag, video](const DragEvent& event) {
-    drag = video ? std::clamp(event.translation.x, 0.0F, tab_width)
-                 : std::clamp(event.translation.x, -tab_width, 0.0F);
-  }).On<DragEvents::Ended>([selected, video, select](const DragEvent& event) {
-    const float travel = video ? event.translation.x : -event.translation.x;
-    select(travel >= tab_width * 0.4F ? (video ? CaptureMode::Photo : CaptureMode::Video) : selected);
+  ).On<DragEvents::Changed>([drag, selected_index](const DragEvent& event) {
+    drag = std::clamp(event.translation.x, -static_cast<float>(selected_index) * tab_width,
+                      static_cast<float>(2 - selected_index) * tab_width);
+  }).On<DragEvents::Ended>([selected_index, select](const DragEvent& event) {
+    int next = selected_index;
+    if (event.translation.x <= -tab_width * 0.4F) {
+      next = std::min(2, selected_index + 1);
+    } else if (event.translation.x >= tab_width * 0.4F) {
+      next = std::max(0, selected_index - 1);
+    }
+    select(next == 0 ? CaptureMode::Photo : next == 1 ? CaptureMode::Video : CaptureMode::Scan);
   }).On<DragEvents::Canceled>([drag](const DragEvent&) { drag = std::nullopt; });
 }
 
@@ -782,10 +801,158 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
       .With(Frame{.max_height = 560.0F});
 }
 
+View ScanEffect(float offset) {
+  return Stack {
+    Canvas([](PaintContext& paint, Size size) {
+      constexpr float box = 240.0F;
+      const Rect frame{(size.width - box) * 0.5F, (size.height - box) * 0.5F, box, box};
+      const Color scrim = Color::Rgb(0, 0, 0, 0.38F);
+      paint.DrawRect({0.0F, 0.0F, size.width, std::max(0.0F, frame.y)}, scrim);
+      paint.DrawRect({0.0F, frame.y + box, size.width, std::max(0.0F, size.height - frame.y - box)}, scrim);
+      paint.DrawRect({0.0F, frame.y, std::max(0.0F, frame.x), box}, scrim);
+      paint.DrawRect({frame.x + box, frame.y, std::max(0.0F, size.width - frame.x - box)}, scrim);
+      constexpr float width = 3.0F;
+      constexpr float length = 24.0F;
+      const Color corner = accent;
+      paint.DrawRect({frame.x, frame.y, length, width}, corner);
+      paint.DrawRect({frame.x, frame.y, width, length}, corner);
+      paint.DrawRect({frame.x + box - length, frame.y, length, width}, corner);
+      paint.DrawRect({frame.x + box - width, frame.y, width, length}, corner);
+      paint.DrawRect({frame.x, frame.y + box - width, length, width}, corner);
+      paint.DrawRect({frame.x, frame.y + box - length, width, length}, corner);
+      paint.DrawRect({frame.x + box - length, frame.y + box - width, length, width}, corner);
+      paint.DrawRect({frame.x + box - width, frame.y + box - length, width, length}, corner);
+    }),
+    Stack {
+      Canvas([](PaintContext& paint, Size size) {
+        paint.DrawRect({0.0F, 0.0F, size.width, size.height}, accent);
+      }).With(Frame{.width = 220.0F, .height = 2.0F}, CornerRadius(1.0F)).With(Offset(Point{0.0F, offset})),
+    }.With(Frame{.width = 240.0F, .height = 240.0F},
+           Align(HorizontalAlignment::Center, VerticalAlignment::Start)),
+  }.With(Grow(), Align(HorizontalAlignment::Center, VerticalAlignment::Center));
+}
+
+View ScanOverlay(State<ScanState> scan, bool live, float offset) {
+  const char* status = !live ? "Camera is not running"
+      : scan->error.empty() ? "Point the camera at a QR code"
+      : "Scanning failed";
+  return Stack {
+    live ? ScanEffect(offset) : View(),
+    Column {
+      Spacer(),
+      Label(status, 13.0F, foreground, FontWeight::SemiBold)
+          .With(Padding(EdgeInsets::Symmetric(14.0F, 10.0F)), Background(overlay_background), CornerRadius(10.0F)),
+    }.With(MainAlign(MainAxisAlignment::End), CrossAlign(CrossAxisAlignment::Center), Padding(20.0F)),
+  }.With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
+}
+
+View ScanPanel(State<ScanState> scan, bool live, bool available, std::function<void()> retry) {
+  if (!available) {
+    return Label("QR scanning is unavailable on this platform.", 13.0F, secondary);
+  }
+  return Column {
+    Label(live ? "Scanning the live preview" : "Camera is not running", 14.0F, foreground, FontWeight::Medium),
+    scan->error.empty() ? View() : Label(scan->error, 12.0F, Color::Rgb(255, 162, 156)),
+    Row {
+      Spacer(),
+      Button(live ? "Restart scan" : "Start camera")
+          .OnClick([scan, live, retry = std::move(retry)] {
+            if (!live) {
+              retry();
+              return;
+            }
+            scan = ScanState{.generation = scan->generation + 1};
+          }),
+    }.With(CrossAlign(CrossAxisAlignment::Center), Spacing(12.0F)),
+  }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+View ScanResultPage(const ScanCandidate& candidate, std::function<void()> back) {
+  return Column {
+    Row {
+      Label("Scan result", 20.0F, foreground, FontWeight::SemiBold),
+      Spacer(),
+      IconButton(app::images::close, "Close result").OnClick(back),
+    }.With(CrossAlign(CrossAxisAlignment::Center)),
+    Label(candidate.format, 11.0F, accent, FontWeight::SemiBold),
+    ScrollView(Column {
+      Label(candidate.text, 16.0F, foreground),
+    }.With(Padding(16.0F), Spacing(10.0F))).With(
+        Grow(),
+        Background(surface),
+        Border(outline, 1.0F),
+        CornerRadius(14.0F)
+    ),
+    Button("Scan again").OnClick(back),
+  }.With(
+      Padding(EdgeInsets::Symmetric(20.0F, 16.0F)),
+      Spacing(16.0F),
+      CrossAlign(CrossAxisAlignment::Stretch),
+      Grow(),
+      Background(background),
+      SafeAreaPadding{},
+      SystemBarsAppearance{
+          .status_bar_background = background,
+          .navigation_bar_background = background,
+          .status_bar_content = SystemBarContentBrightness::Light,
+          .navigation_bar_content = SystemBarContentBrightness::Light,
+      }
+  );
+}
+
+View ScanChoicePage(const std::vector<ScanCandidate>& candidates, std::function<void(ScanCandidate)> choose,
+                    std::function<void()> cancel) {
+  std::vector<View> cards;
+  cards.reserve(candidates.size());
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    const auto& candidate = candidates[index];
+    cards.push_back(Column {
+      Label("QR CODE " + std::to_string(index + 1), 10.0F, accent, FontWeight::SemiBold),
+      Label(candidate.text, 14.0F, foreground),
+    }.With(
+        Padding(14.0F),
+        Spacing(6.0F),
+        Background(surface),
+        Border(outline, 1.0F),
+        CornerRadius(12.0F),
+        PointerCursor(PointerCursorKind::Hand)
+    ).OnClick([choose, candidate] { choose(candidate); }));
+  }
+  return Column {
+    Row {
+      Label("Multiple QR codes", 20.0F, foreground, FontWeight::SemiBold),
+      Spacer(),
+      IconButton(app::images::close, "Cancel selection").OnClick(cancel),
+    }.With(CrossAlign(CrossAxisAlignment::Center)),
+    Label("Scanning is paused. Choose the code to open.", 13.0F, secondary),
+    ScrollView(Column(std::move(cards)).With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+        .With(Grow()),
+    Button("Back to scanner").OnClick(cancel),
+  }.With(
+      Padding(EdgeInsets::Symmetric(20.0F, 16.0F)),
+      Spacing(14.0F),
+      CrossAlign(CrossAxisAlignment::Stretch),
+      Grow(),
+      Background(background),
+      SafeAreaPadding{},
+      SystemBarsAppearance{
+          .status_bar_background = background,
+          .navigation_bar_background = background,
+          .status_bar_content = SystemBarContentBrightness::Light,
+          .navigation_bar_content = SystemBarContentBrightness::Light,
+      }
+  );
+}
+
 [[huxerui::composable]]
 View CameraWorkspace() {
   auto active = UseState(false);
   auto mode = UseState(CaptureMode::Photo);
+  auto scan = UseState(ScanState{});
+  auto scan_line = UseState(0.0F);
+  auto scan_choices = UseState(std::vector<ScanCandidate>{});
+  auto scan_result = UseState(std::optional<ScanCandidate>{});
+  auto qr_decoder = UseState(QrDecoderHandle{});
   auto flash_mode = UseState(camera::FlashMode::Off);
   auto changing_torch = UseState(false);
   auto torch_error = UseState(std::string{});
@@ -812,6 +979,15 @@ View CameraWorkspace() {
   auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
+  Lifecycle([qr_decoder] {
+    qr_decoder = OpenQrDecoder();
+    return [qr_decoder] { qr_decoder = QrDecoderHandle{}; };
+  });
+  Lifecycle([mode, scan] {
+    if (mode.Get() == CaptureMode::Scan) {
+      scan = ScanState{.generation = scan->generation + 1};
+    }
+  }, mode.Get());
   const std::size_t resolution = capture_resolution;
   const std::size_t frame_rate = capture_frame_rate;
   constexpr std::uint32_t widths[]{0, 1280, 1920};
@@ -854,6 +1030,7 @@ View CameraWorkspace() {
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
   const bool video = mode.Get() == CaptureMode::Video;
+  const bool scanning = mode.Get() == CaptureMode::Scan;
   const bool video_busy = phase != VideoPhase::Idle;
   const bool recording = status.recording_video && phase == VideoPhase::Recording;
   const bool paused = recording && status.recording_paused;
@@ -1030,6 +1207,58 @@ View CameraWorkspace() {
     });
   };
 
+  Lifecycle([scanning, live, tasks, session, scan, qr_decoder, scan_choices, scan_result, active] {
+    TaskHandle loop;
+    if (scanning && live && QrScanningAvailable()) {
+      const auto generation = scan->generation;
+      loop = tasks.Launch([session, scan, qr_decoder, generation, scan_choices, scan_result, active]() -> Task<void> {
+        while (session.Status().state == camera::SessionState::Running &&
+               scan->generation == generation) {
+          const auto image = co_await session.CapturePhotoAsync({.jpeg_quality = 70});
+          if (scan->generation != generation) co_return;
+          if (image.Succeeded()) {
+            const auto encoded = image.Value().EncodedBytes();
+            auto outcome = co_await ScanQrFromJpeg(Bytes(encoded.begin(), encoded.end()), qr_decoder.Get());
+            if (scan->generation != generation) co_return;
+            if (!outcome.candidates.empty()) {
+              if (outcome.candidates.size() == 1) {
+                scan_result = std::move(outcome.candidates.front());
+              } else {
+                scan_choices = std::move(outcome.candidates);
+              }
+              active = false;
+              co_return;
+            }
+            scan.Update([&](ScanState& value) { value.error = std::move(outcome.error); });
+          } else if (image.Error().code == camera::CameraErrorCode::Interrupted) {
+            co_return;
+          } else {
+            const auto message = image.Error().message;
+            scan.Update([&](ScanState& value) { value.error = message; });
+          }
+          co_await Delay(std::chrono::milliseconds(700));
+        }
+      });
+    }
+    return [loop] { loop.Cancel(); };
+  }, scanning, live, scan->generation);
+
+  Lifecycle([scanning, live, tasks, scan_line] {
+    TaskHandle animation;
+    if (scanning && live) {
+      animation = tasks.Launch([scan_line]() -> Task<void> {
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+          const auto elapsed =
+              std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+          scan_line = std::fmod(elapsed / 1.7F, 1.0F) * 220.0F;
+          co_await Delay(std::chrono::milliseconds(16));
+        }
+      });
+    }
+    return [animation] { animation.Cancel(); };
+  }, scanning, live);
+
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
   View badge = recording || phase == VideoPhase::Finishing
       ? RecordingBadge(session, recording && live, paused)
@@ -1089,12 +1318,12 @@ View CameraWorkspace() {
 
   const auto selected_point = live ? selection->point : std::nullopt;
   View light_control;
-  if (live && video && status.torch) {
+  if (live && !scanning && video && status.torch) {
     light_control = LightingButton(app::images::torch, torch_enabled ? "Turn off torch" : "Turn on torch",
                                    nullptr, torch_enabled,
                                    !changing_torch && (torch_enabled || status.torch->available))
         .OnClick([set_torch, torch_enabled] { set_torch(!torch_enabled); }).Key("torch");
-  } else if (live && !video && (flash.supports_auto || flash.supports_on)) {
+  } else if (live && !scanning && !video && (flash.supports_auto || flash.supports_on)) {
     const bool automatic = selected_flash == camera::FlashMode::Auto;
     const bool forced = selected_flash == camera::FlashMode::On;
     light_control = LightingButton(automatic || forced ? app::images::flash : app::images::flash_off,
@@ -1147,6 +1376,13 @@ View CameraWorkspace() {
       ClipChildren()
   );
 
+  if (scanning) {
+    viewfinder = Stack {
+      std::move(viewfinder),
+      ScanOverlay(scan, live, scan_line.Get()),
+    }.With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
+  }
+
   const char* photo_action = status.capturing_photo ? "Taking photo" : "Take photo";
   const char* video_action = recording ? "Stop recording" : phase == VideoPhase::Authorizing ? "Requesting microphone access"
       : phase == VideoPhase::Starting ? "Starting microphone" : video_busy ? "Processing video" : "Record video";
@@ -1179,8 +1415,9 @@ View CameraWorkspace() {
     video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
     photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
     torch_error->empty() ? View() : View(Label(torch_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
-    CaptureModePicker(mode, !video_busy && !status.capturing_photo && !changing_torch),
-    Stack {
+    CaptureModePicker(mode, !video_busy && !changing_torch &&
+                                 !(status.capturing_photo && !scanning)),
+    scanning ? ScanPanel(scan, live, QrScanningAvailable(), start_camera) : View(Stack {
       Row {
         left_control,
         Spacer(),
@@ -1192,13 +1429,30 @@ View CameraWorkspace() {
           facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
         }).With(Enabled(!authorizing && !stopping), Background(control_background), CornerRadius(14.0F)),
       }.With(Frame{.width = 288.0F}, CrossAlign(CrossAxisAlignment::Center)),
-    }.With(Frame{.height = 68.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center)),
+    }.With(Frame{.height = 68.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center))),
   }.With(
       Spacing(8.0F),
       Padding(EdgeInsets::Symmetric(16.0F, 8.0F)),
       SafeAreaPadding{.top = false},
       CrossAlign(CrossAxisAlignment::Stretch)
   );
+
+  auto return_to_scan = [scan_result, scan_choices, active, scan] {
+    scan_result = std::nullopt;
+    scan_choices = std::vector<ScanCandidate>{};
+    active = true;
+    scan = ScanState{.generation = scan->generation + 1};
+  };
+  auto choose_scan = [scan_result, scan_choices](ScanCandidate candidate) {
+    scan_result = std::move(candidate);
+    scan_choices = std::vector<ScanCandidate>{};
+  };
+  if (scan_result->has_value()) {
+    return ScanResultPage(scan_result->value(), return_to_scan);
+  }
+  if (!scan_choices->empty()) {
+    return ScanChoicePage(scan_choices.Get(), choose_scan, return_to_scan);
+  }
 
   return Column {
     viewfinder,
@@ -1278,6 +1532,7 @@ const Application application{
         .application_hooks = {
             huxerui::camera::Install,
             huxerui::audio::Install,
+            app::InstallQrScanning,
 #if defined(__ANDROID__)
             [](ApplicationContext& context) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;

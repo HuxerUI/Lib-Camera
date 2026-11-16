@@ -50,3 +50,28 @@ huxerui_use_library(example_camera
         TARGET HuxerUI::Camera
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
+
+set(LIB_QRCODE_URL "https://github.com/HuxerUI/Lib-QRCode.git"
+        CACHE STRING "Lib-QRCode repository required by the scan demo")
+set(LIB_QRCODE_COMMIT "4f67b7a1b60d459a53effe52af1ca9e44f67ff28"
+        CACHE STRING "Lib-QRCode commit checked out for the scan demo")
+set(HUXERUI_QRCODE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(HUXERUI_QRCODE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+huxerui_use_library(example_camera
+        TARGET HuxerUI::QRCode
+        URL "${LIB_QRCODE_URL}"
+        COMMIT "${LIB_QRCODE_COMMIT}"
+)
+
+if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(HUXERUI_EXAMPLE_GDK_PIXBUF REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
+        target_link_libraries(example_camera PRIVATE PkgConfig::HUXERUI_EXAMPLE_GDK_PIXBUF)
+    elseif (WIN32)
+        target_link_libraries(example_camera PRIVATE windowscodecs ole32)
+    elseif (APPLE)
+        target_link_libraries(example_camera PRIVATE
+                "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+    endif ()
+endif ()
